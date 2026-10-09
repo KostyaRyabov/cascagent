@@ -70,11 +70,16 @@ CPU-слой вокруг неё (см. §5–7 и docs/architecture.md).
    — артефакт переноса, а не структура).
 4. **Никогда не обрезаем список** подзадач: возвращаем всё, что сгенерировано
    (фильтрация дублей — ответственность DuplicateDetector выше по стеку).
-5. Парсер не изобретает задач: мусорные секции (например, preamble до первой
-   задачи) игнорируются; но ни одна валидная пара brief+description не теряется.
-6. Markdown-шум на границах строк sanitize'ится детерминированно
-   (буллеты, нумерация, `**`/`` ` `` обёртки, zero-width символы) —
-   как и в v1, `sanitize_line()` переиспользуется без изменений.
+5. Парсер не изобретает задач: preamble до первой задачи игнорируется; но
+   ни одна валидная пара brief+description не теряется.
+6. **Защита от вырожденного ответа:** если после разбора осталась ровно
+   одна подзадача, а её `brief` высокосходен с задачей родителя
+   (DuplicateDetector.is_parent_repeat) — считаем, что модель повторила
+   задачу вместо декомпозиции: это атом. Правило детерминировано и живёт
+   на CPU, модель про него не знает.
+7. Markdown-шум на границах строк sanitize'ится детерминированно
+   (буллеты, нумерация, `**`/backtick обёртки, zero-width символы) —
+   `sanitize_line()` переиспользуется из v1 без изменений.
 
 Эталонная реализация (~20 строк):
 
@@ -110,7 +115,7 @@ class Task:
     result: Optional[str] = None  # что получилось после выполнения
     parent_id: Optional[str] = None
     depth: int = 0
-    subtasks: List["Task"] = field(default_factory=list)  # id детей
+    subtasks: List[str] = field(default_factory=list)  # id детей (порядок = исполнение)
 ```
 
 **УДАЛЕНО из v1** (определяется системой, а не моделью):
@@ -119,8 +124,9 @@ class Task:
 - acceptance criteria;
 - поле `blocked_by`.
 
-`DecompositionCall` остаётся (task_id, prompt, think, final_response,
-timings, error) — формат истории JSONL совместим между v1/v2.
+`DecompositionCall` остаётся (task_id, task_brief, depth, think_enabled,
+prompt, think, final_response, timings, error, atomic) — формат JSONL
+истории совместим между v1/v2; `is_atomic` — свойство самого call.
 
 ## 5. Что видит модель (полный prompt одного вызова)
 
@@ -140,8 +146,10 @@ USER:
 РАЗБЕЙ НА ПОДЗАДАЧИ:
 ```
 
-- Вместо `{parent_title}` (v1) теперь `{task.brief}` родителя передаётся
-  только как часть enriched context, если enricher сочтёт нужным.
+Референсная сборка — `parser.build_user_prompt(brief, context_lines,
+completed_siblings)` (pure function, тестируется без сети).
+
+- Название родителя входит в `Контекст:` только когда enricher его добавил.
 - think/no_think выбирается системой по глубине (L0–L2 think, L3+ no_think) —
   модель не управляет этим сама.
 
@@ -154,10 +162,12 @@ USER:
 4. Чеклист выполненных siblings.
 
 После декомпозиции (оркестратор):
-1. `parse_decomposition()` → список подзадач;
-2. DuplicateDetector: фильтр дублей, повтора родителя, циклов по предкам
-   (порог 0.75, SequenceMatcher — без изменений);
-3. Сохранение в SQLite Kanban; зависимости — по порядку.
+1. `split_think_and_response()` → THINK / FINAL RESPONSE (логируются оба);
+2. `is_atomic(final_response)` → атом или список;
+3. `parse_decomposition()` → список подзадач;
+4. DuplicateDetector: фильтр дублей внутри списка, повтора родителя
+   (см. §3.6), циклов по предкам (порог 0.75, SequenceMatcher — без изменений);
+5. Сохранение в SQLite Kanban; зависимости — по порядку.
 
 После выполнения:
 1. Сбор результатов детей; `summarize_results()` (конкатенация; опционально
@@ -176,13 +186,13 @@ def execute_with_decomposition(task: Task) -> str:
     if not task.subtasks:
         enriched = enricher.enrich(task.brief)
         call = decomposer.decompose(task, enriched)      # isolated HTTP call
-        if call.is_atomic:                                # "<atom>" or empty
+        if call.is_atomic or degenerate_repeat(call, task):   # §3.6
             task.result = executor.execute(task)
             task.status = DONE
             return task.result
         task.subtasks = filter_dupes(parse(call.final_response), task)
-        kanban.save_all(task.subtasks)
-    results = [execute_with_decomposition(s) for s in children(task)]
+        kanban.save_all(children_of(task))
+    results = [execute_with_decomposition(kanban.get(i)) for i in task.subtasks]
     task.result = summarize_results(results)
     task.status = DONE
     kanban.update(task)
@@ -199,19 +209,20 @@ def execute_with_decomposition(task: Task) -> str:
 | Парсинг | category detection | 20 строк, отступы |
 | Категории задач | RESEARCH/MUST_DO/DEFERRED | удалены (решает система) |
 | Токенов на запрос | ~500 system | ~100 system |
+| Модель данных | title + category + status-str | brief + description + TaskStatus |
 
 ## 9. Миграция кодовой базы (чеклист)
 
-- [x] Документация v2 принята (этот файл, AGENTS.md §4, architecture.md)
+- [x] Документация v2 принята (этот файл, AGENTS.md §2.3–7/§10, architecture.md)
 - [ ] `models.py`: `TaskStatus`, новый `Task(brief, description, ...)`,
-      удалить `TaskCategory`/`SYMBOL_TO_CATEGORY`
+      удалить `TaskCategory`/`SYMBOL_TO_CATEGORY`; `DecompositionCall` под v2
 - [ ] `parser.py`: `SYSTEM_PROMPT`, `ATOM_MARKER`, `is_atomic()`,
       `parse_decomposition()`, `build_user_prompt()`;
       удалить `detect_category`, `parse_response`, старую сборку prompt;
       `split_think_and_response`, `sanitize_line` — без изменений
 - [ ] `detector.py`: API на `task.brief` вместо `task.title` (логика та же)
-- [ ] Тесты parser/detector переписать под v2-формат
+- [ ] Тесты parser/detector переписать под v2-формат (+тест на §3.6)
 - [ ] history.py — по спецификации v2 (JSONL + debug.log, THINK/FINAL RESPONSE)
-- [ ] Этапы 2–5 (client, cache_manager, decomposer, cli, bk_tree, semantic, rag)
-      — по AGENTS.md §6–7 с учётом новых модулей v2: enricher, executor,
-      reflector, researcher
+- [ ] Этапы 2–6 (client, cache_manager, decomposer/kanban/cli, bk_tree,
+      semantic, rag, enricher/executor/reflector/researcher)
+      — по AGENTS.md §6–7
