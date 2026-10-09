@@ -1,16 +1,1 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-.venv/
-venv/
-.pytest_cache/
-.coverage
-data/*.db
-data/*.jsonl
-data/*.log
-data/kv_cache/*.bin
-*.bin
-.idea/
-.vscode/
+(empty)
