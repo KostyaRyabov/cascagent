@@ -60,6 +60,10 @@ System prompt ~200 символов; модель не знает про RAG/п�
 - Хранение: SQLite (Kanban), JSONL (история LLM-вызовов), `.bin` (KV-кэши).
 - Python 3.11+: requests, sqlite3, difflib, numpy, Levenshtein, pyyaml, pytest.
 - Лицензия Apache 2.0 (файлы LICENSE, NOTICE в корне).
+- Эволюация выбора движка (Ollama → llama.cpp → ExLlamaV2/TabbyAPI),
+  сравнение моделей и конфигурации — `docs/stack.md`. Кандидат на ревизию
+  (TabbyAPI + Qwen3 8B EXL2 4.0bpw) там же, §7 — решение не принято;
+  до принятия код пишется под llama.cpp.
 
 Команда запуска сервера-референс:
 ```bash
@@ -139,6 +143,7 @@ cascagent/
 ├── docs/architecture.md  # конспект принятых решений
 ├── docs/product.md       # продукт: сценарии, функции, системные агенты (draft)
 ├── docs/cpu-offload.md   # реестр CPU-алгоритмов vs LLM-вызовы
+├── docs/stack.md         # стек инференса: движки, модели, think, конфиги (draft)
 ├── AGENTS.md             # этот файл
 ├── pyproject.toml
 ├── README.md
