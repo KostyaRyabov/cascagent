@@ -2,6 +2,9 @@
 
 > Обновлено под **архитектуру v2** (ультра-простая декомпозиция).
 > Полная спецификация протокола — `docs/protocol.md`.
+> Продуктовое видение и системные агенты — `docs/product.md`.
+> Реестр CPU-алгоритмов (что делает CPU, чтобы не нагружать GPU) — `docs/cpu-offload.md`.
+> Стек инференса (движки, модели, think-режим, конфигурация) — `docs/stack.md`.
 > Статусы модулей: ✅ реализовано, 🚧 в работе/миграции, ⬜ план.
 
 ## 1. Обзор системы
@@ -49,6 +52,10 @@ Details: docs/protocol.md §2–3.
 | `semantic.py` | SemanticMemory (эмбеддинги + cosine, remember/recall) | ⬜ Этап 4 |
 | `rag.py` | BM25 + vector search по документации | ⬜ Этап 4 |
 
+Полный реестр CPU-алгоритмов (что делает CPU, чтобы не нагружать GPU/LLM) —
+`docs/cpu-offload.md`; продуктовые сценарии и таблица системных агентов —
+`docs/product.md`.
+
 ## 3. Протокол декомпозиции
 
 См. `docs/protocol.md` (спецификация v2). Ключевые инварианты парсера:
@@ -89,8 +96,36 @@ think/no_think выбирается системой по глубине (L0–L
 Обоснованы в AGENTS.md §3, §8, §9: llama.cpp (а не ExLlamaV2), одна модель,
 без warmup, без batch, формат ответа — plain text с отступами (v2),
 короткий системный промпт без упоминания внутренних механизмов.
+Эволюция и обоснование выбора стека — `docs/stack.md` §1–2; там же
+задокументирован **кандидат на ревизию** TabbyAPI + Qwen3 8B EXL2 (§7).
 
-## 7. План заполнения документа
+## 7. Смежные документы
+
+- `docs/product.md` — что умеет продукт, пользовательские сценарии, таблица
+  системных агентов (триггеры/вход/выход), state machine задачи.
+- `docs/cpu-offload.md` — полный реестр CPU-алгоритмов (pre-call P1–P9,
+  post-call A1–A13, обработка ошибок) и исчерпывающий список того, что
+  остаётся на GPU; оценки сложности и чеклист ревью новых модулей.
+- `docs/stack.md` — сравнение inference-движков (Ollama → llama.cpp →
+  ExLlamaV2/TabbyAPI), выбор модели и квантования, конфигурация бэкенда,
+  управление think-режимом, KV-кэш и budget токенов на вызов.
+- `docs/data.md` — модель данных: эволюция Task v1→v2, dot-path ID,
+  DecompositionCall (JSONL/debug.log), схема SQLite (tasks/llm_calls/
+  research_cache/semantic_memory), ResearchFinding, EnrichedContext.
+- `docs/prompts.md` — системные промпты всех агентов, структура USER-
+  промпта с примером, разбор вывода и обработка краёв, антипаттерны.
+- `docs/config.md` — Python-окружение, зависимости core/extras (с расхождениями
+  против исходной Главы IV), структура проекта, формат config.toml.
+- `docs/algorithms.md` — эталонные реализации CPU-алгоритмов реестра: BK-tree,
+  FuzzyMatcher/фонетика, SemanticMemory, двухступенчатый RAG, RobustYAMLParser,
+  DuplicateDetector (+ normalize-канон и маппинг на P/A).
+- `docs/performance.md` — кэш L1/L2/L3, узкое место префилла и контрмеры,
+  флаги движка под 4 GB VRAM, draft model (спекулятивный декодинг, вне v0.x),
+  PerformanceMetrics и их интерпретация.
+- `docs/decisions/` — ADR: 001 (inference engine), 002 (minimal prompt),
+  003 (no categories).
+
+## 8. План заполнения документа
 
 - После миграции v2: зафиксировать финальные сигнатуры models/parser.
 - После Этапа 2: разделы «Клиент и think-режим», «KV-кэш префиксов».

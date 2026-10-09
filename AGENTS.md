@@ -60,6 +60,10 @@ System prompt ~200 символов; модель не знает про RAG/п�
 - Хранение: SQLite (Kanban), JSONL (история LLM-вызовов), `.bin` (KV-кэши).
 - Python 3.11+: requests, sqlite3, difflib, numpy, Levenshtein, pyyaml, pytest.
 - Лицензия Apache 2.0 (файлы LICENSE, NOTICE в корне).
+- Эволюация выбора движка (Ollama → llama.cpp → ExLlamaV2/TabbyAPI),
+  сравнение моделей и конфигурации — `docs/stack.md`. Кандидат на ревизию
+  (TabbyAPI + Qwen3 8B EXL2 4.0bpw) там же, §7 — решение не принято;
+  до принятия код пишется под llama.cpp.
 
 Команда запуска сервера-референс:
 ```bash
@@ -137,6 +141,15 @@ cascagent/
 ├── tests/                # pytest, по файлу на модуль
 ├── docs/protocol.md      # СПЕЦИФИКАЦИЯ ПРОТОКОЛА v2 (источник истины)
 ├── docs/architecture.md  # конспект принятых решений
+├── docs/product.md       # продукт: сценарии, функции, системные агенты (draft)
+├── docs/cpu-offload.md   # реестр CPU-алгоритмов vs LLM-вызовы
+├── docs/stack.md         # стек инференса: движки, модели, think, конфиги (draft)
+├── docs/data.md          # модель данных: Task v2, dot-path ID, JSONL, схема SQLite
+├── docs/prompts.md       # промпты всех агентов, парсинг вывода, антипаттерны
+├── docs/config.md        # зависимости core/extras, config.toml, структура
+├── docs/algorithms.md    # эталонные реализации CPU-алгоритмов (BK-tree, fuzzy, memory, RAG)
+├── docs/performance.md   # кэш L1–L3, префилл, draft model, PerformanceMetrics
+├── docs/decisions/       # ADR-001..003 (движок, минимальный промпт, без категорий)
 ├── AGENTS.md             # этот файл
 ├── pyproject.toml
 ├── README.md
@@ -151,7 +164,7 @@ cascagent/
 ## 7. Этапы реализации (v2)
 
 - **Этап 1 (Фундамент):** миграция models/parser/detector на протокол v2
-  (+тесты), history.py (+тесты). pyproject — готов.
+  (+тесты), history.py (+тесты; формат записи — docs/data.md §3). pyproject — готов.
 - **Этап 2 (LLM-инфраструктура):** client, cache_manager
 - **Этап 3 (Ядро):** decomposer (DecomposerSession + execute_with_decomposition),
   kanban, cli
@@ -176,6 +189,9 @@ cascagent/
 
 - Мульти-модельные системы; draft model; warmup; ExLlamaV2; batch processing.
 - Эвристики вида «если содержит hello world — это атом».
+- Просить LLM делать то, что есть в реестре CPU-алгоритмов (`docs/cpu-offload.md` §2):
+  парсить формат, искать дубли, выбирать инструменты, планировать очередь,
+  хранить/читать состояние. На GPU остаются ровно 5 видов вызовов (§3 того же файла).
 
 ## 10. Статус и конвенции
 
