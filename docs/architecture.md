@@ -109,6 +109,15 @@ think/no_think выбирается системой по глубине (L0–L
 - `docs/stack.md` — сравнение inference-движков (Ollama → llama.cpp →
   ExLlamaV2/TabbyAPI), выбор модели и квантования, конфигурация бэкенда,
   управление think-режимом, KV-кэш и budget токенов на вызов.
+- `docs/data.md` — модель данных: эволюция Task v1→v2, dot-path ID,
+  DecompositionCall (JSONL/debug.log), схема SQLite (tasks/llm_calls/
+  research_cache/semantic_memory), ResearchFinding, EnrichedContext.
+- `docs/prompts.md` — системные промпты всех агентов, структура USER-
+  промпта с примером, разбор вывода и обработка краёв, антипаттерны.
+- `docs/config.md` — Python-окружение, зависимости core/extras (с расхождениями
+  против исходной Главы IV), структура проекта, формат config.toml.
+- `docs/decisions/` — ADR: 001 (inference engine), 002 (minimal prompt),
+  003 (no categories).
 
 ## 8. План заполнения документа
 

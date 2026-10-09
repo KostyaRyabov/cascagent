@@ -5,7 +5,9 @@
 > **llama.cpp + Qwen3 4B Q4_K_M** (AGENTS.md §3). Расхождения помечены
 > «⚠️ пересмотреть AGENTS.md». Смежные документы: `docs/product.md`
 > (системные агенты), `docs/cpu-offload.md` (CPU-слой vs GPU),
-> `docs/protocol.md` (формат общения с моделью).
+> `docs/protocol.md` (формат общения с моделью),
+> `docs/data.md` (модель данных и хранилища), `docs/prompts.md` (промпты
+> агентов); обоснования ключевых решений — ADR в `docs/decisions/`.
 
 ## 1. Эволюция выбора inference-движка
 

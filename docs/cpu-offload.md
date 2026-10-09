@@ -57,6 +57,9 @@ Qwen3 4B Q4_K_M на 4 GB VRAM: ~15–25 токенов/с генерация, �
 | A7 | Антициклы | проверка кандидатов против цепочки предок→потомок (hash ancestor set) | `kanban.py` | защита от self-referential деревьев |
 | A8 | Валидация структуры | brief непустой, description ≤ max_len, depth ≤ max_depth | `decomposer.py` | мусор ловится до записи в Kanban, без «почини вывод»-ретраев |
 | A9 | Персистентность | UPSERT в SQLite, WAL-режим; JSONL append-only история | `kanban.py`, `history.py` | resume без повторного инференса после краша |
+
+Схема таблиц (tasks/llm_calls/research_cache/semantic_memory), формат JSONL-записи
+и конвенции WAL/backup — `docs/data.md` §3–4.
 | A10 | Планирование исполнения | порядок детей = зависимости; FIFO single-flight очередь | оркестратор | модель не планирует расписание |
 | A11 | Маршрутизация агентов | state machine (product.md §5): триггеры Reflect/Research/Summarizer | оркестратор | агент сам не решает, звать ли другого агента |
 | A12 | Сборка результата | summarize_results(): конкатенация с budget; LLM-summarize — только если превышен бюджет | `executor.py` | типовой случай — чистый CPU |

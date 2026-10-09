@@ -144,6 +144,10 @@ cascagent/
 ├── docs/product.md       # продукт: сценарии, функции, системные агенты (draft)
 ├── docs/cpu-offload.md   # реестр CPU-алгоритмов vs LLM-вызовы
 ├── docs/stack.md         # стек инференса: движки, модели, think, конфиги (draft)
+├── docs/data.md          # модель данных: Task v2, dot-path ID, JSONL, схема SQLite
+├── docs/prompts.md       # промпты всех агентов, парсинг вывода, антипаттерны
+├── docs/config.md        # зависимости core/extras, config.toml, структура
+├── docs/decisions/       # ADR-001..003 (движок, минимальный промпт, без категорий)
 ├── AGENTS.md             # этот файл
 ├── pyproject.toml
 ├── README.md
@@ -158,7 +162,7 @@ cascagent/
 ## 7. Этапы реализации (v2)
 
 - **Этап 1 (Фундамент):** миграция models/parser/detector на протокол v2
-  (+тесты), history.py (+тесты). pyproject — готов.
+  (+тесты), history.py (+тесты; формат записи — docs/data.md §3). pyproject — готов.
 - **Этап 2 (LLM-инфраструктура):** client, cache_manager
 - **Этап 3 (Ядро):** decomposer (DecomposerSession + execute_with_decomposition),
   kanban, cli

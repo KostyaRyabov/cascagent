@@ -180,6 +180,9 @@ ResearchAgent (`researcher.py`) изолированно собирает инф
 Полный реестр CPU-шагов с привязкой к модулям и оценками стоимости —
 `docs/cpu-offload.md` (pre-call P1–P9, post-call A1–A13, ошибки/ретраи).
 Системные агенты (триггеры, входы/выходы) — `docs/product.md` §4.
+Модель данных и хранилища (Task v1→v2, dot-path ID, JSONL-запись, схема
+SQLite, EnrichedContext) — `docs/data.md`; промпты всех агентов и разбор
+вывода — `docs/prompts.md`; обоснования решений — `docs/decisions/`.
 
 ## 7. Псевдокод ядра
 
