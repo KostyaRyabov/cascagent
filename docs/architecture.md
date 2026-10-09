@@ -34,9 +34,9 @@ Details: docs/protocol.md §2–3, §3.8.
 
 | Модуль | Назначение | Статус |
 |--------|-----------|--------|
-| `models.py` | Task(brief, description, status, duplicate_of), TaskStatus, DecompositionCall | 🚧 миграция v1→v2 |
-| `parser.py` | SYSTEM_PROMPT, split_think_and_response, sanitize_line, parse_decomposition, is_atomic, build_user_prompt | 🚧 миграция v1→v2 |
-| `detector.py` | DuplicateDetector: R1 локальный (порог 0.75), R2 глобальный (порог ~0.90, по brief) | 🚧 адаптация API |
+| `models.py` | Task(brief, description, status, duplicate_of), TaskStatus, DecompositionCall | ✅ v2 |
+| `parser.py` | SYSTEM_PROMPT, split_think_and_response, sanitize_line, parse_decomposition, is_atomic, build_user_prompt | ✅ v2 |
+| `detector.py` | DuplicateDetector: filter_local R1 (0.75, became_atomic), link_or_promote R2 (0.90, оригинал — глубже) | ✅ v2 |
 | `history.py` | JSONL история LLM-вызовов + debug.log (THINK / FINAL RESPONSE) | ⬜ Этап 1 |
 | `client.py` | OpenAI-совместимый клиент llama.cpp, think параметр | ⬜ Этап 2 |
 | `cache_manager.py` | save/restore KV-кэша через /slots API | ⬜ Этап 2 |

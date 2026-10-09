@@ -189,14 +189,15 @@ cascagent/
 **Архитектура: v2 (ультра-простая)** — принята, документация зафиксирована:
 `docs/protocol.md` (источник истины по формату), AGENTS.md §4–6, architecture.md.
 
-Реализовано (код ещё на протоколе v1, миграция — следующий шаг):
-`models.py`, `parser.py`, `detector.py` (+тесты).
+Реализовано на протоколе v2 (миграция завершена):
+`models.py` (Task/TaskStatus/duplicate_of, DecompositionCall.atomic),
+`parser.py` (SYSTEM_PROMPT заморожен, is_atomic, parse_decomposition,
+build_user_prompt), `detector.py` (R1 filter_local / R2 link_or_promote),
++ 72 теста.
 
 Ближайшие шаги (порядок):
-1. Миграция `models.py` + `parser.py` + `detector.py` на v2 (+переписать тесты;
-   detector — два режима R1/R2, Task — поле `duplicate_of`);
-2. `history.py` (JSONL + debug.log) + тесты;
-3. Этап 2: `client.py`, `cache_manager.py`;
+1. `history.py` (JSONL + debug.log) + тесты;
+2. Этап 2: `client.py`, `cache_manager.py`;
 4. Далее по AGENTS.md §7 с новыми модулями v2 (enricher/executor/reflector/researcher).
 
 Конвенции кода:

@@ -276,15 +276,18 @@ def execute_with_decomposition(task: Task) -> str:
 
 - [x] Документация v2 принята (этот файл, AGENTS.md §2.3–7/§10, architecture.md)
 - [x] Правила дедупликации R1/R2 зафиксированы (§3.8), поле `Task.duplicate_of` (§4)
-- [ ] `models.py`: `TaskStatus`, новый `Task(brief, description, ..., duplicate_of)`,
-      удалить `TaskCategory`/`SYMBOL_TO_CATEGORY`; `DecompositionCall` под v2
-- [ ] `parser.py`: `SYSTEM_PROMPT`, `ATOM_MARKER`, `is_atomic()`,
+- [x] `models.py`: `TaskStatus`, новый `Task(brief, description, ..., duplicate_of)`,
+      удалены `TaskCategory`/`SYMBOL_TO_CATEGORY`; `DecompositionCall` под v2
+      (`task_brief`, флаг `atomic`, `from_dict`)
+- [x] `parser.py`: `SYSTEM_PROMPT`, `ATOM_MARKER`, `is_atomic()`,
       `parse_decomposition()`, `build_user_prompt()`;
-      удалить `detect_category`, `parse_response`, старую сборку prompt;
+      удалены `detect_category`, `parse_response`, старая сборка prompt;
       `split_think_and_response`, `sanitize_line` — без изменений
-- [ ] `detector.py`: API на `task.brief` вместо `task.title` (логика та же);
-      два режима: R1 (локальный, порог 0.75) и R2 (глобальный, порог ~0.90)
-- [ ] Тесты parser/detector переписать под v2-формат (+тесты на §3.8 R1/R2)
+- [x] `detector.py`: API на `task.brief`; два режима: `filter_local()`
+      (R1, порог 0.75, `DedupResult.became_atomic`) и `find_global_match()` /
+      `link_or_promote()` (R2, порог 0.90, оригинал — глубже, repoint при
+      продвижении)
+- [x] Тесты parser/detector переписаны под v2-формат (+тесты на §3.8 R1/R2)
 - [ ] history.py — по спецификации v2 (JSONL + debug.log, THINK/FINAL RESPONSE)
 - [ ] Этапы 2–6 (client, cache_manager, decomposer/kanban/cli, bk_tree,
       semantic, rag, enricher/executor/reflector/researcher)

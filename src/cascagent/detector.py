@@ -1,25 +1,41 @@
 """Duplicate detection for decomposition output (CPU-side, deterministic).
 
-LLM rule #2 says "don't produce identical subtasks" — but weak models
-violate it. The DuplicateDetector filters repeats *after* parsing so the
-tree never contains near-duplicate branches, and detects parent-echo and
-ancestor cycles (decomposition that re-asks the same question forever).
+Protocol v2 defines TWO fundamentally different kinds of name collision
+(docs/protocol.md §3.8), handled by two modes of this detector:
+
+R1 — LOCAL dedup inside one decomposition answer (threshold 0.75):
+    * a subtask that repeats the decomposed task's own brief is deleted;
+    * two near-identical subtasks in the same list collapse to the first.
+    If nothing survives R1 filtering, the orchestrator marks the task
+    ATOMIC (that is how ``<atom>`` arises without the model saying it).
+
+R2 — GLOBAL dedup across the whole Kanban tree (threshold ~0.90, high):
+    a match with a task from ANOTHER branch never deletes work: the
+    DEEPEST task is the original (the need appeared at that level); the
+    shallower one becomes a link ``duplicate_of=<original id>`` whose
+    status/result mirror the original.
 
 Similarity metric: difflib.SequenceMatcher ratio on normalized text
-(casefolded, punctuation-insensitive, whitespace-collapsed).
+(casefolded, punctuation-insensitive, whitespace-collapsed). Works on
+``Task.brief`` (v2 field name).
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Iterable, List, Optional, Tuple
 
 from .models import Task
 
-# Punctuation/symbols stripped before comparison (protocol symbols too).
+# Punctuation/symbols stripped before comparison.
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
+
+#: Default thresholds (docs/protocol.md §3.8 / AGENTS.md).
+LOCAL_THRESHOLD = 0.75     # R1: within one decomposition + parent echo
+GLOBAL_THRESHOLD = 0.90    # R2: cross-branch identity (near-exact briefs)
 
 
 def normalize(text: str) -> str:
@@ -29,10 +45,29 @@ def normalize(text: str) -> str:
     return s.casefold()
 
 
-class DuplicateDetector:
-    """Fuzzy duplicate filter based on SequenceMatcher similarity."""
+@dataclass
+class DedupResult:
+    """Outcome of R1 local filtering for one decomposition answer."""
 
-    def __init__(self, threshold: float = 0.75):
+    kept: List[Task]
+    removed: List[Task]
+
+    @property
+    def became_atomic(self) -> bool:
+        """§3.8 R1: empty list after local dedup => task is atomic."""
+        return not self.kept
+
+
+class DuplicateDetector:
+    """Fuzzy duplicate filter based on SequenceMatcher similarity.
+
+    ``threshold`` governs every pairwise check made through this instance;
+    use two instances for the two protocol modes:
+    ``DuplicateDetector()``          -> R1 local (0.75)
+    ``DuplicateDetector(0.90)``      -> R2 global cross-branch
+    """
+
+    def __init__(self, threshold: float = LOCAL_THRESHOLD):
         if not 0.0 < threshold <= 1.0:
             raise ValueError("threshold must be in (0, 1]")
         self.threshold = threshold
@@ -56,52 +91,113 @@ class DuplicateDetector:
                    for e in existing)
 
     def is_parent_repeat(self, task: str, parent: str) -> bool:
-        """True if the subtask just re-states its parent (rule #1)."""
+        """True if the subtask just re-states its parent (rule R1a)."""
         return self.similarity(task, parent) >= self.threshold
 
     def detect_cycle(self, task: str, ancestors: Iterable[str]) -> bool:
-        """True if ``task`` matches ANY ancestor title => recursive cycle."""
+        """True if ``task`` matches ANY ancestor brief => recursive cycle."""
         return any(self.similarity(task, anc) >= self.threshold
                    for anc in ancestors)
 
-    # ------------------------------------------------------------- filtering
+    # ------------------------------------------------------- R1: local mode
 
-    def filter_tasks(
+    def filter_local(
         self,
         tasks: List[Task],
-        parent_title: Optional[str] = None,
+        parent_brief: Optional[str] = None,
         ancestors: Optional[List[str]] = None,
         siblings: Optional[List[str]] = None,
-    ) -> Tuple[List[Task], List[Task]]:
-        """Split parsed subtasks into (kept, rejected).
+    ) -> DedupResult:
+        """Rule R1 (§3.8): delete repeats inside ONE decomposition answer.
 
         Rejection reasons (all deterministic, CPU-side):
-        - exact '<atom>' tasks are always kept (they carry no title);
-        - parent echo (is_parent_repeat);
-        - cycle against ancestors (detect_cycle);
-        - near-duplicate of an earlier kept task in the same batch;
+        - parent echo (subtask brief ≈ decomposed task brief);
+        - cycle against ancestors;
+        - near-duplicate of an earlier kept task in the same batch
+          (first occurrence wins, order preserved);
         - near-duplicate of already-existing siblings.
 
-        Order-preserving; never truncates legitimate output (§9.2).
+        Returns :class:`DedupResult`; if ``kept`` is empty the caller marks
+        the task atomic (R1 ⇒ atom). Never truncates legitimate output
+        beyond explicit duplicates (§9.2 AGENTS.md).
         """
         kept: List[Task] = []
-        rejected: List[Task] = []
+        removed: List[Task] = []
         seen: List[str] = list(siblings or [])
 
         for task in tasks:
-            if task.is_atom:
-                kept.append(task)
+            brief = task.brief
+            if parent_brief and self.is_parent_repeat(brief, parent_brief):
+                removed.append(task)
                 continue
-            title = task.title
-            if parent_title and self.is_parent_repeat(title, parent_title):
-                rejected.append(task)
+            if ancestors and self.detect_cycle(brief, ancestors):
+                removed.append(task)
                 continue
-            if ancestors and self.detect_cycle(title, ancestors):
-                rejected.append(task)
-                continue
-            if self.is_duplicate(title, seen):
-                rejected.append(task)
+            if self.is_duplicate(brief, seen):
+                removed.append(task)
                 continue
             kept.append(task)
-            seen.append(title)
-        return kept, rejected
+            seen.append(brief)
+        return DedupResult(kept=kept, removed=removed)
+
+    # ----------------------------------------------------- R2: global mode
+
+    def find_global_match(
+        self,
+        brief: str,
+        candidates: Iterable[Task],
+    ) -> Optional[Task]:
+        """Rule R2 (§3.8): find the best cross-branch match in the tree.
+
+        ``candidates`` are tasks from OTHER branches (caller excludes the
+        current subtree). Comparison uses this instance's threshold
+        (typically GLOBAL_THRESHOLD=0.90 — only near-exact identities).
+
+        Original selection policy (returned candidate is the ORIGINAL):
+        - deepest task wins (need materialized at the lowest level);
+        - equal depth → earliest created wins (first planned keeps identity;
+          implemented via stable iteration order of ``candidates``).
+        Returns ``None`` when nothing matches.
+        """
+        best: Optional[Task] = None
+        best_score = 0.0
+        for cand in candidates:
+            score = self.similarity(brief, cand.brief)
+            if score < self.threshold:
+                continue
+            if best is None:
+                best, best_score = cand, score
+                continue
+            # deeper always wins; on tie keep the earlier candidate
+            if cand.depth > best.depth or (
+                    cand.depth == best.depth and score > best_score):
+                best, best_score = cand, score
+        return best
+
+    def link_or_promote(
+        self,
+        new_task: Task,
+        candidates: Iterable[Task],
+    ) -> Tuple[Task, Optional[Task]]:
+        """Apply R2 to one freshly parsed subtask.
+
+        Returns ``(task, repointed_original)``:
+        - match found, original deeper or equal → ``task.duplicate_of`` set
+          to original id, no work duplicated;
+        - match found but ``new_task`` is strictly deeper → the old (shallower)
+          task is REPONTED: it becomes the link to ``new_task`` (which stays
+          the original); returned second element is that demoted task so the
+          orchestrator can persist the change;
+        - no match → task unchanged, second element ``None``.
+        """
+        orig = self.find_global_match(new_task.brief, candidates)
+        if orig is None:
+            return new_task, None
+        if new_task.depth > orig.depth:
+            # New task is deeper → it becomes the original; old one links to it.
+            orig.duplicate_of = new_task.id
+            new_task.duplicate_of = None
+            return new_task, orig
+        # Equal or shallower than found original → new task is the link.
+        new_task.duplicate_of = orig.id
+        return new_task, None
