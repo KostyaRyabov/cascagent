@@ -37,9 +37,11 @@
 | Опечатки в именах | Левенштейн + фонетика | `bk_tree.fix_typo` |
 | Похожие задачи | Эмбеддинги + cosine | `semantic.py` |
 | Поиск в документации | RAG (BM25 + vectors) | `rag.py` |
-| Валидация формата | YAML-парсер + эвристики | `yaml_heal.py` |
+| Обогащение контекста | RAG + recall + сжатие | `enricher.py` |
 | Состояние задач | SQLite Kanban | `kanban.py` |
 | Дубли подзадач | SequenceMatcher | `detector.py` |
+| Разбор формата ответа | отступы → brief/description | `parser.py` |
+| Анализ провалов | ReflectAgent | `reflector.py` |
 
 ### 2.4 Минимальный формат для LLM
 Модель отвечает простым текстом, структура парсится на CPU:
@@ -47,6 +49,7 @@
 read_file /tmp/x.txt        # хорошо
 {"tool": "read_file", ...}  # плохо — модель думает о формате
 ```
+System prompt ~200 символов; модель не знает про RAG/память/Kanban (v2).
 
 ## 3. Технологический стек
 
@@ -66,40 +69,71 @@ read_file /tmp/x.txt        # хорошо
   --no-mmap --threads 6
 ```
 
-## 4. Протокол декомпозиции
+## 4. Протокол декомпозиции (v2 — ультра-простая архитектура)
 
-Категории строк ответа LLM:
-- `>` RESEARCH — исследование, сбор информации
-- `!` MUST_DO — обязательная задача каркаса
-- `?` DEFERRED — опциональная, ждёт контекста, не детализируется
-- `<atom>` — ровно одна строка, задача атомарна
+> Пересмотр протокола: категории `> ! ?` УДАЛЕНЫ. Полная спецификация —
+> `docs/protocol.md`. Системный промпт (~200 символов) зафиксирован в
+> `parser.SYSTEM_PROMPT` — менять текст можно только вместе с тестами.
 
-System prompt модели зафиксирован в `parser.build_system_prompt()` —
-менять текст можно только вместе с тестами.
+Формат вывода модели — простой текст с отступами:
+
+```
+Название задачи            <- без отступа = brief новой подзадачи
+    Подробное описание     <- с отступом = description текущей
+```
+
+Атомарность: ровно `<atom>` (или пустой final_response) — никаких эвристик.
+
+Модель НЕ знает про категории, RAG, semantic memory, enrichment — всё это
+делает CPU-слой вокруг неё (ContextEnricher, DuplicateDetector, Kanban).
+
+Модель данных: `Task(id, brief, description, status, result, parent_id,
+depth, subtasks)`; `TaskStatus = pending | running | done | failed`.
+`TaskCategory` из v1 удалён.
 
 ## 5. Передача контекста между уровнями
 
-- Родительский контекст: **только название родителя** (не описание).
-- Siblings: чеклист выполненных братских задач (`✓ <title>`).
-- Результаты `>`-задач добавляются в контекст детей.
+USER-промпт вызова декомпозиции (см. docs/protocol.md §5):
 
-## 6. Структура проекта
+```
+Задача: {task.brief}
+
+Контекст:
+{enriched_context}          # RAG + semantic recall + siblings (собран CPU)
+
+Выполненные ранее:
+- {completed_siblings} ✓
+
+РАЗБЕЙ НА ПОДЗАДАЧИ:
+```
+
+- Модель видит только свой task.brief + обогащённый контекст от enricher'а.
+- think/no_think выбирается системой по глубине (L0–L2 think, L3+ no_think).
+- Порядок подзадач в списке = порядок исполнения (зависимости решает система).
+
+## 6. Структура проекта (v2)
 
 ```
 cascagent/
 ├── src/cascagent/
-│   ├── models.py         # Task, TaskCategory, DecompositionCall  [готово]
-│   ├── parser.py         # split/sanitize/detect/build_prompt     [готово]
-│   ├── detector.py       # DuplicateDetector                       [готово]
-│   ├── history.py        # History (JSONL + debug.log)             [Этап 1]
-│   ├── client.py         # LlamaCppClient                          [Этап 2]
-│   ├── cache_manager.py  # save/restore KV через /slots            [Этап 2]
-│   ├── decomposer.py     # RecursiveDecomposer (DFS)               [Этап 3]
-│   ├── cli.py            # argparse: --query --max-depth ...       [Этап 3]
-│   ├── bk_tree.py        # BKTree + fix_typo                       [Этап 4]
-│   ├── semantic.py       # SemanticMemory.remember/recall          [Этап 4]
-│   └── rag.py            # BM25 + vector search                    [Этап 4]
+│   ├── models.py         # Task(brief,description,status), TaskStatus  [миграция v2]
+│   ├── parser.py         # SYSTEM_PROMPT, parse_decomposition, is_atomic [миграция v2]
+│   ├── detector.py       # DuplicateDetector (по task.brief)            [готово*]
+│   ├── history.py        # History (JSONL + debug.log)                   [Этап 1]
+│   ├── client.py         # LlamaCppClient                                [Этап 2]
+│   ├── cache_manager.py  # save/restore KV через /slots                  [Этап 2]
+│   ├── decomposer.py     # DecomposerSession (stateful сессия)           [Этап 3]
+│   ├── enricher.py       # ContextEnricher (RAG + semantic + siblings)   [Этап 4+]
+│   ├── executor.py       # TaskExecutor                                  [Этап 4+]
+│   ├── reflector.py      # ReflectAgent (анализ провалов)                [Этап 4+]
+│   ├── researcher.py     # ResearchAgent (изолированный сбор инфы)       [Этап 4+]
+│   ├── kanban.py         # SQLite хранилище                              [Этап 3]
+│   ├── cli.py            # argparse: --query --max-depth ...             [Этап 3]
+│   ├── bk_tree.py        # BKTree + fix_typo                             [Этап 4]
+│   ├── semantic.py       # SemanticMemory.remember/recall                [Этап 4]
+│   └── rag.py            # BM25 + vector search                          [Этап 4]
 ├── tests/                # pytest, по файлу на модуль
+├── docs/protocol.md      # СПЕЦИФИКАЦИЯ ПРОТОКОЛА v2 (источник истины)
 ├── docs/architecture.md  # конспект принятых решений
 ├── AGENTS.md             # этот файл
 ├── pyproject.toml
@@ -108,13 +142,20 @@ cascagent/
 └── .gitignore
 ```
 
-## 7. Этапы реализации
+\* логика готова, API адаптируется под `task.brief` при миграции v2.
 
-- **Этап 1 (Фундамент):** pyproject, models, parser, detector, history (+тесты)
+Модели максимально простые, вся сложность — в CPU-слое вокруг LLM.
+
+## 7. Этапы реализации (v2)
+
+- **Этап 1 (Фундамент):** миграция models/parser/detector на протокол v2
+  (+тесты), history.py (+тесты). pyproject — готов.
 - **Этап 2 (LLM-инфраструктура):** client, cache_manager
-- **Этап 3 (Ядро):** decomposer, cli
+- **Этап 3 (Ядро):** decomposer (DecomposerSession + execute_with_decomposition),
+  kanban, cli
 - **Этап 4 (CPU-алгоритмы):** bk_tree, semantic, rag
-- **Этап 5 (Интеграция):** оставшиеся тесты, README, docs
+- **Этап 5 (Обвязка агентов):** enricher, executor, reflector, researcher
+- **Этап 6 (Интеграция):** оставшиеся тесты, README, docs
 
 Текущий статус: см. раздел 10.
 
@@ -136,10 +177,21 @@ cascagent/
 
 ## 10. Статус и конвенции
 
-Реализовано: `models.py`, `parser.py`, `detector.py` (+тесты).
+**Архитектура: v2 (ультра-простая)** — принята, документация зафиксирована:
+`docs/protocol.md` (источник истины по формату), AGENTS.md §4–6, architecture.md.
+
+Реализовано (код ещё на протоколе v1, миграция — следующий шаг):
+`models.py`, `parser.py`, `detector.py` (+тесты).
+
+Ближайшие шаги (порядок):
+1. Миграция `models.py` + `parser.py` + `detector.py` на v2 (+переписать тесты);
+2. `history.py` (JSONL + debug.log) + тесты;
+3. Этап 2: `client.py`, `cache_manager.py`;
+4. Далее по AGENTS.md §7 с новыми модулями v2 (enricher/executor/reflector/researcher).
+
 Конвенции кода:
 - `from __future__ import annotations` везде; type hints обязательны.
-- Докейстры в каждом модуле со ссылкой на раздел этого файла.
+- Докейстры в каждом модуле со ссылкой на раздел этого файла / docs/protocol.md.
 - Тесты: `tests/test_<module>.py`, без сети и без llama.cpp (юнит-тесты
   только чистых функций; интеграционные помечать `@pytest.mark.network`).
 - PEP 8, max line 88.
