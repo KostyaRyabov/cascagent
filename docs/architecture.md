@@ -25,16 +25,18 @@ CLI (--query)──► DecomposerSession ──► LlamaCppClient ──► llam
 ```
 
 Формат вывода модели: `Название` (без отступа) + `    Описание` (с отступом);
-атом — ровно `<atom>`; вырожденный повтор родителя = атом (§3.6).
-Details: docs/protocol.md §2–3.
+атом — ровно `<atom>`; дедупликация по правилам R1/R2 (protocol.md §3.8):
+локальные дубли удаляются (пусто после фильтрации ⇒ атом), кросс-ветковые
+совпадения становятся ссылкой `duplicate_of` на самый глубокий оригинал.
+Details: docs/protocol.md §2–3, §3.8.
 
 ## 2. Модули и статусы
 
 | Модуль | Назначение | Статус |
 |--------|-----------|--------|
-| `models.py` | Task(brief, description, status), TaskStatus, DecompositionCall | 🚧 миграция v1→v2 |
+| `models.py` | Task(brief, description, status, duplicate_of), TaskStatus, DecompositionCall | 🚧 миграция v1→v2 |
 | `parser.py` | SYSTEM_PROMPT, split_think_and_response, sanitize_line, parse_decomposition, is_atomic, build_user_prompt | 🚧 миграция v1→v2 |
-| `detector.py` | DuplicateDetector (SequenceMatcher, порог 0.75, по brief) | 🚧 адаптация API |
+| `detector.py` | DuplicateDetector: R1 локальный (порог 0.75), R2 глобальный (порог ~0.90, по brief) | 🚧 адаптация API |
 | `history.py` | JSONL история LLM-вызовов + debug.log (THINK / FINAL RESPONSE) | ⬜ Этап 1 |
 | `client.py` | OpenAI-совместимый клиент llama.cpp, think параметр | ⬜ Этап 2 |
 | `cache_manager.py` | save/restore KV-кэша через /slots API | ⬜ Этап 2 |
@@ -77,7 +79,9 @@ think/no_think выбирается системой по глубине (L0–L
 
 - **SQLite Kanban** — источник истины о состоянии задач
   (pending/running/done/failed), граф parent_id + порядок исполнения.
-  Схема фиксируется в `kanban.py` (Этап 3).
+  Схема фиксируется в `kanban.py` (Этап 3). Хранит и связи дедупликации:
+  колонка `duplicate_of` → ссылка на оригинал (правило R2, protocol.md §3.8);
+  поиск глобальных дублей — по нормализованному `brief` через BKTree.
 - **JSONL** — один вызов LLM = одна строка (DecompositionCall.to_dict()).
 - **debug.log** — человекочитаемый лог с раздельными секциями
   `=== THINK ===` / `=== FINAL RESPONSE ===`.

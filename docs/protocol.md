@@ -72,14 +72,49 @@ CPU-слой вокруг неё (см. §5–7 и docs/architecture.md).
    (фильтрация дублей — ответственность DuplicateDetector выше по стеку).
 5. Парсер не изобретает задач: preamble до первой задачи игнорируется; но
    ни одна валидная пара brief+description не теряется.
-6. **Защита от вырожденного ответа:** если после разбора осталась ровно
-   одна подзадача, а её `brief` высокосходен с задачей родителя
-   (DuplicateDetector.is_parent_repeat) — считаем, что модель повторила
-   задачу вместо декомпозиции: это атом. Правило детерминировано и живёт
-   на CPU, модель про него не знает.
+6. **Вырожденный ответ = атом.** Если единственная подзадача декомпозиции
+   повторяет название задачи-родителя (`brief` ≈ родитель, см. §3.8 правило R1)
+   — это не декомпозиция, а признание нерасчленённости: задача атомарна.
+   Правило детерминировано и живёт на CPU, модель про него не знает.
 7. Markdown-шум на границах строк sanitize'ится детерминированно
    (буллеты, нумерация, `**`/backtick обёртки, zero-width символы) —
    `sanitize_line()` переиспользуется из v1 без изменений.
+
+### 3.8 Дедупликация: два разных случая (правила R1–R2)
+
+Совпадение названий бывает двух принципиально разных видов. Обрабатываются
+они по-разному; критерий — **область совпадения**.
+
+**R1 — локальный дубль внутри одной декомпозиции → УДАЛЯЕМ.**
+Сравнение идёт в пределах одного ответа модели:
+- подзадача совпадает с названием самой разбираемой задачи
+  (`is_parent_repeat`, порог 0.75) → строка удаляется;
+- две подзадачи совпадают между собой (`is_duplicate`, порог 0.75) →
+  остаётся первая по порядку, последующие удаляются.
+
+Если после фильтрации список пуст (или осталась одна строка, равная
+родителю) — **задача считается атомарной**, выполняется как есть
+(Executor), дальнейшей декомпозиции не подлежит. Это и есть способ
+получить `<atom>` без прямого токена от модели.
+
+**R2 — глобальное совпадение с задачей ДРУГОЙ ветки дерева → НЕ удаляем,
+создаём ссылку.** Сравнение идёт со всем деревом Kanban (нормализованный
+`brief`, BKTree, высокий порог ~0.90):
+- **оригиналом** становится самая ГЛУБОКАЯ задача (та, что появилась на
+  последнем уровне декомпозиции): именно в ней реально возникла потребность,
+  она содержит конкретику нижнего уровня;
+- более мелкая совпадающая задача помечается ссылкой `duplicate_of=<id
+  оригинала>` и НЕ исполняется отдельно;
+- результат оригинала автоматически распространяется на все ссылки;
+- родитель «мелкой» задачи получает блокировку по оригиналу: он завершится
+  (summarize) только когда оригинал станет DONE;
+- исходный порядок siblings сохраняется — ссылка не перемещается.
+
+Итого: локальное повторение (R1) — сигнал «не делится», удаляется и даёт
+атомарность; кросс-ветковое совпадение (R2) — сигнал «эта работа уже
+планируется глубже», превращается в ссылку на глубокий оригинал. Ни в коем
+случе R2 не приводит к удалению работы: она выполняется один раз — на
+максимальной глубине.
 
 Эталонная реализация (~20 строк):
 
@@ -116,7 +151,13 @@ class Task:
     parent_id: Optional[str] = None
     depth: int = 0
     subtasks: List[str] = field(default_factory=list)  # id детей (порядок = исполнение)
+    duplicate_of: Optional[str] = None  # ссылка на оригинал (правило R2, §3.8)
 ```
+
+Поле `duplicate_of` заполняется только CPU-слоем при глобальном совпадении
+с задачей другой ветки; `None` = задача самостоятельна (оригинал или unique).
+Ссылка (`duplicate_of != None`) не декомпозируется и не исполняется — её
+статус и `result` зеркалятся с оригинала.
 
 **УДАЛЕНО из v1** (определяется системой, а не моделью):
 - `TaskCategory` (`>` / `!` / `?`) — категорий больше нет; порядок списка =
@@ -165,9 +206,14 @@ completed_siblings)` (pure function, тестируется без сети).
 1. `split_think_and_response()` → THINK / FINAL RESPONSE (логируются оба);
 2. `is_atomic(final_response)` → атом или список;
 3. `parse_decomposition()` → список подзадач;
-4. DuplicateDetector: фильтр дублей внутри списка, повтора родителя
-   (см. §3.6), циклов по предкам (порог 0.75, SequenceMatcher — без изменений);
-5. Сохранение в SQLite Kanban; зависимости — по порядку.
+4. DuplicateDetector, правило R1 (§3.8): локальные дубли — внутри списка и
+   с родителем (порог 0.75) — удаляются; пустой список после фильтрации ⇒
+   задача атомарна;
+5. Глобальный дедуп по дереву Kanban, правило R2 (§3.8): совпадение с задачей
+   другой ветки (нормализованный brief, BKTree, порог ~0.90) ⇒ оригиналом
+   становится более глубокая задача, мелкая помечается `duplicate_of`;
+6. Сохранение в SQLite Kanban; зависимости — по порядку; ссылки блокируют
+   родителя до готовности оригинала.
 
 После выполнения:
 1. Сбор результатов детей; `summarize_results()` (конкатенация; опционально
@@ -186,13 +232,27 @@ def execute_with_decomposition(task: Task) -> str:
     if not task.subtasks:
         enriched = enricher.enrich(task.brief)
         call = decomposer.decompose(task, enriched)      # isolated HTTP call
-        if call.is_atomic or degenerate_repeat(call, task):   # §3.6
+        subs = parse(call.final_response)               # [] если <atom>/пусто
+        subs = filter_local_dupes(subs, task)           # R1: порог 0.75
+        if not subs:                                    # §3.8 R1: атом
             task.result = executor.execute(task)
             task.status = DONE
             return task.result
-        task.subtasks = filter_dupes(parse(call.final_response), task)
+        for s in subs:                                  # R2: дедуп по дереву
+            orig = kanban.find_duplicate(s.brief, threshold=0.90)
+            if orig and orig.depth >= s.depth:          # оригинал — глубже
+                s.duplicate_of = orig.id
+            elif orig:                                  # новая глубже →
+                kanban.repoint(orig, s)                 # она оригинал
+        task.subtasks = subs
         kanban.save_all(children_of(task))
-    results = [execute_with_decomposition(kanban.get(i)) for i in task.subtasks]
+    results = []
+    for i in task.subtasks:
+        child = kanban.get(i)
+        if child.duplicate_of:                          # ссылка ждёт оригинал
+            results.append(execute_with_decomposition(kanban.get(child.duplicate_of)))
+        else:
+            results.append(execute_with_decomposition(child))
     task.result = summarize_results(results)
     task.status = DONE
     kanban.update(task)
@@ -210,18 +270,21 @@ def execute_with_decomposition(task: Task) -> str:
 | Категории задач | RESEARCH/MUST_DO/DEFERRED | удалены (решает система) |
 | Токенов на запрос | ~500 system | ~100 system |
 | Модель данных | title + category + status-str | brief + description + TaskStatus |
+| Дубликаты | только локальный фильтр | R1 локальный (удаление/атом) + R2 глобальный (ссылка `duplicate_of`, оригинал — глубже) |
 
 ## 9. Миграция кодовой базы (чеклист)
 
 - [x] Документация v2 принята (этот файл, AGENTS.md §2.3–7/§10, architecture.md)
-- [ ] `models.py`: `TaskStatus`, новый `Task(brief, description, ...)`,
+- [x] Правила дедупликации R1/R2 зафиксированы (§3.8), поле `Task.duplicate_of` (§4)
+- [ ] `models.py`: `TaskStatus`, новый `Task(brief, description, ..., duplicate_of)`,
       удалить `TaskCategory`/`SYMBOL_TO_CATEGORY`; `DecompositionCall` под v2
 - [ ] `parser.py`: `SYSTEM_PROMPT`, `ATOM_MARKER`, `is_atomic()`,
       `parse_decomposition()`, `build_user_prompt()`;
       удалить `detect_category`, `parse_response`, старую сборку prompt;
       `split_think_and_response`, `sanitize_line` — без изменений
-- [ ] `detector.py`: API на `task.brief` вместо `task.title` (логика та же)
-- [ ] Тесты parser/detector переписать под v2-формат (+тест на §3.6)
+- [ ] `detector.py`: API на `task.brief` вместо `task.title` (логика та же);
+      два режима: R1 (локальный, порог 0.75) и R2 (глобальный, порог ~0.90)
+- [ ] Тесты parser/detector переписать под v2-формат (+тесты на §3.8 R1/R2)
 - [ ] history.py — по спецификации v2 (JSONL + debug.log, THINK/FINAL RESPONSE)
 - [ ] Этапы 2–6 (client, cache_manager, decomposer/kanban/cli, bk_tree,
       semantic, rag, enricher/executor/reflector/researcher)

@@ -83,15 +83,22 @@ System prompt ~200 символов; модель не знает про RAG/п�
 ```
 
 Атомарность: ровно `<atom>` (или пустой final_response) — никаких эвристик.
-Исключение (тоже детерминированное, CPU): вырожденный ответ — одна
-подзадача, чей brief ≈ задача родителя — трактуется как атом (§3 п.6).
+Два правила дедупликации (docs/protocol.md §3.8):
+- **R1 (локальные дубли → удаляем):** подзадача ≈ задача-родитель или
+  дубль внутри списка (порог 0.75) удаляется; если после фильтрации
+  список пуст — задача атомарна;
+- **R2 (кросс-ветковые совпадения → ссылка, не удаление):** оригиналом
+  считается самая глубокая задача (в ней реально возникла потребность);
+  более мелкая совпадающая помечается `Task.duplicate_of=<id оригинала>`,
+  не исполняется отдельно, её результат зеркалится с оригинала, а её
+  родитель блокируется до готовности оригинала.
 
 Модель НЕ знает про категории, RAG, semantic memory, enrichment — всё это
 делает CPU-слой вокруг неё (ContextEnricher, DuplicateDetector, Kanban).
 
 Модель данных: `Task(id, brief, description, status, result, parent_id,
-depth, subtasks)`; `TaskStatus = pending | running | done | failed`.
-`TaskCategory` из v1 удалён.
+depth, subtasks, duplicate_of)`; `TaskStatus = pending | running | done |
+failed`. `TaskCategory` из v1 удалён.
 
 ## 5. Передача контекста между уровнями
 
@@ -186,7 +193,8 @@ cascagent/
 `models.py`, `parser.py`, `detector.py` (+тесты).
 
 Ближайшие шаги (порядок):
-1. Миграция `models.py` + `parser.py` + `detector.py` на v2 (+переписать тесты);
+1. Миграция `models.py` + `parser.py` + `detector.py` на v2 (+переписать тесты;
+   detector — два режима R1/R2, Task — поле `duplicate_of`);
 2. `history.py` (JSONL + debug.log) + тесты;
 3. Этап 2: `client.py`, `cache_manager.py`;
 4. Далее по AGENTS.md §7 с новыми модулями v2 (enricher/executor/reflector/researcher).
