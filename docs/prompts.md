@@ -145,36 +145,13 @@ def parse_decomposition(response: str) -> list[dict]:
 
 ### 4.1. Разделение THINK / FINAL (`split_think_and_response`)
 
-Фиксируем реализацию (Глава VI.5 полной документации). Покрывает: нет
-think-блоков → `("", text)`; один блок; несколько блоков (склеиваются через
-`\n\n`); **незакрытый блок** (генерация оборвана на лимите токенов) — хвост
-после последнего открывающего тега считается незавершённым рассуждением,
-помечается `[INCOMPLETE]`, final пуст → ретрай по правилам cpu-offload §2.3:
+Эталон поведения (Глава VI.5 полной документации): нет think-блоков →
+`("", text)`; один блок; несколько блоков; **незакрытый блок** (генерация
+оборвана на лимите токенов) — хвост после открывающего тега считается
+незавершённым рассуждением, final пуст → ретрай по правилам cpu-offload §2.3.
 
-```python
-import re
-
-def split_think_and_response(response: str) -> tuple[str, str]:
-    think_pattern = re.compile(
-        r"<(?:think|thinking)>([\s\S]*?)</(?:think|thinking)>", re.DOTALL)
-    blocks = think_pattern.findall(response)
-    think = "\n\n".join(b.strip() for b in blocks)
-    final = think_pattern.sub("", response).strip()
-    if "" in response:                       # незакрытый хвост
-        tail = response.split("")[-1]
-        think += ("\n\n[INCOMPLETE]\n" + tail) if think else ("[INCOMPLETE]\n" + tail)
-        final = ""
-    return think, final
-```
-
-Примечание реализации: Qwen3 в чат-шаблоне chatml пишет рассуждения отдельным
-сообщением с каналом `think`; на llama.cpp при `"think": true` они приходят в
-`message.reasoning_content`, а не в `content`. Поэтому `client.py` обязан
-подавать в этот парсер оба варианта (inline-теги и склейка
-`reasoning_content + content`). Обёрнутые формы `<atom>текст</atom>`
-(наблюдались у phi4-mini) правит `sanitize_text` (A2), не эта функция.
-
-Снапшот-тесты (фиксируем в `tests/test_parser.py`):
+Референс — `src/cascagent/parser.py::split_think_and_response` (реализован,
+тесты зелёные); поведение зафиксировано снапшот-тестами:
 
 ```python
 def test_split_no_think():
@@ -186,9 +163,23 @@ def test_split_with_think():
     assert "Рассуждения" in t and "Задача" in f
 
 def test_split_incomplete_think():
+    # незакрытый тег: всё после него — think, финального ответа нет
     t, f = split_think_and_response("Оборванные рассуждения")
-    assert "[INCOMPLETE]" in t and f == ""
+    assert "Оборванные" in t and f == ""
 ```
+
+Отличие от исходного листинга Главы VI.5 (осознанное): реализация в репозитории
+ищет содержимое между парными тегами через position-slices вместо одного
+regex, корректно обрабатывает «только закрывающий тег» и второй галлюцинированный
+`` внутри ответа (подрезает final до него); маркер `[INCOMPLETE]` —
+уровень history/debug-логирования, а не парсера. Обёрнутые формы
+`<atom>текст</atom>` (наблюдались у phi4-mini) правит `sanitize_text` (A2),
+не эта функция.
+
+Примечание для `client.py`: Qwen3 в chatml пишет рассуждения отдельным
+сообщением с каналом `think`; на llama.cpp при `"think": true` они приходят в
+`message.reasoning_content`, а не в `content`. Клиент обязан подавать в парсер
+оба варианта (inline-теги и склейку `reasoning_content + content`).
 
 ## 5. Промпты остальных системных агентов
 
