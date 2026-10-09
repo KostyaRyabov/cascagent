@@ -183,6 +183,10 @@ ResearchAgent (`researcher.py`) изолированно собирает инф
 Модель данных и хранилища (Task v1→v2, dot-path ID, JSONL-запись, схема
 SQLite, EnrichedContext) — `docs/data.md`; промпты всех агентов и разбор
 вывода — `docs/prompts.md`; обоснования решений — `docs/decisions/`.
+Процесс выполнения целиком (ленивая декомпозиция, enrichment pipeline,
+Research/Reflect, суммаризация; детализация Главы IX) — `docs/process.md`;
+сквозные примеры логов — `docs/examples.md`; эксплуатация —
+`docs/operations.md`.
 
 ## 7. Псевдокод ядра
 
