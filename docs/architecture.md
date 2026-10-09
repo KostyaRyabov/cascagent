@@ -116,6 +116,12 @@ think/no_think выбирается системой по глубине (L0–L
   промпта с примером, разбор вывода и обработка краёв, антипаттерны.
 - `docs/config.md` — Python-окружение, зависимости core/extras (с расхождениями
   против исходной Главы IV), структура проекта, формат config.toml.
+- `docs/algorithms.md` — эталонные реализации CPU-алгоритмов реестра: BK-tree,
+  FuzzyMatcher/фонетика, SemanticMemory, двухступенчатый RAG, RobustYAMLParser,
+  DuplicateDetector (+ normalize-канон и маппинг на P/A).
+- `docs/performance.md` — кэш L1/L2/L3, узкое место префилла и контрмеры,
+  флаги движка под 4 GB VRAM, draft model (спекулятивный декодинг, вне v0.x),
+  PerformanceMetrics и их интерпретация.
 - `docs/decisions/` — ADR: 001 (inference engine), 002 (minimal prompt),
   003 (no categories).
 

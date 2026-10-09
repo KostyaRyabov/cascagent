@@ -62,6 +62,8 @@ cascagent/
 │   ├── product.md          # продукт: миссия, сценарии, системные агенты
 │   ├── architecture.md     # конспект архитектурных решений
 │   ├── cpu-offload.md      # реестр CPU-алгоритмов (P/A/E) vs LLM-вызовы
+│   ├── algorithms.md       # эталонные реализации: BK-tree, fuzzy, memory, RAG, YAML
+│   ├── performance.md      # кэш L1-L3, префилл, draft model, PerformanceMetrics
 │   ├── stack.md            # стек инференса: движки, модель, think, KV-кэш
 │   ├── data.md             # модель данных: Task, ID, история, хранилища
 │   ├── prompts.md          # системные промпты всех агентов, парсинг, антипаттерны

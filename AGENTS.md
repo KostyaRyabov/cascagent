@@ -147,6 +147,8 @@ cascagent/
 ├── docs/data.md          # модель данных: Task v2, dot-path ID, JSONL, схема SQLite
 ├── docs/prompts.md       # промпты всех агентов, парсинг вывода, антипаттерны
 ├── docs/config.md        # зависимости core/extras, config.toml, структура
+├── docs/algorithms.md    # эталонные реализации CPU-алгоритмов (BK-tree, fuzzy, memory, RAG)
+├── docs/performance.md   # кэш L1–L3, префилл, draft model, PerformanceMetrics
 ├── docs/decisions/       # ADR-001..003 (движок, минимальный промпт, без категорий)
 ├── AGENTS.md             # этот файл
 ├── pyproject.toml
