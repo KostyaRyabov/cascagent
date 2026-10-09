@@ -104,7 +104,33 @@ class TestFilterTasks:
         assert len(rejected) == 1
 
     def test_keeps_all_distinct_never_truncates(self, det):
-        tasks = [self._t(f"Задача {i}: " + "".join(chr(0x410 + (i * 7 + j * 5) % 32) for j in range(9))) for i in range(20)]
+        # 20 заведомо различных задач: максимальный SequenceMatcher ratio
+        # между любой парой ~0.56 (проверено) — далеко ниже порога 0.75,
+        # поэтому filter_tasks не должен отбрасывать ничего (принцип
+        # «никогда не обрезаем список»).
+        titles = [
+            "Написать unit-тесты для parser.py",
+            "Собрать CI pipeline с GitHub Actions",
+            "Заменить логгер на structlog",
+            "Добавить retry с экспоненциальным backoff",
+            "Профилировать CPU утилитой py-sampler",
+            "Настроить pre-commit хуки",
+            "Мигрировать конфиг из ini в toml",
+            "Удалить мёртвый код модуля legacy_utils",
+            "Добавить typing stubs для сторонней либы",
+            "Рефакторинг cli: вынести парсер аргументов",
+            "Закешировать HTTP ответы в sqlite",
+            "Добавить rate limiter к внешнему API",
+            "Переименовать пакет core в engine",
+            "Вынести константы в отдельный файл",
+            "Добавить метрики Prometheus endpoint",
+            "Написать миграцию базы v3->v4",
+            "Внедрить feature flags через env",
+            "Оптимизировать N+1 запросы в ORM",
+            "Добавить graceful shutdown сервиса",
+            "Задокументировать публичный API в README",
+        ]
+        tasks = [self._t(t) for t in titles]
         kept, rejected = det.filter_tasks(tasks)
         assert len(kept) == 20 and rejected == []
 
