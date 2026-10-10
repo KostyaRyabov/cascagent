@@ -37,7 +37,7 @@
 | Опечатки в именах | Левенштейн + фонетика | `bk_tree.fix_typo` |
 | Похожие задачи | Эмбеддинги + cosine | `semantic.py` |
 | Поиск в документации | RAG (BM25 + vectors) | `rag.py` |
-| Обогащение контекста | RAG + recall + сжатие | `enricher.py` |
+| Обогащение контекста | CPU RAG по embedding(brief), не через LLM (process.md §2) | `enricher.py` |
 | Состояние задач | SQLite Kanban | `kanban.py` |
 | Дубли подзадач | SequenceMatcher | `detector.py` |
 | Разбор формата ответа | отступы → brief/description | `parser.py` |
@@ -149,7 +149,12 @@ cascagent/
 ├── docs/config.md        # зависимости core/extras, config.toml, структура
 ├── docs/algorithms.md    # эталонные реализации CPU-алгоритмов (BK-tree, fuzzy, memory, RAG)
 ├── docs/performance.md   # кэш L1–L3, префилл, draft model, PerformanceMetrics
-├── docs/decisions/       # ADR-001..003 (движок, минимальный промпт, без категорий)
+├── docs/process.md       # процесс: ленивая декомпозиция, enrichment, Reflect/Research (Глава IX)
+├── docs/examples.md      # референсные сквозные логи + anti-примеры (Глава XII)
+├── docs/operations.md    # эксплуатация: железо, установка, мониторинг, troubleshooting (Глава XI)
+├── docs/plugins.md       # плагинная архитектура агентов v3: секции, SessionMemory, конфиги (Этап 5+)
+├── docs/roadmap.md       # АУДИТ ПРОБЕЛОВ + решения: Python для MVP (порт после), timeout/guard/recovery, MVP-чеклист
+├── docs/decisions/       # ADR-001..004 (движок, минимальный промпт, без категорий, ленивая декомпозиция)
 ├── AGENTS.md             # этот файл
 ├── pyproject.toml
 ├── README.md
@@ -172,10 +177,24 @@ cascagent/
 - **Этап 5 (Обвязка агентов):** enricher, executor, reflector, researcher
 - **Этап 6 (Интеграция):** оставшиеся тесты, README, docs
 
+Процесс выполнения системы (ленивая декомпозиция, enrichment pipeline,
+Research/Reflect, суммаризация) специфицирован в `docs/process.md`;
+референсные сквозные логи — `docs/examples.md`; эксплуатация —
+`docs/operations.md`. Плагинная архитектура агентов (секции init/input/
+trigger/output, SessionMemory, конфигурации через TOML) спроектирована в
+`docs/plugins.md` и реализуется на Этапе 5. Аудит непроектированных областей
+(20 пробелов) и принятые по ним решения — `docs/roadmap.md`; перед реализацией
+новых компонентов сверяйтесь с его чек-листом продакшн-MVP (§8) и открытыми
+вопросами (§9).
+
 Текущий статус: см. раздел 10.
 
 ## 8. Принципы разработки
 
+0. **Язык: MVP пишется на Python; после MVP — оптимизация/порт на более
+   подходящий язык** (решения и следствия — `docs/roadmap.md` §1). Не
+   завязывать CPU-алгоритмы на Python-specific трюки, держать форматы на
+   диске language-neutral.
 1. Никаких эвристик для определения атомарности: только точный `<atom>`
    или пустой final_response.
 2. НЕ обрезать список подзадач — возвращать всё после дубль-фильтрации.

@@ -68,6 +68,12 @@ cascagent/
 │   ├── data.md             # модель данных: Task, ID, история, хранилища
 │   ├── prompts.md          # системные промпты всех агентов, парсинг, антипаттерны
 │   ├── config.md           # этот файл: конфиг, зависимости, окружение
+│   ├── process.md          # процесс: ленивая декомпозиция, enrichment,
+│   │                       #   Reflect/Research (Глава IX)
+│   ├── examples.md         # референсные сквозные логи + anti-примеры (Глава XII)
+│   ├── operations.md       # эксплуатация: железо, установка, мониторинг (Глава XI)
+│   ├── plugins.md          # плагинная архитектура агентов v3: секции, память, конфиги
+│   ├── roadmap.md          # аудит пробелов + решения (MVP-чеклист, timeout/guard/recovery)
 │   └── decisions/          # ADR: 001 inference engine, 002 minimal prompt,
 │       │                   #      003 no categories
 │       └── *.md

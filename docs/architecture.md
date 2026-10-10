@@ -74,7 +74,8 @@ Details: docs/protocol.md §2–3.
 1. system prompt (`SYSTEM_PROMPT`, фиксированный ~200 симв. → префиксный кэш);
 2. `Задача: {task.brief}`;
 3. `Контекст:` — enriched context (RAG-фрагменты, semantic recall top-3,
-   сжатые выводы) — источники модели неизвестны;
+   сжатые выводы) — источники модели неизвестны; обогащение строится на
+   CPU по embedding(brief) задачи — LLM не решает что искать (process.md §2);
 4. `Выполненные ранее:` — чеклист siblings;
 5. `РАЗБЕЙ НА ПОДЗАДАЧИ:`.
 
@@ -122,8 +123,31 @@ think/no_think выбирается системой по глубине (L0–L
 - `docs/performance.md` — кэш L1/L2/L3, узкое место префилла и контрмеры,
   флаги движка под 4 GB VRAM, draft model (спекулятивный декодинг, вне v0.x),
   PerformanceMetrics и их интерпретация.
+- `docs/process.md` — процесс выполнения (Глава IX): ленивая декомпозиция с
+  эталонным псевдокодом execute_task, Context Enrichment pipeline,
+  ResearchAgent/ReflectAgent в v2-трактовке (без RESEARCH_NEEDED/replan),
+  суммаризация результатов, реестр расхождений оригинала с v2.
+- `docs/examples.md` — референсные сквозные логи (Hello World / REST API /
+  Reflect на FAILED / research-heavy) + anti-примеры; основа будущих e2e.
+- `docs/operations.md` — эксплуатация (Глава XI): железо, установка бэкендов,
+  профили конфигурации, мониторинг (status/tree/report/health),
+  troubleshooting, безопасность.
+- `docs/plugins.md` — плагинная архитектура агентов (слой v3, Этап 5+):
+  агент = промпт + плагины + инструменты, четыре секции (init/input/
+  trigger/output), SessionMemory (global/local/stats/breakpoints, подписки),
+  базовые классы, каталог встроенных плагинов, TOML-конфигурации четырёх
+  агентов, правила расширения и обратная совместимость API.
+- `docs/roadmap.md` — аудит пробелов архитектуры (20 пунктов) с
+  зафиксированными решениями: Python для MVP (+порт после), timeout-плагины
+  вместо sandbox, PromptInjectionGuard, recovery/checkpoints, seed/replay,
+  обработка ошибок LLM, observability через SharedMemory+файлы, MemoryEntry
+  с метрикой актуальности, версионирование промптов, canonical_id для
+  графов задач, модель разрешений MCP tools; чек-лист продакшн-MVP.
 - `docs/decisions/` — ADR: 001 (inference engine), 002 (minimal prompt),
-  003 (no categories).
+  003 (no categories), 004 (lazy decomposition). Решения «CPU-offload»
+  (cpu-offload.md), «изоляция агентов» (product.md §2.1) и «атомарность
+  только `<atom>`» (prompts.md §4, AGENTS.md §8.1) приняты и задокументированы
+  в тематических файлах; отдельные ADR для них не заводились.
 
 ## 8. План заполнения документа
 

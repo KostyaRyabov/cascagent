@@ -142,7 +142,11 @@ class FuzzyMatcher:
 - `remember(brief, result, source_task_id)` — после успешного DONE (A12);
   эмбеддинг `brief` (не description — короче и стабильнее как ключ опыта).
 - `recall(query, top_k=3, min_similarity=0.7)` — перед вызовом модели (P2);
-  результаты кладутся в `EnrichedContext.semantic_memories`.
+  результаты кладутся в `EnrichedContext.semantic_memories`. Query —
+  embedding(brief) задачи: **LLM не решает что искать**, enrichment это
+  CPU-предобработка по вектору brief'а (process.md §2, зафиксировано
+  2026-10-10). Принимает как строку (энкодится внутри), так и готовый
+  np.ndarray (skip re-encode при едином qv из enricher'а).
 - Реализация v0.x: numpy-перебор BLOB'ов (~50 мс на 1000 записей, CPU-only
   all-MiniLM-L6-v2 encode ≈10 мс/строка). Порог миграции на faiss-cpu /
   sqlite-vss — >10k записей (открытый вопрос data.md §9).
@@ -171,6 +175,12 @@ def recall(self, query: str, top_k: int = 3, min_similarity: float = 0.7):
 
 BM25 (ключевые слова, дёшево) → vector rerank top-50 (семантика, точнее).
 Документация индексируется при старте; запрос — из обогащения (P3).
+Важно (зафиксировано 2026-10-10): LLM не формулирует поисковые запросы —
+query всегда происходит от embedding(brief) текущей задачи (process.md §2).
+BM25 здесь — только дешёвый предфильтр кандидатов под векторный rerank,
+а не «поиск по словам которые придумала модель». `search()` принимает как
+строку, так и готовый query-вектор (qv из enricher'а, чтобы не энкодить
+brief дважды).
 
 ```python
 def search(self, query: str, top_k: int = 3):
