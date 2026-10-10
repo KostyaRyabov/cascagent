@@ -37,7 +37,7 @@
 | Опечатки в именах | Левенштейн + фонетика | `bk_tree.fix_typo` |
 | Похожие задачи | Эмбеддинги + cosine | `semantic.py` |
 | Поиск в документации | RAG (BM25 + vectors) | `rag.py` |
-| Обогащение контекста | RAG + recall + сжатие | `enricher.py` |
+| Обогащение контекста | CPU RAG по embedding(brief), не через LLM (process.md §2) | `enricher.py` |
 | Состояние задач | SQLite Kanban | `kanban.py` |
 | Дубли подзадач | SequenceMatcher | `detector.py` |
 | Разбор формата ответа | отступы → brief/description | `parser.py` |

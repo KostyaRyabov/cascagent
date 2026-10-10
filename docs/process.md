@@ -109,14 +109,26 @@ T4: 0.3 видит результаты 0.1+0.2 — и т.д.
 **Когда:** перед каждым вызовом LLM (декомпозиция, executor, reflect).
 Модель не знает источников — она видит блок `Контекст:` (prompts §3).
 
+**Ключевой принцип (зафиксирован 2026-10-10):** LLM сама НЕ решает что
+искать. Обогащение — чистая CPU-предобработка: у задачи есть `brief`,
+по его эмбеддингу идёт семантический поиск по всем индексам проекта
+(документация, файлы, база знаний, findings исследований), top-K
+фрагментов подмешивается в контекст **до** передачи в LLM. Дефолтный
+путь поиска — векторный (embedding brief'а → cosine similarity); BM25
+в RAG остаётся дешёвой предфильтрацией кандидатов (algorithms §4), а не
+способом «сформулировать запрос». Детерминированность: одинаковый
+brief → одинаковое обогащение. Нехватку данных определяет не модель, а
+Validator **после** попытки выполнения (§5, roadmap §4.6.2).
+
 ```python
 class ContextEnricher:
     def enrich(self, brief: str, parent_context=None,
                completed_siblings=None, max_tokens: int = 500) -> EnrichedContext:
         ctx = EnrichedContext()
-        ctx.rag_documents      = [d["content"] for d in rag.search(brief, top_k=3)]     # P3
-        ctx.semantic_memories  = format_memories(semantic.recall(brief, top_k=3))       # P2
-        ctx.similar_tasks      = kanban.find_similar(brief, top_k=3)                     # P1/P2
+        qv = self.embedder.encode(brief)   # embedding(brief) — ЕДИНЫЙ query для всех индексов
+        ctx.rag_documents      = [d["content"] for d in rag.search(qv, top_k=3)]     # P3, vector-first
+        ctx.semantic_memories  = format_memories(semantic.recall(qv, top_k=3))       # P2, cosine по эмбеддингам
+        ctx.similar_tasks      = kanban.find_similar(qv, top_k=3)                            # P1/P2
         ctx.completed_siblings = completed_siblings or []
         ctx.parent_context     = parent_context or {}
         full = ctx.to_prompt_block(max_tokens)                                           # data.md §6
@@ -127,6 +139,15 @@ class ContextEnricher:
         ctx.gaps = detect_gaps(ctx)   # пусто везде → сигнал ResearchAgent (§5)
         return ctx
 ```
+
+Схема потока (зафиксирована): `brief → embed(brief) → semantic_search по
+индексам [docs, files, KB, research findings] → format(top-K) → LLM
+работает только с готовым контекстом → Validator проверяет результат;
+при нехватке данных инициирует Researcher, тот обогащает индексы, и
+Executor повторяет попытку`. Разделение ответственности: CPU решает
+**что релевантно** (similarity), LLM — **как использовать**, Researcher —
+**где искать новое**, Validator — **хватает ли**. Никаких «запросов к
+LLM о том, что поискать» — это исключает зацикливание на выборе поиска.
 
 Приоритет при обрезке после сжатия (data.md §6): siblings > research >
 semantic > RAG. Порядок фиксирован — deterministic, тестируется без сети.
@@ -163,8 +184,13 @@ result)` — будущие recall. Правило: суммаризация **�
 
 ⚠️ v1-наследие: в Главе IX декомпозер возвращал маркер `RESEARCH_NEEDED`.
 В v2 модель **не умеет** просить исследование (ADR-003): триггер чисто CPU —
-`enriched.gaps` непустой (RAG/semantic/Kanban ничего не нашли) либо
-Executor вернул ошибку «нет входных данных».
+`enriched.gaps` непустой (семантический поиск по эмбеддингу brief'а ничего
+не нашёл во всех индексах; см. §2) либо Executor вернул ошибку «нет входных
+данных», либо Validator после проверки результата вынес вердикт
+«нехватка данных» → инициирует Researcher (roadmap §4.6.2). Роли разведены
+жёстко: **Executor** выполняет задачу только с теми ресурсами что дал
+enrichment; **Researcher** ищет НОВЫЕ ресурсы и обогащает индексы для
+будущих задач; **Validator** решает хватает ли ресурсов.
 
 ```python
 def handle_research_needed(brief: str) -> ResearchFinding:

@@ -16,7 +16,7 @@
 2. Основные принципы
 3. Архитектура агента
 4. Четыре секции плагинов
-5. SessionMemory — общая память
+5. SessionMemory — 4-уровневая память
 6. Базовые классы
 7. Каталог встроенных плагинов
 8. Конфигурации агентов
@@ -177,8 +177,10 @@ PromptCompiler компилирует этот префикс один раз, �
 |  [INIT plugins]   [INPUT plugins]   [TRIGGER plugins]|
 |                                                     |
 |  [OUTPUT plugins]      SessionMemory                |
-|                        +- global (persistent)       |
-|                        +- local  (per-run)          |
+|                        +- super   (все проекты)     |
+|                        +- project (все агенты)      |
+|                        +- session (этот агент)      |
+|                        +- local   (per-run)         |
 +-----------------------------------------------------+
 ```
 
@@ -233,7 +235,7 @@ class IndexLoader(InitPlugin):
         for name in self.tool_names:
             tree.add(name)
         session.indices["tools"] = tree
-        memory.set_global("tools_loaded", True)
+        memory.set_session("tools_loaded", True)
         return session
 ```
 
@@ -252,18 +254,22 @@ class IndexLoader(InitPlugin):
 
 ```python
 class ContextEnricher(InputPlugin):
-    """Собирает контекст из всех источников."""
+    """CPU-обогащение через RAG по эмбеддингу brief'а. LLM НЕ решает что
+    искать — поиск идёт по embedding(brief) до передачи контекста модели
+    (process.md §2, зафиксировано 2026-10-10)."""
 
     def on_input(self, messages, context, session, memory):
         task = context["task"]
 
-        # Проверяем кэш в local памяти (для multi-turn)
+        # Кэш в local памяти (для multi-turn); детерминирован: одинаковый
+        # brief -> одинаковое обогащение
         cache_key = f"enrichment_{task.id}"
         cached = memory.get_local(cache_key)
 
         if not cached:
-            docs = self.rag.search(task.brief, top_k=3)
-            memories = self.semantic.recall(task.brief, top_k=3)
+            qv = self.embedder.encode(task.brief)      # единый query-вектор
+            docs = self.rag.search(qv, top_k=3)        # vector-first (BM25 — предфильтр)
+            memories = self.semantic.recall(qv, top_k=3)
             siblings = self.kanban.get_completed_siblings(task.id)
             cached = self._format(docs, memories, siblings)
             memory.set_local(cache_key, cached)
@@ -396,64 +402,107 @@ class ResponseParser(OutputPlugin):
 
 ---
 
-## 5. SessionMemory — общая память
+## 5. SessionMemory — четырёхуровневая память
 
-### 5.1 Концепция
+### 5.1 Концепция уровней
 
-SessionMemory — двухуровневое хранилище данных, доступное всем плагинам
-ОДНОГО агента. Это единственный легальный канал коммуникации между
-плагинами (§2.6). Между агентами память НЕ разделяется (§2.1).
+SessionMemory — иерархическое хранилище данных, доступное всем плагинам
+агента. Это единственный легальный канал коммуникации между плагинами
+(§2.6) и между агентами (через project-уровень). Изоляция (§2.1) теперь
+задаётся **уровнем**, а не запретом разделения: агент по умолчанию видит
+только свои local/session; совместные данные явно кладутся на project или
+super уровень.
 
 ```
-+-------------------------------------+
-|          SessionMemory              |
-+-------------------------------------+
-| GLOBAL (живёт всю сессию)           |
-|  - conversation_history: list       |
-|  - stats: dict                      |
-|  - think_stats: dict                |
-|  - rate_limit_calls: list           |
-|  - [любые ключи от плагинов]        |
-|                                     |
-| LOCAL (сбрасывается каждый run)     |
-|  - think_content: str               |
-|  - parse_errors: list               |
-|  - enrichment_{id}: str             |
-|  - [любые ключи от плагинов]        |
-+-------------------------------------+
++-----------------------------------------------------------+
+|                    SUPER GLOBAL                            |
+|      Общая для ВСЕХ агентов во ВСЕХ проектах               |
+|      Персистентная (переживает перезапуски)                |
+|      Примеры: общая статистика, системные конфиги          |
++-----------------------------+-----------------------------+
+                              |
++-----------------------------v-----------------------------+
+|                    PROJECT GLOBAL                          |
+|      Общая для всех агентов ВНУТРИ одного проекта          |
+|      Персистентная (пока проект активен)                   |
+|      Примеры: результаты исследований, общий контекст      |
++-----------------------------+-----------------------------+
+                              |
++-----------------------------v-----------------------------+
+|                    SESSION GLOBAL                          |
+|      Приватная для ОДНОЙ сессии агента                     |
+|      Персистентная в рамках сессии (дампится)              |
+|      Примеры: история диалога, статистика агента           |
++-----------------------------+-----------------------------+
+                              |
++-----------------------------v-----------------------------+
+|                    LOCAL                                   |
+|      Приватная для ОДНОГО вызова run()                     |
+|      Сбрасывается в начале каждого run()                   |
+|      Примеры: think_content, parse_errors, промежуточные   |
++-----------------------------------------------------------+
 ```
 
-### 5.2 Два скоупа
+### 5.2 Матрица доступности
 
-| Скоуп | Время жизни | Сбрасывается | Примеры использования |
-|-------|------------|--------------|----------------------|
-| **global** | Всю сессию агента | При пересоздании | История диалога, статистика, конфиги |
-| **local** | Один вызов run() | В начале каждого run() | Think-блоки, промежуточные результаты, кэш в рамках вызова |
+| Уровень | Видимость | Персистентность | Сброс |
+|---------|-----------|-----------------|-------|
+| **local** | Только этот агент в этом run | ❌ нет | Каждый `run()` |
+| **session** | Только этот агент во всех run | ✅ дамп/SQLite namespace | При `reset_session()` |
+| **project** | Все агенты в проекте | ✅ в БД проекта | При закрытии проекта |
+| **super** | Все агенты везде | ✅ в системной БД | Никогда (или вручную) |
+
+Уровни session/project/super реализуются через унифицированный бэкенд
+`MemoryStore` (§6.5); session-level даёт изоляцию агентов из §2.1,
+project-level — контролируемый обмен (Producer-Consumer, §5.6).
 
 ### 5.3 API памяти
 
 ```python
 class SessionMemory:
-    # === GLOBAL ===
-    def set_global(self, key: str, value: Any) -> None: ...
-    def get_global(self, key: str, default: Any = None) -> Any: ...
-    def update_global(self, key: str, updater: callable, default: Any = None) -> Any: ...
+    """
+    4-уровневая память агента.
 
-    # === LOCAL ===
+    Levels (в порядке приватности):
+      local          — только этот run
+      session        — вся сессия этого агента
+      project        — все агенты в проекте
+      super_global   — все агенты везде
+    """
+
+    # === LOCAL (per-run, in-memory only) ===
     def set_local(self, key: str, value: Any) -> None: ...
     def get_local(self, key: str, default: Any = None) -> Any: ...
     def update_local(self, key: str, updater: callable, default: Any = None) -> Any: ...
 
+    # === SESSION GLOBAL (per-agent session, persisted) ===
+    def set_session(self, key: str, value: Any) -> None: ...
+    def get_session(self, key: str, default: Any = None) -> Any: ...
+    def update_session(self, key: str, updater: callable, default: Any = None) -> Any: ...
+
+    # === PROJECT GLOBAL (shared across agents in project) ===
+    def set_project(self, key: str, value: Any) -> None: ...
+    def get_project(self, key: str, default: Any = None) -> Any: ...
+    def update_project(self, key: str, updater: callable, default: Any = None) -> Any: ...
+
+    # === SUPER GLOBAL (shared across all projects) ===
+    def set_super(self, key: str, value: Any) -> None: ...
+    def get_super(self, key: str, default: Any = None) -> Any: ...
+    def update_super(self, key: str, updater: callable, default: Any = None) -> Any: ...
+
     # === УПРАВЛЕНИЕ ===
-    def reset_local(self) -> None: ...   # вызывается автоматически в начале run()
-    def reset_all(self) -> None: ...     # при пересоздании сессии
+    def reset_local(self) -> None: ...    # вызывается автоматически в начале run()
+    def reset_session(self) -> None: ...  # полный сброс сессии агента (local + session)
 
     # === ПОДПИСКИ (event-driven) ===
     def subscribe(self, key: str, callback: callable) -> None: ...
 
     # === УТИЛИТЫ ===
-    def snapshot(self) -> dict: ...      # снимок всей памяти
+    def snapshot(self) -> dict: ...       # снимок всех четырёх уровней
 ```
+
+Именование методов (`*_session`, `*_project`, `*_super`) фиксируется как
+API v3; старые `*_global` из черновиков не поддерживаются (см. §5.6–§5.7).
 
 ### 5.4 Event-driven подписки
 
@@ -476,9 +525,57 @@ def _on_duration(self, key, value, scope):
 прерывает set_*(); подписки живут до конца сессии (отписка не предусмотрена
 — сессия короткоживущая).
 
-### 5.5 Паттерны использования
+### 5.5 Жизненный цикл и создание памяти
 
-**Producer-Consumer (Trigger → Output):**
+Память создаётся фабрикой до `bind()` — один экземпляр SessionMemory на
+агента; оркестратор передаёт его в `Agent(memory=...)`:
+
+```python
+# При старте системы
+factory = MemoryFactory(
+    project_id="blog-api-project",
+    super_global_db=Path("./data/super_global.db"),
+    projects_db=Path("./data/projects.db"),
+)
+
+# Для каждого агента в проекте
+decomposer_memory = factory.create_for_agent(
+    agent_name="decomposer",
+    session_id="decomposer-session-2026-10-10-1",
+)
+executor_memory = factory.create_for_agent(
+    agent_name="executor",
+    session_id="executor-session-2026-10-10-1",
+)
+
+# decomposer и executor делят project-level память,
+# но их session-level хранилища изолированы
+```
+
+Namespace'ы (`MemoryFactory.create_for_agent`, код — §6.6):
+
+| Уровень | БД | namespace |
+|---------|----|-----------| 
+| session | projects.db | `session:{session_id}` |
+| project | projects.db | `project:{project_id}` |
+| super | super_global.db | `system` |
+
+Видимость между агентами:
+
+```python
+# Decomposer Agent пишет на общий уровень
+decomposer_memory.set_project("research_jwt_findings", {...})
+
+# Executor Agent может прочитать
+jwt_info = executor_memory.get_project("research_jwt_findings")
+
+# Но НЕ видит session-level decomposer'а — это СВОЙ счётчик executor'а:
+calls = executor_memory.get_session("calls_count")   # → None
+```
+
+### 5.6 Паттерны использования
+
+**Producer-Consumer внутри агента (Trigger → Output):**
 
 ```python
 # Trigger плагин пишет в local
@@ -488,13 +585,45 @@ memory.set_local("think_content", think_block)
 think = memory.get_local("think_content", "")
 ```
 
-**Счётчики (атомарное обновление):**
+**Producer-Consumer между агентами (Researcher → Executor):**
 
 ```python
-memory.update_global("total_calls", lambda x: x + 1, default=0)
+# Researcher Agent (producer) — результат исследования в проект
+memory.set_project("research_stripe_api", {
+    "version": "2025-10",
+    "auth": "Bearer token",
+    "endpoints": {...},
+})
+
+# Executor Agent (consumer)
+stripe_info = memory.get_project("research_stripe_api")
 ```
 
-**Кэш в рамках run():**
+**Счётчики на уровне session (атомарное обновление):**
+
+```python
+memory.update_session("calls_count", lambda x: x + 1, default=0)
+memory.update_session("tokens_used", lambda x: x + tokens, default=0)
+
+avg = memory.get_session("tokens_used") / memory.get_session("calls_count")
+```
+
+**Глобальная статистика на super-уровне (редко!):**
+
+```python
+# В output-плагине любого агента
+memory.update_super(
+    "global_stats",
+    lambda s: {
+        "total_calls": s["total_calls"] + 1,
+        "total_duration_ms": s["total_duration_ms"] + duration,
+        "total_tokens": s["total_tokens"] + tokens,
+    },
+    default={"total_calls": 0, "total_duration_ms": 0, "total_tokens": 0},
+)
+```
+
+**Кэш в рамках run() (local):**
 
 ```python
 cached = memory.get_local(f"enrichment_{task.id}")
@@ -503,69 +632,99 @@ if not cached:
     memory.set_local(f"enrichment_{task.id}", cached)
 ```
 
-**Флаги координации:**
+**Флаги координации (local, читает оркестратор после run — §11.3):**
 
 ```python
 # Плагин A
 memory.set_local("needs_research", True)
 memory.set_local("research_query", "как работает X")
 
-# Плагин B
+# Плагин B (позже в цепочке output)
 if memory.get_local("needs_research"):
     query = memory.get_local("research_query")
     # запустить исследование
 ```
 
-### 5.6 Соглашения об именовании ключей
+### 5.7 Соглашения об именовании ключей
 
-| Префикс ключа | Скоуп | Пример | Кто пишет |
-|---------------|-------|--------|-----------|
+| Префикс ключа | Уровень | Пример | Кто пишет |
+|---------------|---------|--------|-----------|
 | `think_*` | local | `think_content`, `think_length` | Trigger |
 | `enrichment_*` | local | `enrichment_0.2.1` | Input |
 | `parsed`, `parse_error` | local | результат парсинга | Output |
-| `stats`, `*_stats` | global | `think_stats`, `token_stats` | StatisticsCollector |
-| `total_calls`, `rate_limit_calls` | global | счётчики | Init/Output |
 | `needs_*`, флаги | local | `needs_research` | любой |
+| `*_stats`, `calls_count` | session | `think_stats`, `conversation_history` | StatisticsCollector |
+| `rate_limit_calls` | session | счётчики лимитов агента | Init/Output |
+| `research_*`, `task_*_result` | project | findings, результаты задач | Output/оркестратор |
+| `global_stats`, `system_version` | super | сквозная статистика | MetricsWriter |
 
 Ключи без префикса — локальные переменные одного плагина, другим секциям
-не гарантируются.
+не гарантируются. Правило выбора уровня: по умолчанию пишется на самый
+приватный подходящий уровень; повышение уровня — осознанное решение
+(лидер проекта: super-уровень использовать только для статистики и
+системных конфигов).
 
-### 5.7 Расширение: stats и breakpoints (решение аудита #3)
+### 5.8 Breakpoints и recovery (решение аудита #3)
 
-Зафиксировано в `docs/roadmap.md` §3.3: для восстановления после сбоев
-SessionMemory получает два дополнительных **персистентных** отдела вдобавок
-к global/local:
-
-```python
-class SessionMemory:
-    _global: dict        # живёт всю сессию агента (как раньше)
-    _local: dict         # сбрасывается каждый run() (как раньше)
-    _stats: dict         # persist: счётчики вызовов, латентность, токены
-    _breakpoints: list   # persist: именованные дампы state для resume
-```
-
-Дополнительный API (основное поведение §5.3 не меняется):
+Пересмотр черновика roadmap §3.3: отдельные `_stats`/`_breakpoints` поля
+**не вводятся** — их роль полностью берут на себя session/project уровни
+(они персистентны по построению, §5.2). Остаются только точки
+восстановления:
 
 ```python
-def set_stats(self, key, value): ...        # как set_global, но попадает
-def get_stats(self, key, default=None): ... #   в to_dump() всегда
-def add_breakpoint(self, name, state): ...  # append {name, ts, state}
-def last_breakpoint(self): ...              # или None
-def to_dump(self) -> dict: ...              # {global, stats, breakpoints}
-@classmethod
-def from_dump(cls, data) -> "SessionMemory": ...
+class BreakpointManager:
+    """Сохраняет снапшоты состояния для восстановления."""
+
+    def __init__(self, memory: SessionMemory, storage_path: Path): ...
+
+    def save_breakpoint(self, label: str, context: dict = None):
+        """append JSONL-записи {label, timestamp, context, snapshot()}"""
+
+    def load_breakpoint(self, label: str) -> dict | None:
+        """последняя точка с таким label"""
+
+    def restore_from(self, breakpoint: dict):
+        """local пересоздаётся из снапшота; session восстанавливается
+        целиком; project/super НЕ трогаем — они персистентные и могли
+        измениться другими агентами пока процесс был мёртв"""
 ```
 
 Правила:
 
-- `reset_local()` **не трогает** stats/breakpoints; `reset_all()` трогает всё.
-- Дамп на диск делает `CheckpointSaver` (Output) в
-  `sessions/{agent_name}/{session_id}.json` при ключевых событиях
-  (успех run, FAILED задачи, конец поддерева); загрузка — `CheckpointLoader`
-  (Init). Механика `cascagent resume` — `docs/roadmap.md` §3.3.
-- Подписки (§5.4) работают и на stats-ключи.
+- `reset_local()` не трогает session/project/super; `reset_session()`
+  чистит local + session (этот агент начинает новую сессию).
+- Breakpoint'ы пишутся в `data/breakpoints/{session_id}.jsonl` плагином
+  `AutoCheckpoint` (Output) после каждого успешного run и при FAILED
+  задачах; ротация — хранить 20 последних на сессию (gzip, открытый
+  вопрос roadmap §9.1 теперь решён в пользу JSONL+gzip).
+- Подписки (§5.4) работают на все четыре уровня; callback получает
+  `(key, value, level)`.
+- Механика `cascagent resume` (kanban как источник истины о задачах) —
+  `docs/roadmap.md` §3.3; память дополняет её состоянием агента.
 - Логику MemoryEntry/актуальности semantic memory (#8) см. roadmap §4.4 —
   это уровень `semantic.py`, а не SessionMemory.
+
+### 5.9 Гарантии и ограничения
+
+**Гарантии:**
+
+1. Атомарность записи: каждая операция set/update завершается полностью
+   или не выполняется (SQLite-транзакция на запись).
+2. Персистентность: session/project/super переживают перезапуск процесса.
+3. Изоляция local: не видна другим run, другим агентам, другим процессам.
+4. Отсутствие коллизий: одинаковые ключи на разных уровнях — разные данные.
+5. Последовательность: всё однопоточно, никаких race conditions.
+
+**Ограничения (принятые сознательно):**
+
+1. Нет распределённых транзакций: запись в project и super — отдельные
+   операции.
+2. Нет блокировок: не нужны (нет параллелизма, MVP однопоточный).
+3. Нет TTL: очистка только через cleanup-плагины (`SessionCleanup`, §7.1).
+4. Нет версионирования записей: если надо — делает плагин (например,
+   version-поле в значении).
+5. Подписка не фильтруется по уровню: callback вызывается на изменение
+   ключа на ЛЮБОМ уровне (уровень приходит третьим аргументом).
 
 ---
 
@@ -579,33 +738,25 @@ def from_dump(cls, data) -> "SessionMemory": ...
 
 ```python
 from typing import Any, Callable
+from pathlib import Path
 
 
 class SessionMemory:
-    """Двухуровневая память для плагинов."""
+    """4-уровневая память для плагинов (§5)."""
 
-    def __init__(self):
-        self._global: dict[str, Any] = {}
+    def __init__(
+        self,
+        session_store: MemoryStore,       # PersistentStore, namespace сессии
+        project_store: MemoryStore,       # PersistentStore, namespace проекта
+        super_global_store: MemoryStore,  # PersistentStore, namespace "system"
+    ):
         self._local: dict[str, Any] = {}
+        self._session = session_store
+        self._project = project_store
+        self._super = super_global_store
         self._subscribers: dict[str, list[Callable]] = {}
 
-    # === GLOBAL ===
-
-    def set_global(self, key: str, value: Any):
-        self._global[key] = value
-        self._notify(key, value, "global")
-
-    def get_global(self, key: str, default: Any = None) -> Any:
-        return self._global.get(key, default)
-
-    def update_global(self, key: str, updater: Callable, default: Any = None) -> Any:
-        current = self._global.get(key, default)
-        new_value = updater(current)
-        self._global[key] = new_value
-        self._notify(key, new_value, "global")
-        return new_value
-
-    # === LOCAL ===
+    # === LOCAL (per-run, in-memory only) ===
 
     def set_local(self, key: str, value: Any):
         self._local[key] = value
@@ -621,14 +772,57 @@ class SessionMemory:
         self._notify(key, new_value, "local")
         return new_value
 
+    # === SESSION GLOBAL (per-agent session, persisted) ===
+
+    def set_session(self, key: str, value: Any):
+        self._session.set(key, value)
+        self._notify(key, value, "session")
+
+    def get_session(self, key: str, default: Any = None) -> Any:
+        return self._session.get(key, default)
+
+    def update_session(self, key: str, updater: Callable, default: Any = None) -> Any:
+        new_value = self._session.update(key, updater, default)
+        self._notify(key, new_value, "session")
+        return new_value
+
+    # === PROJECT GLOBAL (shared across agents in project) ===
+
+    def set_project(self, key: str, value: Any):
+        self._project.set(key, value)
+        self._notify(key, value, "project")
+
+    def get_project(self, key: str, default: Any = None) -> Any:
+        return self._project.get(key, default)
+
+    def update_project(self, key: str, updater: Callable, default: Any = None) -> Any:
+        new_value = self._project.update(key, updater, default)
+        self._notify(key, new_value, "project")
+        return new_value
+
+    # === SUPER GLOBAL (shared across all projects) ===
+
+    def set_super(self, key: str, value: Any):
+        self._super.set(key, value)
+        self._notify(key, value, "super")
+
+    def get_super(self, key: str, default: Any = None) -> Any:
+        return self._super.get(key, default)
+
+    def update_super(self, key: str, updater: Callable, default: Any = None) -> Any:
+        new_value = self._super.update(key, updater, default)
+        self._notify(key, new_value, "super")
+        return new_value
+
     # === УПРАВЛЕНИЕ ===
 
     def reset_local(self):
         self._local.clear()
 
-    def reset_all(self):
-        self._global.clear()
+    def reset_session(self):
+        """Полный сброс сессии агента (project/super не трогаем)."""
         self._local.clear()
+        self._session.clear()
 
     # === ПОДПИСКИ ===
 
@@ -637,17 +831,20 @@ class SessionMemory:
             self._subscribers[key] = []
         self._subscribers[key].append(callback)
 
-    def _notify(self, key: str, value: Any, scope: str):
+    def _notify(self, key: str, value: Any, level: str):
         for cb in self._subscribers.get(key, []):
             try:
-                cb(key, value, scope)
+                cb(key, value, level)
             except Exception as e:
                 print(f"[memory] subscriber error for {key}: {e}")
 
     def snapshot(self) -> dict:
+        """Снимок всей памяти для дампинга/отладки/breakpoint'ов."""
         return {
-            "global": dict(self._global),
             "local": dict(self._local),
+            "session": self._session.all(),
+            "project": self._project.all(),
+            "super": self._super.all(),
         }
 ```
 
@@ -769,12 +966,21 @@ class Agent:
         self.memory = None
         self._retries = 0
 
-    def bind(self) -> "Agent":
-        """Инициализация сессии. Вызывается ровно один раз."""
+    def bind(self, memory: SessionMemory | None = None) -> "Agent":
+        """Инициализация сессии. Вызывается ровно один раз.
+
+        memory — готовая 4-уровневая память из MemoryFactory (§5.5);
+        если не передана — создаётся изолированная (все store'ы in-memory,
+        удобно в тестах).
+        """
         if self.session is not None:
             raise RuntimeError("Agent already bound")
 
-        self.memory = SessionMemory()
+        self.memory = memory or SessionMemory(
+            session_store=InMemoryStore(),
+            project_store=InMemoryStore(),
+            super_global_store=InMemoryStore(),
+        )
         self.session = AgentSession(
             agent_name=self.name,
             system_prompt=self.system_prompt,
@@ -879,6 +1085,211 @@ class Agent:
         return accumulated
 ```
 
+### 6.5 MemoryStore — унифицированный бэкенд
+
+Все персистентные уровни памяти строятся на одном абстрактном KV-хранилище
+(`src/cascagent/memory.py`):
+
+```python
+import json
+import sqlite3
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any, Callable
+
+
+class MemoryStore(ABC):
+    """Абстрактное хранилище ключ-значение."""
+
+    @abstractmethod
+    def set(self, key: str, value: Any) -> None: ...
+
+    @abstractmethod
+    def get(self, key: str, default: Any = None) -> Any: ...
+
+    def update(self, key: str, updater: Callable, default: Any = None) -> Any:
+        current = self.get(key, default)
+        new_value = updater(current)
+        self.set(key, new_value)
+        return new_value
+
+    @abstractmethod
+    def all(self) -> dict: ...
+
+    @abstractmethod
+    def clear(self) -> None: ...
+
+
+class InMemoryStore(MemoryStore):
+    """Простое in-memory хранилище (тесты, изолированные агенты)."""
+
+    def __init__(self):
+        self._data: dict[str, Any] = {}
+
+    def set(self, key, value):
+        self._data[key] = value
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def all(self):
+        return dict(self._data)
+
+    def clear(self):
+        self._data.clear()
+
+
+class PersistentStore(MemoryStore):
+    """
+    SQLite-backed хранилище. Для session/project/super уровней.
+    Сериализует значения через JSON; разделение по namespace в одной таблице.
+    """
+
+    def __init__(self, db_path: Path, namespace: str):
+        self.db_path = db_path
+        self.namespace = namespace
+        self._init_db()
+
+    def _init_db(self):
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory (
+                namespace TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (namespace, key)
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def set(self, key, value):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            """INSERT OR REPLACE INTO memory (namespace, key, value, updated_at)
+               VALUES (?, ?, ?, datetime('now'))""",
+            (self.namespace, key, json.dumps(value, ensure_ascii=False))
+        )
+        conn.commit()
+        conn.close()
+
+    def get(self, key, default=None):
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute(
+            "SELECT value FROM memory WHERE namespace = ? AND key = ?",
+            (self.namespace, key)
+        ).fetchone()
+        conn.close()
+        return json.loads(row[0]) if row else default
+
+    def all(self):
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT key, value FROM memory WHERE namespace = ?",
+            (self.namespace,)
+        ).fetchall()
+        conn.close()
+        return {k: json.loads(v) for k, v in rows}
+
+    def clear(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM memory WHERE namespace = ?", (self.namespace,))
+        conn.commit()
+        conn.close()
+```
+
+Замечания по реализации:
+
+- Одно соединение на операцию достаточно при однопоточном MVP (§5.9);
+  при переходе на параллельных агентов — connection pool и WAL-режим.
+- Таблица `memory` уживается с kanban-схемами (`docs/data.md`) в одной
+  БД проекта; для super уровня — отдельный файл `super_global.db`.
+- Значения должны быть JSON-сериализуемы; сложные объекты (эмбеддинги)
+  хранятся в semantic memory (`semantic.py`), не здесь.
+
+### 6.6 MemoryFactory
+
+```python
+class MemoryFactory:
+    """Создаёт SessionMemory с правильными store'ами (§5.5)."""
+
+    def __init__(
+        self,
+        project_id: str,
+        super_global_db: Path = Path("./data/super_global.db"),
+        projects_db: Path = Path("./data/projects.db"),
+    ):
+        self.project_id = project_id
+        self.super_global_db = super_global_db
+        self.projects_db = projects_db
+
+    def create_for_agent(self, agent_name: str, session_id: str) -> SessionMemory:
+        """
+        - local:     plain dict (приватный, не персистентный)
+        - session:   PersistentStore projects.db, namespace=session:{session_id}
+        - project:   PersistentStore projects.db, namespace=project:{project_id}
+        - super:     PersistentStore super_global.db, namespace="system"
+        """
+        return SessionMemory(
+            session_store=PersistentStore(
+                self.projects_db, namespace=f"session:{session_id}"
+            ),
+            project_store=PersistentStore(
+                self.projects_db, namespace=f"project:{self.project_id}"
+            ),
+            super_global_store=PersistentStore(
+                self.super_global_db, namespace="system"
+            ),
+        )
+```
+
+### 6.7 BreakpointManager
+
+```python
+class BreakpointManager:
+    """Точки восстановления (§5.8). Формат — JSONL, append-only."""
+
+    def __init__(self, memory: SessionMemory, storage_path: Path):
+        self.memory = memory
+        self.storage = storage_path
+
+    def save_breakpoint(self, label: str, context: dict | None = None):
+        bp = {
+            "label": label,
+            "timestamp": datetime.now().isoformat(),
+            "context": context or {},
+            "snapshot": self.memory.snapshot(),
+        }
+        self.storage.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.storage, "a", encoding="utf-8") as f:
+            f.write(json.dumps(bp, ensure_ascii=False) + "\n")
+
+    def load_breakpoint(self, label: str) -> dict | None:
+        if not self.storage.exists():
+            return None
+        last = None
+        with open(self.storage, encoding="utf-8") as f:
+            for line in f:
+                bp = json.loads(line)
+                if bp["label"] == label:
+                    last = bp          # берём ПОСЛЕДНЕЕ совпадение
+        return last
+
+    def restore_from(self, breakpoint: dict):
+        """local пересоздаётся; session восстанавливается целиком;
+        project/super НЕ трогаем (персистентны, могли измениться другими
+        агентами пока процесс был мёртв)."""
+        snap = breakpoint["snapshot"]
+        self.memory.reset_local()
+        for k, v in snap.get("local", {}).items():
+            self.memory.set_local(k, v)
+        self.memory._session.clear()
+        for k, v in snap.get("session", {}).items():
+            self.memory.set_session(k, v)
+```
+
 ---
 
 ## 7. Каталог встроенных плагинов
@@ -890,19 +1301,23 @@ class Agent:
 | `IndexLoader` | Загружает BK-tree инструментов в `session.indices` |
 | `PromptCompiler` | Прекомпилирует system prompt + few-shot в статический префикс |
 | `HealthChecker` | Проверяет доступность LLM-эндпоинта (GET /v1/models), без генерации |
-| `StatisticsCollector` | Подписывается на события памяти для сбора статистики |
-| `RateLimiter` | Инициализирует счётчики rate limiting в global памяти |
+| `StatisticsCollector` | Подписывается на события памяти для сбора статистики (session-уровень) |
+| `RateLimiter` | Инициализирует счётчики rate limiting в session памяти |
+| `CheckpointLoader` | При bind() загружает последний breakpoint (`resume`) в память агента |
+| `SessionCleanup` | При старте чистит старые session-namespace'ы (config: `[memory.cleanup]`) |
+| `TraceExporter` | Открывает trace.jsonl / соединяется с OTLP-collector (опционально, #6) |
 
 ### 7.2 Input-плагины
 
 | Плагин | Назначение |
 |--------|-----------|
-| `ContextEnricher` | RAG + semantic memory + siblings (docs/process.md §2) |
+| `ContextEnricher` | CPU RAG по embedding(brief'а) + semantic memory + siblings; LLM не решает что искать (docs/process.md §2) |
 | `SafetyInputFilter` | Маскирует PII (email, карты, API keys) во входе |
+| `PromptInjectionGuard` | Санитизирует данные из RAG/memory, оборачивает их в data-блоки, детектит инъективные паттерны (#2, roadmap §3.2) |
 | `HistoryTrimmer` | Обрезает длинную историю для multi-turn агентов |
 | `VariableSubstitution` | Подставляет `{project_name}`, `{date}` |
 | `RateLimitCheck` | Проверяет и применяет rate limiting |
-| `ConversationHistory` | Добавляет историю диалога из global памяти |
+| `ConversationHistory` | Добавляет историю диалога из session памяти |
 
 ### 7.3 Trigger-плагины
 
@@ -910,6 +1325,9 @@ class Agent:
 |--------|-----------|
 | `ThinkBlockExtractor` | Разделяет think/final на лету, пишет think в local память |
 | `EarlyStopper` | Останавливает генерацию по стоп-маркерам (например, маркер конца ответа чата) |
+| `FirstTokenTimeout` | Прерывает стрим, если первый токен не пришёл за N сек (#1) |
+| `TotalResponseTimeout` | Прерывает стрим по общему бюджету времени ответа (#1) |
+| `StuckDetector` | Детект зацикливания/бесконечного think по повторам в accumulated (#5) |
 | `PIIFilter` | Маскирует чувствительные данные на лету |
 | `TokenLogger` | Логирует прогресс генерации в debug.log (с троттлингом записи) |
 | `LengthGuard` | Предупреждает о приближении к limit контекстного окна |
@@ -921,9 +1339,18 @@ class Agent:
 | `ResponseParser` | Парсит decompose-формат (`Название` + `    Описание`, `<atom>`) |
 | `DuplicateFilter` | Удаляет дубликаты подзадач (DuplicateDetector, порог 0.75) |
 | `QualityValidator` | Проверки: пустой ответ, вырожденный повтор родителя, мусор |
+| `RefusalDetector` | Детект отказа модели → action=retry с reframe или ошибка (#5) |
+| `ExecutionTimeout` | Таймаут выполнения кода/команд инструмента (Executor, #1) |
+| `AutoCheckpoint` | Сохраняет breakpoint после успешного run / FAILED задачи (§5.8, #3) |
 | `HistoryLogger` | Пишет DecompositionCall в JSONL + THINK/FINAL в debug.log |
 | `SemanticStore` | Сохраняет результат в semantic memory (remember) |
-| `MetricsCollector` | Собирает токены/время/стоимость в global статистику |
+| `MetricsCollector` | Собирает токены/время в session-статистику, сквозные суммы — в super |
+| `MetricsWriter` | Дублирует метрики в metrics.jsonl для внешних дашбордов (#6) |
+| `QualityScorer` | CPU-метрики декомпозиции: specificity, non-redundancy, atom-ratio (#15) |
+
+Все новые плагины из аудита — опциональные: подключаются списком в TOML
+(§8), по умолчанию в конфигурациях агентов их нет. Полная привязка
+«пробел аудита → плагин» — `docs/roadmap.md` §7.
 
 ---
 
@@ -1052,7 +1479,31 @@ max_retries = 1
 | Think-извлечение | да | да | да | да |
 | Retry | 2 | 1 | — | 1 |
 | SemanticStore | нет | да | нет | нет |
-| Изоляция вызова | полный reset | полный reset | полный reset | полный reset |
+| Изоляция вызова | reset_local() | reset_local() | reset_local() | reset_local() |
+
+### 8.6 Конфигурация памяти
+
+Общая для всех агентов проекта (в `config.toml`, см. `docs/config.md`):
+
+```toml
+[memory]
+super_global_db = "./data/super_global.db"
+projects_db = "./data/projects.db"        # session + project namespace'ы
+breakpoints_dir = "./data/breakpoints"
+
+[memory.auto_checkpoint]                  # плагин AutoCheckpoint (§7.4)
+enabled = true
+save_after_every_task = true
+max_breakpoints_per_session = 20          # ротация gzip-архива JSONL
+
+[memory.cleanup]                          # плагин SessionCleanup (§7.1)
+auto_cleanup_on_start = true
+max_session_age_days = 30
+```
+
+`MemoryFactory` (§6.6) строится из этих значений при старте CLI; session_id
+формируется как `{agent_name}-{start_timestamp}` и попадает в breakpoint-файл
+и trace (#4, #6).
 
 ---
 
@@ -1063,18 +1514,27 @@ max_retries = 1
 ```
 run(task)
   |
-  +-- memory.reset_local()                    # local чист, global живёт
+  +-- memory.reset_local()          # local чист; session/project/super живут
   +-- build messages [system=static prefix, user=brief]
   +-- INPUT plugins   (цепочкой: enrichment -> filters -> trim)
+  |     читают project/session/super, пишут local (промежуточное)
   +-- GENERATION      (стрим токенов)
   |     для каждого токена: TRIGGER plugins (цепочкой)
   |     should_stop / action=stop -> прервать стрим
   |     конец стрима: on_stream_end каждого trigger
   +-- OUTPUT plugins  (парсинг -> дубликаты -> логирование)
+  |     читают local; пишут session (своя статистика/история),
+  |     project (результаты для других агентов), super (сквозные суммы);
+  |     AutoCheckpoint сохраняет breakpoint (§5.8)
   |     action=retry -> повтор ВСЕГО run() (до max_retries)
   |     action=reject -> AgentRejectedError
   +-- return AgentResult(response, parsed, metadata)
+      # local будет очищен в начале следующего run
 ```
+
+Тайминг-оверхед памяти: local — наносекунды (dict); session/project/super —
+SQLite-запись на ключ (<1 мс локально); горячий путь триггеров использует
+только local (§12.2 п.3).
 
 ### 9.2 Тайминги и частоты
 
@@ -1110,7 +1570,9 @@ run(task)
 
 ```
 src/cascagent/
-├── memory.py                      # SessionMemory (§6.1)
+├── memory.py                      # SessionMemory, MemoryStore, InMemoryStore,
+│                                  # PersistentStore, MemoryFactory (§6.1, §6.5, §6.6)
+├── breakpoints.py                 # BreakpointManager (§6.7)
 ├── agent.py                       # Agent, AgentSession, AgentResult (§6)
 ├── plugins/
 │   ├── __init__.py                # реестр PLUGIN_REGISTRY
@@ -1119,24 +1581,33 @@ src/cascagent/
 │   │   ├── index_loader.py        # IndexLoader
 │   │   ├── prompt_compiler.py     # PromptCompiler
 │   │   ├── health_checker.py      # HealthChecker
+│   │   ├── checkpoint_loader.py   # CheckpointLoader
+│   │   ├── session_cleanup.py     # SessionCleanup
 │   │   └── statistics.py          # StatisticsCollector, RateLimiter
 │   ├── input/
 │   │   ├── context_enricher.py    # ContextEnricher (обёртка над enricher.py)
 │   │   ├── safety_filter.py       # SafetyInputFilter
+│   │   ├── injection_guard.py     # PromptInjectionGuard
 │   │   ├── history_trimmer.py     # HistoryTrimmer
 │   │   └── variables.py           # VariableSubstitution
 │   ├── trigger/
 │   │   ├── think_extractor.py     # ThinkBlockExtractor
 │   │   ├── early_stop.py          # EarlyStopper
+│   │   ├── timeouts.py            # FirstTokenTimeout, TotalResponseTimeout
+│   │   ├── stuck_detector.py      # StuckDetector
 │   │   └── pii_filter.py          # PIIFilter
 │   └── output/
 │       ├── response_parser.py     # ResponseParser
 │       ├── duplicate_filter.py    # DuplicateFilter
-│       ├── quality_validator.py   # QualityValidator
+│       ├── quality_validator.py   # QualityValidator (+RefusalDetector)
+│       ├── auto_checkpoint.py     # AutoCheckpoint
 │       ├── history_logger.py      # HistoryLogger
-│       └── semantic_store.py      # SemanticStore
-tests/unit/test_memory.py          # SessionMemory: скоупы, подписки, snapshot
-tests/unit/test_agent.py           # Agent: bind/run/retry/triggers (fake LLM)
+│       ├── semantic_store.py      # SemanticStore
+│       └── metrics.py             # MetricsCollector, MetricsWriter, QualityScorer
+tests/unit/test_memory.py          # 4 уровня: set/get/update, изоляция session/project,
+                                   # подписки, snapshot; PersistentStore на tmp SQLite
+tests/unit/test_breakpoints.py     # save/load/restore, project/super не трогаются
+tests/unit/test_agent.py           # Agent: bind(memory)/run/retry/triggers (fake LLM)
 tests/unit/test_plugins_*.py       # по файлу на секцию плагинов
 ```
 
@@ -1231,26 +1702,26 @@ class ThinkStats(InitPlugin):
     def on_init(self, session, memory):
         self._memory = memory
         memory.subscribe("response_duration", self._on_done)
-        memory.set_global("think_stats", {"calls": 0, "total_ms": 0, "max_ms": 0})
+        memory.set_session("think_stats", {"calls": 0, "total_ms": 0, "max_ms": 0})
         return session
 
     def _on_done(self, key, value, scope):
         m = self._memory
-        m.update_global("think_stats", lambda s: {
+        m.update_session("think_stats", lambda s: {
             "calls": s["calls"] + 1,
             "total_ms": s["total_ms"] + value["duration_ms"],
             "max_ms": max(s["max_ms"], value["duration_ms"]),
         })
 
-# после серии run() статистика читается из global-скоупа:
-stats = agent.memory.get_global("think_stats")     # {"calls": 12, ...}
+# после серии run() статистика читается из session-уровня:
+stats = agent.memory.get_session("think_stats")     # {"calls": 12, ...}
 snap = agent.memory.snapshot()                     # отладочный дамп памяти
 ```
 
 Простейшая альтернатива без подписки — прямо в output-плагине:
 
 ```python
-memory.update_global("total_calls", lambda x: x + 1, default=0)
+memory.update_session("calls_count", lambda x: x + 1, default=0)
 ```
 
 ### 11.5 Полная сборка REST API-агента (code, не TOML)
@@ -1320,18 +1791,25 @@ my_limiter = "mypackage.plugins:TokenBudgetLimiter"
 4. **Output-плагины идемпотентны** — повторный прогон на том же ответе даёт
    тот же результат (retry полагается на это).
 5. **Никаких обращений к другим агентам напрямую** — координация только через
-   оркестратор и флаги памяти (§11.3).
-6. **Без эвристик атомарности** — `is_atomic` решает модель (`<atom>`),
+   оркестратор и флаги памяти (§11.3) или project-уровень SessionMemory
+   (Producer-Consumer, §5.6).
+6. **Данные кладутся на самый приватный подходящий уровень** (§5.7): local →
+   session → project → super; запись в project/super из input/trigger
+   запрещена (только output и init).
+7. **Без эвристик атомарности** — `is_atomic` решает модель (`<atom>`),
    QualityValidator проверяет лишь формат (ADR-007).
-7. **Логируем честно** — think и final пишутся всегда, даже если downstream
+8. **Логируем честно** — think и final пишутся всегда, даже если downstream
    использует только final (§2.4).
-8. **Каждый плагин = unit-тесты с fake LLM/fake memory**, coverage >80%.
+9. **Каждый плагин = unit-тесты с fake LLM/fake memory**, coverage >80%.
+   Fake-память — SessionMemory со всеми InMemoryStore (§6.5).
 
 ### 12.3 Матрица обратной совместимости API
 
 | API | Гарантируется стабильным? | Примечание |
 |-----|---------------------------|------------|
-| SessionMemory get/set/update/subscribe | да (semver minor) | ключи — domain плагинов |
+| SessionMemory get/set/update по 4 уровням + subscribe/snapshot | да (semver minor) | ключи — domain плагинов; `*_global` не вводятся |
+| MemoryStore / PersistentStore API (set/get/update/all/clear) | да (semver minor) | схема таблицы `memory(namespace,key,value,updated_at)` — стабильна |
+| BreakpointManager JSONL-формат | нет до 1.0.0 | при смене формата — версионирование записи `v` |
 | Сигнатуры on_init/on_input/on_token/on_output | да (semver major на ломку) | новые optional-параметры — minor |
 | Результат trigger `{"action": ...}` | да | новые действия добавляются расширением enum |
 | Поля AgentSession | нет | внутренняя структура, может меняться |
@@ -1341,7 +1819,8 @@ my_limiter = "mypackage.plugins:TokenBudgetLimiter"
 
 | Версия | Что добавляется |
 |--------|-----------------|
-| 0.5.x | Этап 5: base-классы + memory + ThinkBlockExtractor/ResponseParser/HistoryLogger; Decomposer переведён на Agent |
+| 0.5.x | Этап 5: base-классы + memory (local+session on InMemoryStore) + ThinkBlockExtractor/ResponseParser/HistoryLogger; Decomposer переведён на Agent |
+| 0.5.x+ | Персистентность: PersistentStore + MemoryFactory (project/session namespace'ы); super-уровень и AutoCheckpoint/BreakpointManager — вместе с #3 из roadmap (§8 чек-лист) |
 | 0.6.x | Researcher/Reflector как конфигурации (§8.3–8.4); EntryPoints для внешних плагинов |
 | 0.7.x | SafetyInputFilter/PIIFilter; RateLimiter; multi-turn HistoryTrimmer |
 | 1.0.0 | Заморозка API секций; плагины — единственный способ расширения агентов |
