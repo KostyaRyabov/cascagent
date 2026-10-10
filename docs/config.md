@@ -59,6 +59,7 @@ cascagent/
 ├── tests/                  # test_<module>.py; integration — end-to-end на моках
 ├── docs/
 │   ├── protocol.md         # СПЕЦИФИКАЦИЯ протокола v2 (источник истины формата)
+│   ├── principles.md       # философия и архитектурные принципы, название, лицензия
 │   ├── product.md          # продукт: миссия, сценарии, системные агенты
 │   ├── architecture.md     # конспект архитектурных решений
 │   ├── cpu-offload.md      # реестр CPU-алгоритмов (P/A/E) vs LLM-вызовы

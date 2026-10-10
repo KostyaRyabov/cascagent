@@ -39,8 +39,12 @@ class TaskStatus(str, Enum):
 @dataclass
 class Task:
     id: str                                    # dot-path: 0, 0.1, 0.1.2
-    brief: str                                 # название (~50 токенов, для RAG)
-    description: str                           # подробное описание (для LLM)
+    brief: str                                 # название одной строкой (~50 токенов, для RAG)
+    description: Optional[str]                 # что нужно сделать (для LLM); None у атомов
+    is_atom: bool = False                      # CPU-флаг: задача не декомпозируется
+    embedding: Optional[bytes] = None          # float32 little-endian от embed(brief);
+                                               # считается при инициализации задачи (плагин
+                                               # TaskParser, plugins §7.4 / process §1.3)
     status: TaskStatus = TaskStatus.PENDING
     result: Optional[str] = None               # что получилось после выполнения
     parent_id: Optional[str] = None
@@ -55,15 +59,31 @@ class Task:
 1. **`brief` и `description`** — две формы нужны по разным причинам:
    `brief` (~50 токенов) — индекс RAG/semantic-памяти, дубль-детектор, дерево;
    `description` (~200–400 токенов) — передаётся LLM для работы.
-2. **Нет категорий** — логика «что делать с задачей» вынесена на CPU-слой;
+   Атомарная подзадача: `description = None`, `is_atom = True` (протокол
+   допускает эквивалентную запись `description == ""` — нормализуется
+   парсером к `None`, protocol §3).
+2. **`is_atom` и `embedding`** — производные CPU-поля, модель их не задаёт:
+   `is_atom` выставляется парсером (`<atom>` в описании / глобальный
+   `<atom>`) и фильтром задач (process §1.3, правила F1–F3); `embedding`
+   считается один раз при инициализации задачи из `brief` и переиспользуется
+   recall/дубль-детектором (не пересчитывать на каждый поиск).
+3. **Нет категорий** — логика «что делать с задачей» вынесена на CPU-слой;
    модель либо декомпозирует, либо пишет `<atom>`.
-3. **Нет `blocked_by`** — зависимости определяются из структуры дерева и
+4. **Нет `blocked_by`** — зависимости определяются из структуры дерева и
    порядка siblings: если A идёт раньше B, B зависит от A (FIFO-планирование,
    cpu-offload A9).
-4. **Нет `acceptance`** — критерии приёмки включаются в `description`;
+5. **Нет `acceptance`** — критерии приёмки включаются в `description`;
    оркестратор проверяет покрытие результатом ребёнка (A7/A8).
-5. **`subtasks` — список id, а не объектов** — сериализация тривиальна,
+6. **`subtasks` — список id, а не объектов** — сериализация тривиальна,
    объект задачи живёт только в Kanban (один источник истины).
+
+Иерархия задач хранится в памяти проекта под системным ключом **`tasks`**
+(project-уровень SessionMemory, plugins §5.7): словарь `{id: Task}` со
+ссылками parent/children — единое живое рабочее дерево между плагином
+TaskParser и оркестратором; в процессе декомпозиции оно уже заполнено, а
+TaskParser подставляет новое поддерево детей к соответствующему родителю
+(process §1.3, три стадии: парсинг → фильтрация → сохранение). Kanban
+(SQLite) — персистентное зеркало того же дерева (resume после краша).
 
 State machine статусов и инварианты — `docs/product.md` §5.
 
@@ -115,7 +135,7 @@ class DecompositionCall:
     prompt: str                     # полный SYSTEM+USER как отправлен
     think: Optional[str]            # извлечённый THINK (None если no_think)
     final_response: str             # FINAL RESPONSE после sanitize
-    parsed: list[dict]              # [{"brief":..., "description":...}] — v2
+    parsed: list[dict]              # [{"brief":..., "description":...|None, "is_atom":bool}] — v2
     error: Optional[str]            # тип/текст сбоя, если был
     duration_ms: int
     prompt_tokens: int              # из usage API (approx_tokens — fallback)
@@ -170,8 +190,11 @@ CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
     parent_id TEXT REFERENCES tasks(id),
     depth INTEGER NOT NULL DEFAULT 0,
-    brief TEXT NOT NULL,                    -- ~50 токенов, для RAG/дерева
-    description TEXT NOT NULL,              -- для LLM
+    brief TEXT NOT NULL,                    -- название (~50 токенов), для RAG/дерева
+    description TEXT,                       -- для LLM; NULL у атомов (is_atom=1)
+    is_atom INTEGER NOT NULL DEFAULT 0,     -- 0/1: задача не декомпозируется (CPU-флаг)
+    embedding BLOB,                         -- float32 little-endian от embed(brief);
+                                            -- считается при инициализации задачи
     status TEXT NOT NULL DEFAULT 'pending', -- pending|running|done|failed
     result TEXT,                            -- итог выполнения
     created_at TEXT NOT NULL,

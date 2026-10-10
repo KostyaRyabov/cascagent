@@ -85,7 +85,7 @@ def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
 - статусы `TaskStatus.{PENDING,RUNNING,DONE,FAILED}` вместо `CANCELLED`
   (отмена ветки = FAILED с `partial=true`, product §5);
 - degenerate-repeat проверка идёт **после** парсинга (правило CPU,
-  protocol §3.6), а не как отдельный ответ модели;
+  protocol §3.7), а не как отдельный ответ модели;
 - `RESEARCH_NEEDED` удалён из протокола модели — триггер исследования
   решает enricher по `gaps/confidence` (ADR-003), см. §5;
 - история пишется на каждом вызове (`history.save(call)`), включая провальные.
@@ -103,6 +103,92 @@ T4: 0.3 видит результаты 0.1+0.2 — и т.д.
 
 Инвариант: в момент T3 узел 0.2 ещё **не имеет** детей в Kanban — дети
 появляются только когда 0.2 начинает исполняться. Это и есть ленивость.
+
+### 1.3. Конвейер пост-обработки ответа декомпозиции (плагин TaskParser)
+
+Ответ Decomposer-агента превращается в узлы дерева задач **одним**
+output-плагином `TaskParser` (v3, plugins §7.4; вся логика — чистый CPU,
+LLM не участвует). Цель — снять с LLM всю механику: модель только
+генерирует текст по формату protocol §2–3, остальное детерминировано.
+
+Плагин исполняется как **три строго упорядоченные стадии**; порядок важен:
+сохранение в `tasks` происходит только ПОСЛЕ фильтрации, чтобы в дереве
+не появлялись промежуточные мусорные узлы (ранее планировавшийся
+отдельный `TaskFilter` объединён с парсером — стадии идут в одном
+проходе, эмбеддинги не перекодировались бы между плагинами, а разделение
+на два плагина требовало бы писать в `tasks` дважды).
+
+**Стадия 1 — парсинг.** Разбирает final_response по грамматике протокола
+(эталон — protocol §3) и строит кандидатов `Task`; при инициализации
+каждой задачи считается `embedding = embed(brief)` (brief — первая
+строка блока = название задачи; ровно одна эмбеддинг-прогонка на задачу,
+дальше вектор только переиспользуется). У атома (`<atom>` второй строкой
+или глобальный `<atom>`) `description = None`, `is_atom = True`.
+
+**Стадия 2 — фильтрация/проверка** (правила F1–F3, порядок фиксирован,
+все проверки — CPU, без обращения к модели; работают по эмбеддингам из
+стадии 1):
+
+| Правило | Проверка | Действие |
+|---|---|---|
+| **F1. Самодостаточный атом** | `normalize(brief) == normalize(description)` (или описание высокосходно с названием, similarity ≥ 0.90) | задача уже «название = что делать» → `is_atom = True`, `description = None` |
+| **F2. Повтор родителя** | `similarity(embed(child.brief), embed(parent.brief)) ≥ 0.75` (threshold — config `[dedup]`, algorithms §2) | дочерняя задача **удаляется** из списка детей |
+| **F3. Схлопывание родителя** | после F2 у родителя не осталось ни одной дочерней задачи | родитель помечается `is_atom = True` (декомпозиция вырождена → отдаём его Executor'у без нового LLM-вызова) |
+
+**Стадия 3 — сохранение в переменную `tasks`.** В процессе декомпозиции
+project-ключ **`tasks`** (SessionMemory, plugins §5.7; персистентное
+зеркало — Kanban, data.md §4.2) **уже заполнен** — дерево существует к
+моменту вызова. Поэтому плагин НЕ перезаписывает `tasks`, а **подставляет
+полученное поддерево отфильтрованных детей нужному родителю**: присваивает
+`parent.subtasks = [ids детей]` и добавляет новые узлы в словарь `{id:
+Task}` одним атомарным `update_project`.
+
+```python
+def on_output(self, response, context, session, memory):
+    # стадия 1: парсинг + embedding(brief) при инициализации
+    parsed = parse_decomposition(response)          # protocol §3: блоки через пустую строку
+    children = []
+    for p in parsed:                                # p: {brief, description|None, is_atom}
+        t = Task(
+            brief=p["brief"],
+            description=None if p["is_atom"] else p["description"],
+            is_atom=p["is_atom"],                   # <atom> второй строкой / глобальный <atom>
+        )
+        t.embedding = self.embedder.encode(t.brief) # одна прогонка на задачу, дальше переиспользуется
+        children.append(t)
+
+    # стадия 2: фильтрация/проверка (F1–F3) — до сохранения
+    parent = memory.get_project("tasks")[context["parent_id"]]
+    kept = []
+    for ch in children:
+        if ch.is_atom:                                      # <atom> уже расставлен парсером
+            kept.append(ch); continue
+        if same_or_redundant(ch.brief, ch.description):     # F1
+            ch.is_atom, ch.description = True, None
+        if cosine(ch.embedding, parent.embedding) >= THRESHOLD:  # F2 (эмбеддинги стадии 1)
+            continue                                        # дубль родителя — удаляем
+        kept.append(ch)
+    if not kept and not parent.is_atom:                     # F3
+        parent.is_atom, parent.description = True, None
+
+    # стадия 3: сохранение — подставить поддерево к родителю в уже живое дерево
+    def attach(d):                                          # d: {id: Task}, дерево уже заполнено
+        for ch in kept:
+            ch.parent_id, ch.depth = parent.id, parent.depth + 1
+        parent.subtasks = [ch.id for ch in kept]
+        return d | {ch.id: ch for ch in kept} | {parent.id: parent}
+    memory.update_project("tasks", attach)
+    return {"parsed": kept, "action": "accept"}
+```
+
+Связь с ядром v2: F1/F2 реализуют правило degenerate-repeat (protocol §3.7,
+cpu-offload A5) и частично дедупликацию A6 — в v3 они вынесены из
+оркестратора в плагин и работают **по эмбеддингам, посчитанным на стадии
+1**, поэтому повторного кодирования нет (экономия CPU и детерминизм).
+F3 закрывает цикл «родитель → один такой же ребёнок → снова декомпозиция»:
+вместо второго LLM-вызова родитель становится атомом. Порядок секций
+output для Decomposer: `TaskParser → DuplicateFilter → HistoryLogger`
+(plugins §8.1).
 
 ## 2. Context Enrichment Pipeline
 
