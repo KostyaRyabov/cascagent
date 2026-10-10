@@ -105,7 +105,7 @@ CPU-only замечания: префилл ~10–20 ток/с ⇒ декомп�
 Планируемые команды CLI (Этап 3; сверить с product §2.5 S3):
 
 ```bash
-cascagent status            # счётчики: всего/DONE/RUNNING/pending, вызовы LLM, время
+cascagent status            # счётчики: всего/DONE/RUNNING/ENRICHMENT/pending, вызовы LLM, время
 cascagent tree              # дерево задач со статусами ✓/✗/…
 cascagent report            # PerformanceMetrics (performance §5)
 cascagent health            # см. ниже
@@ -135,7 +135,7 @@ cascagent health            # см. ниже
 | Модель зацикливается на детях | слабый reasoning на глубине | включить think глубже (`think_max_depth=3`); проверить threshold 0.75 (atom_task_ratio вне 30–60% — performance §5) |
 | Много дублей в дереве | промпт/модель деградировали | смотреть `duplicates_removed` в history; калибровать порог detector; НЕ резать список (AGENTS §8.2) |
 | Разросшийся semantic_memory | нет GC | `forget_old(days=30, max_keep=1000)` (algorithms §3) |
-| Kanban «застрял» на RUNNING | краш посреди вызова | resume: RUNNING→PENDING при старте (process §7); DONE не перевыполняется |
+| Kanban «застрял» на RUNNING/ENRICHMENT | краш посреди вызова/обогащения | resume: RUNNING и ENRICHMENT →PENDING при старте (process §7); DONE не перевыполняется |
 | Префикс-кэш не бьёт | кто-то правит SYSTEM_PROMPT динамически | константа модуля (prompts §2); тест снапшот текста |
 
 ## 7. Безопасность и приватность

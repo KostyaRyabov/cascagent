@@ -218,8 +218,8 @@ def from_dump(cls, data: dict) -> "SessionMemory": ...
 
 **Механика resume (уровень оркестратора):**
 
-1. Kanban — источник истины о задачах (`RUNNING` задачи при старте после
-   краша переводятся в `PENDING` — они не могли завершиться бесследно,
+1. Kanban — источник истины о задачах (`RUNNING` и `ENRICHMENT` задачи при
+   старте после краша переводятся в `PENDING` — они не могли завершиться бесследно,
    side-effects идемпотентятся см. п.4).
 2. `cascagent resume <project>` загружает kanban.db + последний checkpoint
    каждого агента + историю JSONL.
@@ -438,11 +438,12 @@ name (e.g. decomposer.system) | version (int) | text | is_active
 class Task:
     ...
     embedding: np.ndarray | None = None   # embed(brief)
-    canonical_id: str | None = None       # ссылка на оригинал
+    canonical: 'Task' | None = None       # прямая ссылка на оригинал
+                                          # (в SQL — canonical_id dot-path)
 ```
 
 При создании подзадачи: cosine-search по активным задачам проекта;
-sim ≥ 0.85 → создаётся задача-ссылка (`canonical_id=existing.id`,
+sim ≥ 0.85 → создаётся задача-ссылка (`canonical=existing`,
 status=PENDING, но результат читается из оригинала; если оригинал ещё не
 готов — ссылка ждёт его результата, цикл невозможен: ссылка всегда смотрит
 «вверх» по времени создания). Порог и включение фичи — в `[graph]`.

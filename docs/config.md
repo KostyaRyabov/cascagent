@@ -59,6 +59,7 @@ cascagent/
 ├── tests/                  # test_<module>.py; integration — end-to-end на моках
 ├── docs/
 │   ├── protocol.md         # СПЕЦИФИКАЦИЯ протокола v2 (источник истины формата)
+│   ├── principles.md       # философия и архитектурные принципы, название, лицензия
 │   ├── product.md          # продукт: миссия, сценарии, системные агенты
 │   ├── architecture.md     # конспект архитектурных решений
 │   ├── cpu-offload.md      # реестр CPU-алгоритмов (P/A/E) vs LLM-вызовы
@@ -109,6 +110,10 @@ db_path = "./data/kanban.db"
 history_path = "./data/history.jsonl"
 debug_log_path = "./data/debug.log"
 backup_every_n_ops = 200          # sqlite backup (data.md §4.4)
+
+[ids]
+epoch = "2026-01-01T00:00:00Z"    # эпоха snowflake id (data.md §2); менять нельзя
+node_id = 0                       # 0..1023; уникален на процесс оркестратора
 
 [enrichment]
 max_context_tokens = 500          # бюджет блока «Контекст»

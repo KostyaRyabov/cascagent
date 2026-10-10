@@ -42,7 +42,7 @@ Qwen3 4B Q4_K_M на 4 GB VRAM: ~15–25 токенов/с генерация, �
 | P4 | Выбор инструмента | BK-tree fuzzy search по описаниям манифестов, O(log n); Левенштейн+фонетика для опечаток (`fix_typo`) | `bk_tree.py` | MCP-схемы инструментов не попадают в промпт (−2000 токенов/вызов) |
 | P5 | Сжатие контекста | Selective Context: удаление дублей предложений, low-infofuzz-фильтр, обрезка до budget | `enricher.py` | длина промпта ⇒ время префилла |
 | P6 | Сборка промпта | pure-function конструктор фиксированной формы | `parser.build_user_prompt` | стабильный префикс ⇒ KV-кэш работает |
-| P7 | Решение think/no_think | таблица по глубине: L0–L2 think, L3+ no_think | `decomposer.py` | no_think сокращает генерацию в разы на мелких узлах |
+| P7 | Решение think/no_think | политика по глубине и механика бэкендов — `docs/stack.md §5` (источник истины) | `decomposer.py` | no_think сокращает генерацию в разы на мелких узлах |
 | P8 | Prefix KV-кэш | save/restore слотов llama.cpp `/slots/N?action=save|restore`; SYSTEM_PROMPT как неизменный префикс | `cache_manager.py` | повторный префилл system prompt (~100 токенов) каждый вызов |
 | P9 | Нормализация запроса | strip/lowercase/unicode-NFKC перед любыми сравнениями | `detector.py` | ложные промахи кэша и ложные дубли |
 
@@ -56,7 +56,8 @@ Qwen3 4B Q4_K_M на 4 GB VRAM: ~15–25 токенов/с генерация, �
 | A2 | Санитайзинг строк | regex: буллеты, нумерация, markdown-обёртки, zero-width | `parser.sanitize_line` | модель не должна «думать» про чистоту вывода |
 | A3 | Парсинг дерева | однопроходный скан отступов (O(n)) → Task[] | `parser.parse_decomposition` | детерминированная грамматика |
 | A4 | Атомарность | точное сравнение `<atom>` / пустой ответ; без эвристик | `parser.is_atomic` | принципиальное решение AGENTS.md §8.1 |
-| A5 | Degenerate-repeat | одна подзадача и similarity(brief_child, brief_parent) ≥ 0.75 ⇒ атом (protocol §3.6) | оркестратор + `detector.py` | спасает от бесконечных циклов передекомпозиции без нового вызова |
+| A4.1 | Инициализация задач | при создании каждой Task `__init__` формирует ВСЕ поля за один шаг: `created_at` → snowflake `id`, `embedding = embed(brief)` (brief = первая строка блока ответа), `depth = parent.depth + 1`; атом ⇒ `description=None`, `is_atom=True`; отфильтрованное поддерево подставляется к родителю в project-ключ `tasks` (v3 — стадия 3 плагина TaskParser) | `parser.py` / `plugins/task_parser.py` | один прогон эмбеддинга на задачу, переиспользуется F2/recall (process §1.3); порядок детей — позиция в `parent.subtasks`, отдельного поля `order` нет (data.md §1) |
+| A5 | Degenerate-repeat | одна подзадача и similarity(brief_child, brief_parent) ≥ 0.75 ⇒ атом (protocol §3.7); v3: правила F1–F3 плагина TaskParser (стадия фильтрации) — brief==description ⇒ атом, дубль родителя ⇒ удалить ребёнка, нет детей ⇒ родитель становится атомом (process §1.3) | оркестратор + `detector.py` / `plugins/task_parser.py` | спасает от бесконечных циклов передекомпозиции без нового вызова |
 | A6 | Дедупликация детей | SequenceMatcher pairwise внутри списка, порог 0.75 | `detector.py` | лишние дети = лишние LLM-вызовы ниже по дереву |
 | A7 | Антициклы | проверка кандидатов против цепочки предок→потомок (hash ancestor set) | `kanban.py` | защита от self-referential деревьев |
 | A8 | Валидация структуры | brief непустой, description ≤ max_len, depth ≤ max_depth | `decomposer.py` | мусор ловится до записи в Kanban, без «почини вывод»-ретраев |
@@ -76,7 +77,7 @@ Qwen3 4B Q4_K_M на 4 GB VRAM: ~15–25 токенов/с генерация, �
 | Таймаут вызова | client-side timeout → один retry того же промпта (стоимость удваивается, поэтому ровно один) |
 | Пустой/битый вывод | НЕ отправляем «переделай формат» — парсер толерантен (A2/A3); если final пуст ⇒ атом (A4) |
 | Сбой инструмента | код ошибки классифицируется таблицей (transient/fatal); transient ⇒ retry без LLM |
-| Провал атома | 1 retry → ReflectAgent (единственный легальный новый LLM-вызов) → reframe → PENDING |
+| Провал атома | 1 retry → ReflectAgent (единственный легальный новый LLM-вызов) → reframe → PENDING (повторный старт снова проходит через ENRICHMENT) |
 
 ## 3. Что остаётся на GPU (исчерпывающий список!)
 
