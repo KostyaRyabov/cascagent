@@ -108,8 +108,14 @@ LLM при этом остаётся только генерацией текс�
 делает CPU-слой вокруг неё (ContextEnricher, DuplicateDetector, Kanban).
 
 Модель данных: `Task(id, brief, description, is_atom, embedding, status,
-result, parent_id, depth, subtasks)`; `TaskStatus = pending | running |
-done | failed`. `TaskCategory` из v1 удалён.
+result, parent, depth, subtasks, created_at, started_at, finished_at)`;
+`parent`/`subtasks` — прямые ссылки на объекты `Task` в живом дереве
+(в SQL-зеркале — `parent_id`/dot-path); время — `datetime` (UTC).
+`TaskStatus = pending | enrichment | running | done | failed`, где
+**pending — задача ещё не начала работу**; обогащение контекстом и
+ресурсами (выбор агента, MCP-инструменты, базы знаний) — отдельный этап
+**enrichment** между стартом и первым LLM-вызовом. Полная спецификация —
+docs/data.md §1. `TaskCategory` из v1 удалён.
 
 ## 5. Передача контекста между уровнями
 

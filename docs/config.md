@@ -111,6 +111,10 @@ history_path = "./data/history.jsonl"
 debug_log_path = "./data/debug.log"
 backup_every_n_ops = 200          # sqlite backup (data.md §4.4)
 
+[ids]
+epoch = "2026-01-01T00:00:00Z"    # эпоха snowflake id (data.md §2); менять нельзя
+node_id = 0                       # 0..1023; уникален на процесс оркестратора
+
 [enrichment]
 max_context_tokens = 500          # бюджет блока «Контекст»
 rag_top_k = 3

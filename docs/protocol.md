@@ -120,9 +120,11 @@ def parse_decomposition(response: str) -> List[Task]:
             continue
         brief, rest = lines[0], lines[1:]
         if len(rest) == 1 and rest[0].lower() == "<atom>":  # построчный атом
-            tasks.append(Task(brief=brief, description=None, is_atom=True))
+            tasks.append(Task(brief=brief, description=None, is_atom=True,
+                              created_at=datetime.now(timezone.utc)))
         else:
-            tasks.append(Task(brief=brief, description=" ".join(rest) or None))
+            tasks.append(Task(brief=brief, description=" ".join(rest) or None,
+                              created_at=datetime.now(timezone.utc)))
     return tasks
 ```
 
@@ -139,7 +141,11 @@ def parse_decomposition(response: str) -> List[Task]:
 
 - модель оперирует парой `brief` (название, для RAG/дерева) +
   `description` (подробное описание, для LLM); статусы
-  `pending | running | done | failed`; дети — список id, порядок = исполнение;
+  `pending | enrichment | running | done | failed` (pending = работа ещё не
+  начата; enrichment = старт: сбор контекста/ресурсов до LLM-вызова,
+  semantics — data.md §1, product §5);
+  дети — список id в SQL-контракте, в памяти — объекты `Task`
+  (`subtasks: List[Task]`, порядок = исполнение; data.md §1);
 - **УДАЛЕНО из v1** (определяется системой, а не моделью):
   `TaskCategory` (`>` / `!` / `?`), acceptance criteria, `blocked_by`
   (обоснование отказа — data.md §1, ADR-003);
@@ -210,9 +216,9 @@ def execute_with_decomposition(task: Task) -> str:
             task.result = executor.execute(task)
             task.status = DONE
             return task.result
-        task.subtasks = filter_dupes(parse(call.final_response), task)
-        kanban.save_all(children_of(task))
-    results = [execute_with_decomposition(kanban.get(i)) for i in task.subtasks]
+        task.subtasks = filter_dupes(parse(call.final_response), task)  # List[Task]
+        kanban.save_all(task.subtasks)
+    results = [execute_with_decomposition(c) for c in task.subtasks]
     task.result = summarize_results(results)
     task.status = DONE
     kanban.update(task)

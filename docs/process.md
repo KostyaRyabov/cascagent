@@ -35,14 +35,20 @@ def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
     """Рекурсивное выполнение задачи с ленивой декомпозицией. Чистый CPU-код."""
     if task.status == TaskStatus.DONE:
         return task.result                      # идемпотентность / resume
-    kanban.update_status(task.id, TaskStatus.RUNNING, started_at=now())
+    # PENDING → ENRICHMENT: именно здесь задача начинает работу и обогащается
+    # контекстом и ресурсами; в PENDING обогащения НЕ происходит (data.md §1,
+    # TaskStatus; product §5)
+    kanban.update_status(task.id, TaskStatus.ENRICHMENT, started_at=datetime.now(timezone.utc))
 
-    # 1. Обогащение контекста (CPU, §2) — перед КАЖДЫМ LLM-вызовом
+    # 1. Обогащение контекста (CPU, §2) — этап ENRICHMENT: выбор агента-исполнителя,
+    #    MCP-инструменты, базы знаний/recall, формирование контекста
     enriched = enricher.enrich(
         brief=task.brief,
         parent_context=context,
         completed_siblings=kanban.done_siblings(task.id),
     )
+    # ENRICHMENT → RUNNING: контекст собран, начинаем LLM-вызовы
+    kanban.update_status(task.id, TaskStatus.RUNNING)
 
     # 2. Декомпозиция — только если детей ещё нет (ленивость)
     if not task.subtasks:
@@ -54,16 +60,15 @@ def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
             semantic.remember(task.brief, result, task.id)
             return result
         children = dedup(filter_dupes(parse(call.final_response), task))
-        for i, sub in enumerate(children):
-            sub.id = f"{task.id}.{i + 1}"              # dot-path, data.md §2
-            sub.parent_id, sub.depth = task.id, task.depth + 1
-            kanban.add_task(sub)
-        task.subtasks = [c.id for c in children]
+        for i, sub in enumerate(children):             # Task(...) уже содержит
+            sub.order = i                              # snowflake id и created_at (data.md §2)
+            sub.parent, sub.depth = task, task.depth + 1  # прямые ссылки (data.md §1)
+            kanban.add_task(sub)                       # в SQL — parent_id (wire-формат)
+        task.subtasks = children                       # List[Task], порядок = исполнение
 
     # 3. Последовательное выполнение детей (порядок = зависимости, A9/A10)
     results = []
-    for cid in task.subtasks:
-        child = kanban.get(cid)
+    for i, child in enumerate(task.subtasks):          # живые объекты, kanban.get не нужен
         if child.status == TaskStatus.DONE:
             results.append(child.result)               # resume без инференса
             continue
@@ -82,8 +87,10 @@ def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
 ```
 
 Отличия от листинга Главы IX (осознанные, v2):
-- статусы `TaskStatus.{PENDING,RUNNING,DONE,FAILED}` вместо `CANCELLED`
-  (отмена ветки = FAILED с `partial=true`, product §5);
+- статусы `TaskStatus.{PENDING,ENRICHMENT,RUNNING,DONE,FAILED}` вместо
+  `CANCELLED` (отмена ветки = FAILED с `partial=true`, product §5);
+  обогащение контекста/ресурсов — отдельный этап ENRICHMENT между стартом
+  и первым LLM-вызовом (data.md §1);
 - degenerate-repeat проверка идёт **после** парсинга (правило CPU,
   protocol §3.7), а не как отдельный ответ модели;
 - `RESEARCH_NEEDED` удалён из протокола модели — триггер исследования
@@ -93,16 +100,18 @@ def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
 ### 1.2. Временная линия (из Главы IX, без изменений по смыслу)
 
 ```
-T0: запрос "Создать REST API"          → задача 0 (pending)
-T1: декомпозиция L0                     → 0 → [0.1 … 0.5]
-T2: 0.1 декомпозируется на актуальном контексте → [0.1.1, 0.1.2] → атоны ✓
-    0.1 DONE, result="FastAPI + PostgreSQL настроены"
-T3: 0.2 декомпозируется с результатом 0.1 в контексте → [0.2.1..0.2.3] ...
-T4: 0.3 видит результаты 0.1+0.2 — и т.д.
+T0: запрос "Создать REST API"          → задача id=1 (pending)
+T1: декомпозиция L0                     → 1 → [2 … 6]   (дети, order 0..4)
+T2: задача 3 декомпозируется на актуальном контексте → [7, 8] → атоны ✓
+    3 DONE, result="FastAPI + PostgreSQL настроены"
+T3: задача 4 декомпозируется с результатом 3 в контексте → [9..11] ...
+T4: задача 5 видит результаты 3+4 — и т.д.
 ```
 
-Инвариант: в момент T3 узел 0.2 ещё **не имеет** детей в Kanban — дети
-появляются только когда 0.2 начинает исполняться. Это и есть ленивость.
+Инвариант: в момент T3 узел 4 ещё **не имеет** детей в Kanban — дети
+появляются только когда 4 начинает исполняться. Это и есть ленивость.
+(Идентификаторы — snowflake, растущие со временем; родство видно только
+через `parent_id`/`order`, не через сам id — data.md §2.)
 
 ### 1.3. Конвейер пост-обработки ответа декомпозиции (плагин TaskParser)
 
@@ -131,7 +140,7 @@ LLM не участвует). Цель — снять с LLM всю механи
 
 | Правило | Проверка | Действие |
 |---|---|---|
-| **F1. Самодостаточный атом** | `normalize(brief) == normalize(description)` (или описание высокосходно с названием, similarity ≥ 0.90) | задача уже «название = что делать» → `is_atom = True`, `description = None` |
+| **F1. Самодостаточный атом** | `normalize(brief) == normalize(description)` (или высокосходны: `cos(embed(brief), embed(description)) ≥ 0.90` — сравнение считается **на лету внутри F1**, отдельный `embedding(description)` в модели не хранится, см. data.md §1 п.2) | задача уже «название = что делать» → `is_atom = True`, `description = None` |
 | **F2. Повтор родителя** | `similarity(embed(child.brief), embed(parent.brief)) ≥ 0.75` (threshold — config `[dedup]`, algorithms §2) | дочерняя задача **удаляется** из списка детей |
 | **F3. Схлопывание родителя** | после F2 у родителя не осталось ни одной дочерней задачи | родитель помечается `is_atom = True` (декомпозиция вырождена → отдаём его Executor'у без нового LLM-вызова) |
 
@@ -140,12 +149,13 @@ project-ключ **`tasks`** (SessionMemory, plugins §5.7; персистент
 зеркало — Kanban, data.md §4.2) **уже заполнен** — дерево существует к
 моменту вызова. Поэтому плагин НЕ перезаписывает `tasks`, а **подставляет
 полученное поддерево отфильтрованных детей нужному родителю**: присваивает
-`parent.subtasks = [ids детей]` и добавляет новые узлы в словарь `{id:
+`parent.subtasks = [объекты детей]` и добавляет новые узлы в словарь `{id:
 Task}` одним атомарным `update_project`.
 
 ```python
 def on_output(self, response, context, session, memory):
-    # стадия 1: парсинг + embedding(brief) при инициализации
+    # стадия 1: парсинг + Task(...) — конструктор сам фиксирует created_at и
+    # генерирует snowflake id (data.md §2); embedding(brief) — при инициализации
     parsed = parse_decomposition(response)          # protocol §3: блоки через пустую строку
     children = []
     for p in parsed:                                # p: {brief, description|None, is_atom}
@@ -153,7 +163,9 @@ def on_output(self, response, context, session, memory):
             brief=p["brief"],
             description=None if p["is_atom"] else p["description"],
             is_atom=p["is_atom"],                   # <atom> второй строкой / глобальный <atom>
-        )
+            order=len(children),                    # позиция = порядок в ответе LLM
+        )                                           # __post_init__: created_at=datetime.now(utc),
+                                                    # id=snowflake_ids.next_id(created_at)
         t.embedding = self.embedder.encode(t.brief) # одна прогонка на задачу, дальше переиспользуется
         children.append(t)
 
@@ -163,8 +175,8 @@ def on_output(self, response, context, session, memory):
     for ch in children:
         if ch.is_atom:                                      # <atom> уже расставлен парсером
             kept.append(ch); continue
-        if same_or_redundant(ch.brief, ch.description):     # F1
-            ch.is_atom, ch.description = True, None
+        if same_or_redundant(ch.brief, ch.description):     # F1: сравнение на лету,
+            ch.is_atom, ch.description = True, None         # embedding(description) НЕ хранится
         if cosine(ch.embedding, parent.embedding) >= THRESHOLD:  # F2 (эмбеддинги стадии 1)
             continue                                        # дубль родителя — удаляем
         kept.append(ch)
@@ -173,9 +185,11 @@ def on_output(self, response, context, session, memory):
 
     # стадия 3: сохранение — подставить поддерево к родителю в уже живое дерево
     def attach(d):                                          # d: {id: Task}, дерево уже заполнено
-        for ch in kept:
-            ch.parent_id, ch.depth = parent.id, parent.depth + 1
-        parent.subtasks = [ch.id for ch in kept]
+        for i, ch in enumerate(kept):                       # id уже snowflake (стадия 1)
+            ch.order = i                                    # переиндексация после фильтрации F2
+            ch.parent = parent                              # прямые ссылки на объекты (v2+)
+            ch.depth = parent.depth + 1                     # инкремент от родителя
+        parent.subtasks = kept                              # List[Task], порядок = исполнение
         return d | {ch.id: ch for ch in kept} | {parent.id: parent}
     memory.update_project("tasks", attach)
     return {"parsed": kept, "action": "accept"}
