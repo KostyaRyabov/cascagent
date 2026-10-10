@@ -344,7 +344,7 @@ Reflect на задачу (stack §3).
 ```
 атом failed → retry×1 (тот же промпт) → ReflectAgent → {retry|reframe|give_up}
 root с FAILED-веткой → завершается с partial=true в результате
-краш процесса → resume из Kanban: RUNNING→PENDING при старте, DONE не перевыполняется
+краш процесса → resume из Kanban: RUNNING и ENRICHMENT→PENDING при старте, DONE не перевыполняется
 ```
 
 ## 8. Расхождения Главы IX с v2 (реестр)
