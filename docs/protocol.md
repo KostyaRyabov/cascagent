@@ -33,7 +33,7 @@ CPU-слой вокруг неё (см. §5–7 и docs/architecture.md).
 - Если ВСЯ исходная задача не делится — верни только одну строку: <atom>
 ```
 
-Хранится как константа `SYSTEM_PROMPT` в `cascagent/parser.py`.
+Хранится как константа `SYSTEM_PROMPT` в `cascagent/plugins/task_parser.py`.
 Стабильный префикс → llama.cpp prefix caching / KV save-restore работает
 на нём без модификаций.
 

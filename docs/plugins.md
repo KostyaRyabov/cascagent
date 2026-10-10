@@ -802,47 +802,45 @@ class AgentSession:
 from abc import ABC, abstractmethod
 
 
-class InitPlugin(ABC):
-    name: str = "base_init"
+> **v3 (2026-10-11, решения лида).** Секции переименованы: InitPlugin убран
+> (его роль — ленивая тяжёлая подготовка в PrePlugin), InputPlugin → PrePlugin,
+> TriggerPlugin → RuntimePlugin, OutputPlugin → PostPlugin. Из API убраны
+> `reset()` (очистка — ответственность агента: `run()` стирает local-скоуп
+> памяти), `should_stop` и `on_stream_end` (семантика останова живёт в op-типах
+> `on_token`; финализация потока — работа PostPlugin). Память биндится в плагин
+> ОДИН РАЗ (`bind()`), а не прокидывается аргументом в каждый хук — хот-путь
+> на токен не тащит лишние параметры. Хуки работают с двумя скоупами:
+> `self.global_memory` (переживает итерации) и `self.local_memory`
+> (очищается агентом перед каждым `run()`).
+
+```python
+class Plugin(ABC):                     # общий предок: name/config/bind()
+    ...
+
+class PrePlugin(Plugin):               # секция PRE (был InputPlugin)
+    name = "base_pre"
 
     @abstractmethod
-    def on_init(self, session: AgentSession, memory: SessionMemory) -> AgentSession:
-        pass
+    def on_input(self, messages: list, context: dict) -> list:
+        """Меняет ТОЛЬКО user-сообщения; system/assistant — байт-в-байт
+        (префиксный кэш llama.cpp, P8)."""
 
+class RuntimePlugin(Plugin):           # секция RUNTIME (был TriggerPlugin)
+    name = "base_runtime"
 
-class InputPlugin(ABC):
-    name: str = "base_input"
+    def on_token(self, token: str, accumulated: str) -> dict:
+        """{"op": "continue"} | {"op": "stop", "data": ...}
+        (останов без ошибки) | {"op": "error", "data": "..."}
+        (останов с ошибкой). Дефолт: pass-through."""
+        return {"op": "continue"}
 
-    @abstractmethod
-    def on_input(self, messages: list, context: dict,
-                 session: AgentSession, memory: SessionMemory) -> list:
-        pass
-
-
-class TriggerPlugin(ABC):
-    name: str = "base_trigger"
-
-    @abstractmethod
-    def on_token(self, token: str, accumulated: str,
-                 session: AgentSession, memory: SessionMemory) -> dict:
-        pass
-
-    def should_stop(self, accumulated: str,
-                    session: AgentSession, memory: SessionMemory) -> bool:
-        return False
-
-    def on_stream_end(self, full_response: str,
-                      session: AgentSession, memory: SessionMemory) -> str:
-        return full_response
-
-
-class OutputPlugin(ABC):
-    name: str = "base_output"
+class PostPlugin(Plugin):              # секция POST (был OutputPlugin)
+    name = "base_post"
 
     @abstractmethod
-    def on_output(self, response: str, context: dict,
-                  session: AgentSession, memory: SessionMemory) -> dict:
-        pass
+    def on_output(self, response: str, context: dict) -> dict:
+        """{"response", "parsed", "metadata",
+           "action": accept|retry|reject}."""
 ```
 
 ### 6.4 Agent (оркестратор)

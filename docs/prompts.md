@@ -171,8 +171,8 @@ def parse_decomposition(response: str) -> list[dict]:
 оборвана на лимите токенов) — хвост после открывающего тега считается
 незавершённым рассуждением, final пуст → ретрай по правилам cpu-offload §2.3.
 
-Референс — `src/cascagent/parser.py::split_think_and_response` (реализован,
-тесты зелёные); поведение зафиксировано снапшот-тестами:
+Референс — `src/cascagent/plugins/task_parser.py::TaskParser.split_think_and_response`
+(реализован, тесты зелёные); поведение зафиксировано снапшот-тестами:
 
 ```python
 def test_split_no_think():
