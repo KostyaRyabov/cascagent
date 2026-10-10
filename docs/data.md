@@ -42,9 +42,13 @@ class Task:
     brief: str                                 # название одной строкой (~50 токенов, для RAG)
     description: Optional[str]                 # что нужно сделать (для LLM); None у атомов
     is_atom: bool = False                      # CPU-флаг: задача не декомпозируется
+                                               # (<atom> в описании / глобальный <atom>
+                                               # либо правила F1/F3 — process §1.3)
     embedding: Optional[bytes] = None          # float32 little-endian от embed(brief);
                                                # считается при инициализации задачи (плагин
                                                # TaskParser, plugins §7.4 / process §1.3)
+    canonical_id: Optional[str] = None         # v2+ (roadmap #10): ссылка на оригинал при
+                                               # семантическом дубле; в v1 всегда None
     status: TaskStatus = TaskStatus.PENDING
     result: Optional[str] = None               # что получилось после выполнения
     parent_id: Optional[str] = None
@@ -62,11 +66,14 @@ class Task:
    Атомарная подзадача: `description = None`, `is_atom = True` (протокол
    допускает эквивалентную запись `description == ""` — нормализуется
    парсером к `None`, protocol §3).
-2. **`is_atom` и `embedding`** — производные CPU-поля, модель их не задаёт:
+2. **`is_atom`, `embedding` и `canonical_id`** — производные CPU-поля, LLM
+   их не задаёт:
    `is_atom` выставляется парсером (`<atom>` в описании / глобальный
-   `<atom>`) и фильтром задач (process §1.3, правила F1–F3); `embedding`
-   считается один раз при инициализации задачи из `brief` и переиспользуется
-   recall/дубль-детектором (не пересчитывать на каждый поиск).
+   `<atom>`) и стадией фильтрации плагина TaskParser (process §1.3, правила
+   F1–F3); `embedding` считается один раз при инициализации задачи из `brief`
+   и переиспользуется recall/дубль-детектором (не пересчитывать на каждый
+   поиск); `canonical_id` — поле будущего графа задач (roadmap #10), в v1
+   остаётся `None`.
 3. **Нет категорий** — логика «что делать с задачей» вынесена на CPU-слой;
    модель либо декомпозирует, либо пишет `<atom>`.
 4. **Нет `blocked_by`** — зависимости определяются из структуры дерева и
