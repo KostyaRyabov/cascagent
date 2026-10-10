@@ -60,11 +60,12 @@ def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
             semantic.remember(task.brief, result, task.id)
             return result
         children = dedup(filter_dupes(parse(call.final_response), task))
-        for i, sub in enumerate(children):             # Task(...) уже содержит
-            sub.order = i                              # snowflake id и created_at (data.md §2)
-            sub.parent, sub.depth = task, task.depth + 1  # прямые ссылки (data.md §1)
-            kanban.add_task(sub)                       # в SQL — parent_id (wire-формат)
-        task.subtasks = children                       # List[Task], порядок = исполнение
+        # Task(...) фиксирует created_at + snowflake id, считает embedding(brief)
+        # и вычисляет depth из parent — всё в __init__ (data.md §1/§2)
+        task.subtasks = children                    # List[Task], порядок = исполнение
+                                                    # (position == index, поля order нет)
+        for sub in children:                        # SQL-зеркало: parent_id + "order"
+            kanban.add_task(sub, order=task.subtasks.index(sub))
 
     # 3. Последовательное выполнение детей (порядок = зависимости, A9/A10)
     results = []
@@ -101,7 +102,7 @@ def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
 
 ```
 T0: запрос "Создать REST API"          → задача id=1 (pending)
-T1: декомпозиция L0                     → 1 → [2 … 6]   (дети, order 0..4)
+T1: декомпозиция L0                     → 1 → [2 … 6]   (дети, позиция в subtasks 0..4)
 T2: задача 3 декомпозируется на актуальном контексте → [7, 8] → атоны ✓
     3 DONE, result="FastAPI + PostgreSQL настроены"
 T3: задача 4 декомпозируется с результатом 3 в контексте → [9..11] ...
@@ -111,7 +112,7 @@ T4: задача 5 видит результаты 3+4 — и т.д.
 Инвариант: в момент T3 узел 4 ещё **не имеет** детей в Kanban — дети
 появляются только когда 4 начинает исполняться. Это и есть ленивость.
 (Идентификаторы — snowflake, растущие со временем; родство видно только
-через `parent_id`/`order`, не через сам id — data.md §2.)
+через `parent`/позицию в `subtasks` (в SQL — `parent_id`/`"order"`), не через сам id — data.md §2.)
 
 ### 1.3. Конвейер пост-обработки ответа декомпозиции (плагин TaskParser)
 
@@ -154,23 +155,24 @@ Task}` одним атомарным `update_project`.
 
 ```python
 def on_output(self, response, context, session, memory):
-    # стадия 1: парсинг + Task(...) — конструктор сам фиксирует created_at и
-    # генерирует snowflake id (data.md §2); embedding(brief) — при инициализации
+    # стадия 1: парсинг + Task(...) — ВСЕ поля формируются за один шаг в __init__:
+    # created_at -> snowflake id (без __post_init__), embedding(brief), depth от parent
+    # (data.md §1/§2). Порядок детей = позиция в списке (поля order нет).
     parsed = parse_decomposition(response)          # protocol §3: блоки через пустую строку
-    children = []
+    parent = memory.get_project("tasks")[context["parent_id"]]
+    children = []                                   # kept-кандидаты; индекс == порядок
     for p in parsed:                                # p: {brief, description|None, is_atom}
         t = Task(
             brief=p["brief"],
             description=None if p["is_atom"] else p["description"],
             is_atom=p["is_atom"],                   # <atom> второй строкой / глобальный <atom>
-            order=len(children),                    # позиция = порядок в ответе LLM
-        )                                           # __post_init__: created_at=datetime.now(utc),
-                                                    # id=snowflake_ids.next_id(created_at)
-        t.embedding = self.embedder.encode(t.brief) # одна прогонка на задачу, дальше переиспользуется
+            parent=parent,                          # __init__: depth=parent.depth+1,
+        )                                           # created_at=datetime.now(utc),
+                                                    # id=snowflake_ids.next_id(created_at),
+                                                    # embedding=embed(brief) — всё здесь
         children.append(t)
 
     # стадия 2: фильтрация/проверка (F1–F3) — до сохранения
-    parent = memory.get_project("tasks")[context["parent_id"]]
     kept = []
     for ch in children:
         if ch.is_atom:                                      # <atom> уже расставлен парсером
@@ -183,12 +185,12 @@ def on_output(self, response, context, session, memory):
     if not kept and not parent.is_atom:                     # F3
         parent.is_atom, parent.description = True, None
 
-    # стадия 3: сохранение — подставить поддерево к родителю в уже живое дерево
+    # стадия 3: сохранение — подставить поддерево к родителю в уже живое дерево.
+    # kept уже в нужном порядке: после фильтрации F2 позиция == индекс,
+    # никакой переиндексации не требуется (order как поле удалён из модели).
     def attach(d):                                          # d: {id: Task}, дерево уже заполнено
-        for i, ch in enumerate(kept):                       # id уже snowflake (стадия 1)
-            ch.order = i                                    # переиндексация после фильтрации F2
+        for ch in kept:
             ch.parent = parent                              # прямые ссылки на объекты (v2+)
-            ch.depth = parent.depth + 1                     # инкремент от родителя
         parent.subtasks = kept                              # List[Task], порядок = исполнение
         return d | {ch.id: ch for ch in kept} | {parent.id: parent}
     memory.update_project("tasks", attach)

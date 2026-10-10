@@ -108,9 +108,12 @@ LLM при этом остаётся только генерацией текс�
 делает CPU-слой вокруг неё (ContextEnricher, DuplicateDetector, Kanban).
 
 Модель данных: `Task(id, brief, description, is_atom, embedding, status,
-result, parent, depth, subtasks, created_at, started_at, finished_at)`;
+result, parent, depth, subtasks, created_at, started_at, finished_at)` —
+все поля формируются за один шаг в `__init__` (created_at → snowflake id,
+embedding(brief), depth от parent; без dataclass/`__post_init__`; отдельного
+поля `order` нет — порядок детей = позиция в `parent.subtasks`);
 `parent`/`subtasks` — прямые ссылки на объекты `Task` в живом дереве
-(в SQL-зеркале — `parent_id`/dot-path); время — `datetime` (UTC).
+(в SQL-зеркале — `parent_id` + колонка `"order"`); время — `datetime` (UTC).
 `TaskStatus = pending | enrichment | running | done | failed`, где
 **pending — задача ещё не начала работу**; обогащение контекстом и
 ресурсами (выбор агента, MCP-инструменты, базы знаний) — отдельный этап

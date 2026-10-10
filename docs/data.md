@@ -32,8 +32,7 @@ class Task:
 **Версия 2 (актуальная, зафиксирована в protocol §4):**
 
 ```python
-from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import List, Optional
 
@@ -50,45 +49,44 @@ class TaskStatus(str, Enum):
     DONE = "done"             # задача корректно выполнена
     FAILED = "failed"         # ошибка либо недостаточно данных для выполнения
 
-@dataclass
 class Task:
-    id: int                                    # snowflake (data.md §2): кодирован created_at;
-                                               # генерируется В КОНСТРУКТОРЕ задачи —
-                                               # экземпляр Task без id невозможен
-    brief: str                                 # название одной строкой (~50 токенов, для RAG)
-    description: Optional[str]                 # что нужно сделать (для LLM); None у атомов
-    is_atom: bool = False                      # CPU-флаг: задача не декомпозируется
-                                               # (<atom> в описании / глобальный <atom>
-                                               # либо правила F1/F3 — process §1.3)
-    embedding: Optional[List[float]] = None    # вектор от embed(brief); считается один раз
-                                               # при инициализации задачи (плагин TaskParser,
-                                               # plugins §7.4 / process §1.3); отдельный
-                                               # embedding(description) НЕ хранится (см. п.2)
-    canonical: Optional['Task'] = None         # v2+ (roadmap #10): прямая ссылка на задачу-
-                                               # оригинал при семантическом дубле; в v1 None
-    status: TaskStatus = TaskStatus.PENDING
-    result: Optional[str] = None               # что получилось после выполнения
-    parent: Optional['Task'] = None            # прямая ссылка на родителя; в живом дереве
-                                               # (project-ключ `tasks`) все ссылки — объекты
-    order: int = 0                             # позиция среди siblings (порядок задаёт
-                                               # парсер; в SQL — колонка `order`;
-                                               # исполнение — по возрастанию внутри parent)
-    depth: int = 0                             # уровень детализации: depth(child) =
-                                               # depth(parent) + 1 (инкремент от родителя)
-    subtasks: List['Task'] = field(default_factory=list)  # дети; порядок = исполнение;
-                                               # default_factory=list — mutable default:
-                                               # каждый экземпляр получает СВОЙ новый []
-                                               # (можно append без предварительной
-                                               # инициализации поля)
-    created_at: datetime                       # обязателен (без default — заполняется при
-                                               # создании Task; datetime.now(timezone.utc);
-                                               # None недопустим: из него кодируется snowflake id)
-    started_at: Optional[datetime] = None      # проставляется оркестратором при переходе
-                                               # PENDING → ENRICHMENT (момент начала работы,
-                                               # до LLM-вызова; RUNNING — уже с собранным
-                                               # контекстом)
-    finished_at: Optional[datetime] = None     # проставляется при DONE / FAILED
+    """Все поля формируются за ОДИН шаг — в __init__ (без __post_init__ и
+    вторичной записи id). Не dataclass: ручной конструктор даёт гарантию
+    «id создан ровно из того created_at, что зафиксирован в этом же вызове»."""
+
+    def __init__(self, brief: str, description: Optional[str] = None, *,
+                 is_atom: bool = False, parent: Optional['Task'] = None,
+                 canonical: Optional['Task'] = None):
+        self.created_at = datetime.now(timezone.utc)  # обязателен, DateTime, не опционален
+        self.id = snowflake_ids.next_id(self.created_at)  # snowflake (§2): кодирован
+                                              # created_at; генерируется ЗДЕСЬ ровно один раз
+        self.brief = brief                    # название одной строкой (~50 токенов, для RAG)
+        self.description = description        # что нужно сделать (для LLM); None у атомов
+        self.is_atom = is_atom                # CPU-флаг: не декомпозируется (<atom> / F1/F3,
+                                              # process §1.3); атом ⇒ description=None
+        self.embedding = embed(brief)         # вектор от embed(brief); один прогон в
+                                              # конструкторе (плагин TaskParser, plugins §7.4);
+                                              # отдельный embedding(description) НЕ хранится (п.2)
+        self.canonical = canonical            # v2+ (roadmap #10): ссылка на задачу-оригинал
+                                              # при семантическом дубле; в v1 None
+        self.status = TaskStatus.PENDING
+        self.result = None                    # что получилось после выполнения
+        self.parent = parent                  # прямая ссылка на родителя; в живом дереве
+                                              # (project-ключ `tasks`) все ссылки — объекты
+        self.depth = 0 if parent is None else parent.depth + 1
+                                              # уровень детализации: инкремент от родителя
+        self.subtasks: List['Task'] = []      # дети; ПОРЯДОК ИСПОЛНЕНИЯ = порядок в этом
+                                              # списке (position == index); отдельного поля
+                                              # `order` НЕТ — он лишний
+        self.started_at = None                # оркестратор ставит при PENDING → ENRICHMENT
+        self.finished_at = None               # ставится при DONE / FAILED
 ```
+
+> **Позиция sibling'а.** Порядок исполнения детей определяется индексом в
+> `parent.subtasks` (`i = parent.subtasks.index(task)`), мутаций порядка —
+> `list.insert/reindex`. В SQL-зеркале (§4.2) индекс материализуется колонкой
+> `"order"` при сериализации дерева (пишет её только save-слой TaskParser/оркестратор),
+> чтобы пережить перезагрузку из SQLite; в памяти поля `order` не существует.
 
 > **Реализация:** типизация выше — идеалистическая (прямые ссылки `Task`,
 > `datetime`). SQLAlchemy-модель kanban (§4.2) хранит те же сущности в
@@ -118,21 +116,31 @@ class Task:
 3. **Нет категорий** — логика «что делать с задачей» вынесена на CPU-слой;
    модель либо декомпозирует, либо пишет `<atom>`.
 4. **Нет `blocked_by`** — зависимости определяются из структуры дерева и
-   порядка siblings: если A идёт раньше B, B зависит от A (FIFO-планирование,
-   cpu-offload A9).
+   порядка siblings (индекс в `parent.subtasks`): если A идёт раньше B,
+   B зависит от A (FIFO-планирование, cpu-offload A9).
 5. **Нет `acceptance`** — критерии приёмки включаются в `description`;
    оркестратор проверяет покрытие результатом ребёнка (A7/A8).
-6. **В памяти — прямые ссылки, в БД — id.** В живом дереве `parent`,
+6. **Нет поля `order`** — позиция sibling'а выводится напрямую из порядка в
+   `parent.subtasks` (position == index); отдельный счётчик был бы вторым
+   источником истины о порядке и рассинхронизировался бы при insert/remove.
+7. **В памяти — прямые ссылки, в БД — id.** В живом дереве `parent`,
    `subtasks` и `canonical` — объекты `Task` (никаких `kanban.get(id)` на
    каждый шаг обхода). Сериализация тривиальна: snowflake id уже хранится в
    самом поле `id` задачи, поэтому SQL-строка (§4.2) выводится из объекта без
    отдельного индекса-словаря; при загрузке из Kanban связи восстанавливаются
-   по `parent_id` за один проход.
-7. **Иерархия — не в id.** Snowflake id непрозрачен для дерева (в отличие от
+   по `parent_id` за один проход, а порядок детей — по колонке `"order"`,
+   материализованной из позиции в `subtasks` при сохранении.
+8. **Иерархия — не в id.** Snowflake id непрозрачен для дерева (в отличие от
    прежней dot-path схемы): родство держится на ссылках `parent`/`subtasks`
-   (+ `parent_id` в SQL), порядок siblings — на поле `order`, глубина — на
-   `depth`. Обход «дерево вниз» = индексация `subtasks`, «вверх» = цепочка
-   `parent`; сортировка исполнения — `ORDER BY parent_id, "order"` (§4.2).
+   (+ `parent_id` в SQL), порядок siblings — на позиции в списке `subtasks`,
+   глубина — на `depth`. Обход «дерево вниз» = индексация `subtasks`,
+   «вверх» = цепочка `parent`; сортировка исполнения — `ORDER BY parent_id,
+   "order"` (§4.2).
+9. **Все поля — за один шаг (`__init__`).** Конструктор фиксирует
+   `created_at`, тут же кодирует из него snowflake `id` (без `__post_init__`
+   и двойной записи), считает `embedding(brief)` и вычисляет `depth` из
+   переданного `parent`. Экземпляр Task с неполным набором полей
+   невозможлен — инварианты модели гарантированы самим фактом создания.
 
 Иерархия задач хранится в памяти проекта под системным ключом **`tasks`**
 (project-уровень SessionMemory, plugins §5.7): словарь `{id: Task}` со
@@ -148,9 +156,10 @@ State machine статусов и инварианты — `docs/product.md` §5
 
 ID задачи — **snowflake** (алгоритм генерации уникальных ID, Twitter):
 монотонный 64-битный целый, в который закодирован момент создания
-(`created_at`). Формируется **в конструкторе Task** (`__post_init__`: сначала
-фиксируется `created_at = datetime.now(timezone.utc)`, затем
-`id = snowflake_ids.next_id(created_at)`; TaskParser, process §1.3), поэтому
+(`created_at`). Формируется **в конструкторе Task** (`__init__`: сначала
+фиксируется `created_at = datetime.now(timezone.utc)`, затем сразу
+`id = snowflake_ids.next_id(created_at)` — один вызов, без `__post_init__`
+и вторичной записи; TaskParser, process §1.3), поэтому
 id существует с первой секунды жизни задачи и содержит дату внутри — по нему
 можно восстановить время создания без отдельного lookup.
 
@@ -215,24 +224,21 @@ def created_at_from_id(task_id: int) -> datetime:
 - **Компактность**: int64 — одно целое вместо строкового id, без обращения к
   внешнему сервису генерации (децентрализованно, только локальный lock).
 
-В модели Task это реализуется так (dataclass, idealized §1):
+В модели Task это реализуется прямо в `__init__` (см. §1 — без dataclass и
+`__post_init__`, один вызов генератора):
 
 ```python
-@dataclass
 class Task:
-    id: int = field(default_factory=lambda: snowflake_ids.next_id())
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    # ... остальные поля
-
-    def __post_init__(self):
-        # id кодирует именно этот created_at (один источник времени)
-        self.id = snowflake_ids.next_id(self.created_at)
+    def __init__(self, brief: str, ...):
+        self.created_at = datetime.now(timezone.utc)   # сначала фиксируем время
+        self.id = snowflake_ids.next_id(self.created_at)  # затем кодируем из НЕГО id
+        # ... остальные поля — в этом же вызове конструктора
 ```
 
 Что заменили (dot-path `0`, `0.1`, `0.1.2`): родство теперь только через
-`parent`/`subtasks` (+ `parent_id` в SQL), порядок siblings — через поле
-`order` (проставляет парсер по позиции блока в ответе LLM), глубина — через
-`depth = parent.depth + 1`. Инварианты загрузки из БД: у каждой задачи
+`parent`/`subtasks` (+ `parent_id` в SQL), порядок siblings — позиция в списке
+`parent.subtasks` (в SQL материализуется колонкой `"order"` при сохранении
+дерева), глубина — через `depth = parent.depth + 1`. Инварианты загрузки из БД: у каждой задачи
 (кроме корневых) есть существующий `parent_id`; `"order"` уникален внутри
 `(parent_id, order)`; `depth` согласован с длиной цепочки parent (проверка —
 CPU-валидация, cpu-offload A13).
