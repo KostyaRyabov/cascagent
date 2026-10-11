@@ -64,6 +64,13 @@ class ParseState:
     done: bool = False                    # получен [DONE]
 ```
 
+**Финальная правка (раунд v3): `finish_reason` убран из `ParseStatus`.**
+Он есть у каждого `Segment` (как сегмент завершился) и остаётся в `ParseState` только как
+протокольное поле потока (почему остановилась генерация LLM). Дублировать его в статусе
+текущего элемента незачем — они могут не совпадать (поток закончился по "length",
+а открытый сегмент будет закрыт с "unclosed"). В `ParseStatus` остаются только
+`PARTIAL` / `WORD` / `SPECIAL`.
+
 ## Что убрали по ходу обсуждения
 - `Unit` — его поля (`status`, `word`) переехали прямо в `ParseState`; состояние единичное и текущее.
 - `raw: str` — дублировал `buffer`.
@@ -74,6 +81,7 @@ class ParseState:
 - `source`, `open_tag`, `is_open_tag` — информация дублировала `kind`.
 - `truncated: bool` — заменён на `finish_reason` по аналогии с выводом LLM.
 - `children` -> `segments` (единая терминология: сегменты и подсегменты).
+- `finish_reason` из `ParseStatus` — дублировал `Segment.finish_reason` и протокольный `ParseState.finish_reason`.
 
 ## Интерфейс плагина
 
