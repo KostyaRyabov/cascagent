@@ -24,8 +24,10 @@ Two structural decisions of 2026-10-11 shape the API below:
    hold instance state themselves; transient data goes to memory.
 
 2. Memories are BOUND ONCE at plugin registration (``bind()``), not
-   passed through every hook call. Hot-path hooks run per TOKEN, so
-   their signature stays minimal: ``on_token(token, accumulated)``.
+   passed through every hook call. Hot-path hooks run per committed
+   ELEMENT (word/special), and the ``on_token(token, accumulated)``
+   signature was removed 2026-10-12 in favour of ``on_upload(state,
+   context)`` — plugins see structured ParseState, not raw tokens.
    ALL FOUR hierarchy memories are bound: workspace / project / global /
    local (decision 2026-10-11) — any level is addressable from a hook as
    a plain attribute (e.g. task tree lives in ``self.project_memory``).

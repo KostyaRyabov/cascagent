@@ -204,8 +204,9 @@ class Agent:
         """Attach a plugin and bind the agent's memories into it.
 
         Binding happens ONCE at initialization so hot-path hooks stay
-        argument-light: ``on_token(token, accumulated)`` instead of
-        dragging session+memory through every single token.
+        attribute-based instead of dragging memories through every
+        single element (``on_token`` per-token API was removed
+        2026-10-12; runtime hooks receive ParseState + context).
         """
         from cascagent.plugins.base import PrePlugin, RuntimePlugin, PostPlugin
         # Bind ALL four hierarchy memories: the agent's own two plus the
