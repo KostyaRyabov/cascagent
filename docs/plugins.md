@@ -899,17 +899,20 @@ class Agent:
         # 2. PRE:    messages = p.on_input(messages, context)   # цепочкой
         # 3. LLM+RUNTIME:
         #    parser = self._make_parser()            # свежий ResponseParser
-        #    for chunk in gen:                       # стрим или str-файк
+        #    gen = llm(messages)                     # ТОЛЬКО chunk-iterator
+        #    for chunk in gen:                       # (str не поддерживается)
         #        for ev in parser.feed(chunk):       # WORD/SPECIAL элементы
-        #            st.token_offset += 1            # позиция элемента
+        #            process(ev):                    #   (в коде — замыкание vote)
         #            голосуют ВСЕ runtime-плагины on_upload(state, context)
-        #            -> bool; все True -> parser.commit(ev)
-        #              (commit инкрементит word_count);
+        #            -> bool до первого False; все True -> parser.commit(ev)
+        #              (commit создаёт Word и инкрементит word_count);
         #            первый False -> стоп (finish_reason: "stop"|"error",
         #            не задан -> "error"), элемент НЕ коммитится
-        #    parser.state.finish_reason = None       # finalize ставит истину
-        #    parser.finalize("stop"|"error")         # хвост буфера флашится
+        #    чистый конец: tail = parser.drain_buffer(); process(tail);
+        #      parser.finalize("stop")
+        #    стоп плагина: parser.close_on_stop(stop)  # хвост НЕ флашится
         #    finish_reason == "error" -> RuntimeError(state.error)
+        #    response = parser.response_text()       # из commit-дерева, не эхо
         # 4. context["response"], context["think"]   # think из THINK-сегментов
         #    context["parse_state"] = parser.state   # живой state для POST (§5.6)
         # 5. POST:   r = p.on_output(response, context)  # цепочкой
