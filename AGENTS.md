@@ -159,7 +159,7 @@ cascagent/
 │   ├── researcher.py     # ResearchAgent (изолированный сбор инфы)       [Этап 4+]
 │   ├── kanban.py         # SQLite хранилище                              [Этап 3]
 │   ├── cli.py            # argparse: --query --max-depth ...             [Этап 3]
-│   ├── bk_tree.py        # BKTree + fix_typo                             [Этап 4]
+│   ├── bk_tree.py        # BKTree + fix_typo                             [готово]
 │   ├── semantic.py       # SemanticMemory.remember/recall                [Этап 4]
 │   └── rag.py            # BM25 + vector search                          [Этап 4]
 ├── tests/                # pytest, по файлу на модуль
