@@ -27,8 +27,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
-[project.scripts]
-cascagent = "cascagent.cli:main"
+# Entry point временно отключён: модуль cascagent/cli.py появится в фазе 2
+# терминального агента (docs/roadmap.md). Включить обратно вместе с cli.py:
+# [project.scripts]
+# cascagent = "cascagent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

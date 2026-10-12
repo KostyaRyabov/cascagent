@@ -25,7 +25,7 @@ from cascagent.bk_tree import (
     fix_typo,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"  # синхронизировано с pyproject.toml; см. docs/roadmap.md (фаза 0)
 
 __all__ = [
     "BKNode",

@@ -688,15 +688,19 @@ port-этап (§1), full observability/dashboards.
 ## 10. План работ (аудит «код ↔ документация», 2026-10-12)
 
 ### Фаза 0 — гигиена репозитория (без изменения поведения)
-- [ ] Починить 2 падающих теста под текущий API: голосование Runtime-
+- [x] Починить 2 падающих теста под текущий API: голосование Runtime-
       плагинов идёт на parsed-элементах через `on_upload(state)`, а не
       `on_token` (`tests/test_plugins_base.py::TestHierarchy::
       test_runtime_stop_without_error`, `test_runtime_error_raises`).
-- [ ] Унифицировать версию: `pyproject.toml` = 0.1.0 vs
+      — сделано (коммит 015073d, 2026-10-12).
+- [x] Унифицировать версию: `pyproject.toml` = 0.1.0 vs
       `src/cascagent/__init__.py::__version__` = 0.2.0.
-- [ ] NOTICE (пустой файл) — заполнить attribution-текстом Apache-2.0.
-- [ ] Entry point `cascagent = "cascagent.cli:main"` битый — модуля `cli.py`
+      — сделано: приведено к 0.1.0 (ветка v0.1, работающего кода агента ещё нет).
+- [x] NOTICE (пустой файл) — заполнить attribution-текстом Apache-2.0.
+      — сделано: copyright + link to LICENSE + third-party notices.
+- [x] Entry point `cascagent = "cascagent.cli:main"` битый — модуля `cli.py`
       нет; появляется в фазе 2 (либо временно убрать из pyproject).
+      — сделано: закомментирован в pyproject.toml с пометкой «включить в фазе 2».
 
 ### Фаза 1 — рефакторинг документации (привести к фактическому состоянию кода)
 - [ ] `AGENTS.md` §6: дерево src не соответствует факту — `parser.py`/
