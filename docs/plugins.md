@@ -443,6 +443,17 @@ def _on_duration(self, key, value):
 «callback получает (key, value, level)» снято: уровень задаётся тем, на
 каком экземпляре Memory подписались, третий аргумент не нужен.
 
+**Решение (зафиксировано):** скоуп подписки остаётся строго per-level —
+вариант А. Convenience-обёрток вроде `Agent.subscribe_all(pattern, cb)`
+(подписка сразу на все четыре уровня) и propagation событий от низших
+уровней к высшим НЕ вводим. Если плагину нужно отслеживать ключ, который
+может появиться на любом уровне, он явно подписывается на каждый нужный
+экземпляр Memory (`local_memory.subscribe(...)`, `project_memory.subscribe(...)`
+и т.д.). Обоснование: явность дешевле магии — propagation сделал бы
+невозможным предсказание, сколько раз вызовется callback, и усложнил бы
+отладку; а `subscribe_all` скрывал бы привязку плагина к уровню, которая
+является осмысленной частью его контракта.
+
 ### 5.5 Жизненный цикл и создание памяти (реализовано)
 
 Память НЕ создаётся отдельной фабрикой — она является частью объектов
@@ -1512,8 +1523,10 @@ dump = dict(agent.global_memory._data)          # отладочный дамп 
 ```
 
 Подписка glob'ом по семейству ключей — так же, другим паттерном:
-`self.project_memory.subscribe("tasks:*", cb)`. Простейшая альтернатива без
-подписки — прямо в post-плагине:
+`self.project_memory.subscribe("tasks:*", cb)`. Скоуп строго per-level
+(решение зафиксировано, §5.4): если ключ может появиться на нескольких
+уровнях, подписываемся явно на каждый из них; обёрток и propagation нет.
+Простейшая альтернатива без подписки — прямо в post-плагине:
 
 ```python
 self.global_memory.set("calls_count", self.global_memory.get("calls_count", 0) + 1)
@@ -1600,7 +1613,7 @@ my_limiter = "mypackage.plugins:TokenBudgetLimiter"
 
 | API | Гарантируется стабильным? | Примечание |
 |-----|---------------------------|------------|
-| Memory get/set/clear + subscribe/unsubscribe (glob) | да (semver minor) | ключи — domain плагинов; уровни задаются экземпляром, суффиксов не вводим |
+| Memory get/set/clear + subscribe/unsubscribe (glob) | да (semver minor) | ключи — domain плагинов; уровни задаются экземпляром, суффиксов не вводим; скоуп подписки строго per-level (вариант А, §5.4) — без обёрток и propagation |
 | Иерархия Workspace/Project/Agent (add_*, *_memory свойства) | да (semver minor) | project/workspace могут быть None у невстроенного агента |
 | Сигнатуры on_input/on_upload/on_output | да (semver major на ломку) | новые optional-параметры — minor |
 | bind(workspace/project/global/local_memory) | да (semver major на ломку) | порядок/наборы keyword-аргументов фиксированы |
