@@ -1021,7 +1021,7 @@ global, super → workspace):
 Черновик ниже написан под снятый `SessionMemory`; при реализации
 (`breakpoints.py` нет в дереве) конструктор принимает `Agent`, а
 `snapshot()` строится копированием четырёх экземпляров `Memory`
-(§5.8). Логику save/load/restore оставляем как ориентир формата JSONL;
+(§5.8; контракт формы снимка `{level: dict-копия}` зафиксирован в §11.4.1). Логику save/load/restore оставляем как ориентир формата JSONL;
 метод `restore_from()` переписан под фактический API v0.1
 (`Memory.set/get/clear`, без суффиксов-скоупов):
 
@@ -1531,6 +1531,28 @@ dump = dict(agent.global_memory._data)          # отладочный дамп 
 ```python
 self.global_memory.set("calls_count", self.global_memory.get("calls_count", 0) + 1)
 ```
+
+### 11.4.1 Снимок памяти (snapshot) — ПЛАН
+
+Метода `Agent.snapshot()` в v0.1 **нет** (проверено по дереву: ни в
+`memory.py`, ни в плагинах). Для отладочного дампа сейчас допустим прямой
+доступ к `_data`, но это внутренний атрибут — не API. Целевая форма
+(реализация вместе с breakpoint'ами, §6.7):
+
+```python
+def snapshot(self) -> Dict[str, Dict[str, Any]]:
+    """{level: dict-копия} по четырём экземплярам Memory агента."""
+    return {
+        "local":     dict(self.local_memory._data),
+        "global":    dict(self.global_memory._data),
+        "project":   dict(self.project_memory._data) if self.project_memory else {},
+        "workspace": dict(self.workspace_memory._data) if self.workspace_memory else {},
+    }
+```
+
+Семантика снимка согласована с формой JSONL-записи BreakpointManager
+(§6.7); формат `{level: {...}}` фиксируем как контракт ещё до реализации,
+чтобы тесты breakpoint'ов писались против него сразу.
 
 ### 11.5 Полная сборка Decomposer-проекта (code, не TOML)
 
