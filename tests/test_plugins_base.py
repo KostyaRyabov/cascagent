@@ -166,10 +166,12 @@ class TestMemory:
         m.set("k", 1)
         assert m.get("k") == 1
 
-    def test_update_with_default(self):
+    def test_read_modify_write_via_set(self):
         m = Memory()
-        assert m.update("cnt", lambda x: x + 1, default=0) == 1
-        assert m.update("cnt", lambda x: x + 1, default=0) == 2
+        m.set("cnt", (m.get("cnt") or 0) + 1)
+        assert m.get("cnt") == 1
+        m.set("cnt", (m.get("cnt") or 0) + 1)
+        assert m.get("cnt") == 2
 
     def test_clear_empties_the_store(self):
         m = Memory()
@@ -203,7 +205,7 @@ class TestMemory:
         seen = []
         m.subscribe("*", lambda k, v: seen.append(k))
         m.set("a", 1)
-        m.update("b", lambda x: (x or 0) + 1, default=0)
+        m.set("b", (m.get("b") or 0) + 1)
         assert seen == ["a", "b"]
 
     def test_get_does_not_notify(self):

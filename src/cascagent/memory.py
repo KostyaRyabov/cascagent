@@ -43,7 +43,7 @@ class Memory:
     def __init__(self, name: str = "") -> None:
         self.name = name
         self._data: Dict[str, Any] = {}
-        #: [(glob pattern, callback)] — fired on set/update.
+        #: [(glob pattern, callback)] — fired on set.
         self._subscribers: List[tuple] = []
 
     # -- CRUD -----------------------------------------------------------
@@ -56,14 +56,6 @@ class Memory:
         """Read ``key`` (``default`` when absent). Never fires callbacks."""
         return self._data.get(key, default)
 
-    def update(self, key: str, updater: Callable[[Any], Any],
-               default: Any = None) -> Any:
-        """Atomic read-modify-write: ``updater(old) -> new``, stored and
-        broadcast as one operation (history appends, counters)."""
-        new_value = updater(self._data.get(key, default))
-        self._data[key] = new_value
-        self._notify(key, new_value)
-        return new_value
 
     def clear(self) -> None:
         """Drop ALL keys silently (no per-key events — a bulk wipe is not
@@ -78,7 +70,7 @@ class Memory:
         Patterns: "tasks:*" (every task node), "*.error" (any error flag),
         "*" watches everything (replaces the old global on_change).
         Callback signature: ``callback(key, new_value)`` — fired after
-        set/update, NOT after clear().
+        set, NOT after clear().
         """
         self._subscribers.append((pattern, callback))
 
