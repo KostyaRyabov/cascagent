@@ -29,6 +29,9 @@ from __future__ import annotations
 import fnmatch
 from typing import Any, Callable, Dict, List, Optional
 
+#: Sentinel for delete(): distinguishes "key absent" from a stored None.
+_MISSING = object()
+
 
 class Memory:
     """A flat KV store with glob-pattern subscriptions.
@@ -43,7 +46,7 @@ class Memory:
     def __init__(self, name: str = "") -> None:
         self.name = name
         self._data: Dict[str, Any] = {}
-        #: [(glob pattern, callback)] — fired on set/update.
+        #: [(glob pattern, callback)] — fired on set.
         self._subscribers: List[tuple] = []
 
     # -- CRUD -----------------------------------------------------------
@@ -56,14 +59,18 @@ class Memory:
         """Read ``key`` (``default`` when absent). Never fires callbacks."""
         return self._data.get(key, default)
 
-    def update(self, key: str, updater: Callable[[Any], Any],
-               default: Any = None) -> Any:
-        """Atomic read-modify-write: ``updater(old) -> new``, stored and
-        broadcast as one operation (history appends, counters)."""
-        new_value = updater(self._data.get(key, default))
-        self._data[key] = new_value
-        self._notify(key, new_value)
-        return new_value
+
+    def delete(self, pattern: str) -> int:
+        """Remove ALL keys matching an fnmatch glob; return their count.
+
+        Exact key works too (a key matches itself). Silent removal: no
+        subscriber notification (there is no new value to deliver).
+        After delete the keys read back as absent.
+        """
+        doomed = [k for k in self._data if fnmatch.fnmatch(k, pattern)]
+        for k in doomed:
+            del self._data[k]
+        return len(doomed)
 
     def clear(self) -> None:
         """Drop ALL keys silently (no per-key events — a bulk wipe is not
@@ -78,7 +85,7 @@ class Memory:
         Patterns: "tasks:*" (every task node), "*.error" (any error flag),
         "*" watches everything (replaces the old global on_change).
         Callback signature: ``callback(key, new_value)`` — fired after
-        set/update, NOT after clear().
+        set, NOT after clear().
         """
         self._subscribers.append((pattern, callback))
 
@@ -181,8 +188,8 @@ class Agent:
         self.parser_config: Dict[str, Any] = dict(parser_config or {})
 
     def _make_parser(self):
-        """Instantiate StreamParser from ``parser_config`` (agent-owned)."""
-        from cascagent.stream_parser import StreamParser
+        """Instantiate ResponseParser from ``parser_config`` (agent-owned)."""
+        from cascagent.stream_parser import ResponseParser
         cfg = self.parser_config
         kwargs: Dict[str, Any] = {}
         if "whitelist" in cfg:
@@ -190,15 +197,16 @@ class Agent:
         for key in ("max_depth", "fuzzy_max_distance", "max_buffer_chunks"):
             if key in cfg:
                 kwargs[key] = cfg[key]
-        return StreamParser(**kwargs)
+        return ResponseParser(**kwargs)
 
     # -- plugin wiring --------------------------------------------------
     def add_plugin(self, plugin: Any) -> Any:
         """Attach a plugin and bind the agent's memories into it.
 
         Binding happens ONCE at initialization so hot-path hooks stay
-        argument-light: ``on_token(token, accumulated)`` instead of
-        dragging session+memory through every single token.
+        attribute-based instead of dragging memories through every
+        single element (``on_token`` per-token API was removed
+        2026-10-12; runtime hooks receive ParseState + context).
         """
         from cascagent.plugins.base import PrePlugin, RuntimePlugin, PostPlugin
         # Bind ALL four hierarchy memories: the agent's own two plus the
@@ -229,13 +237,13 @@ class Agent:
     # -- one full iteration ----------------------------------------------
     def run(self, messages: List[Dict[str, str]],
             context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """PRE → LLM → RUNTIME(stream via built-in StreamParser) → POST.
+        """PRE → LLM → RUNTIME(stream via built-in ResponseParser) → POST.
 
-        First act: wipe local scope. The agent owns the StreamParser
+        First act: wipe local scope. The agent owns the ResponseParser
         service (docs/stream_parser_model.md): raw chunks become WORD /
         SPECIAL elements; every element is delivered to ALL runtime
         plugins (on_upload) and applied to the segment tree ONLY if all
-        of them vote continue.
+        of them return True (continue).
         """
         self.local_memory.clear()
         context = dict(context or {})
@@ -244,53 +252,75 @@ class Agent:
             messages = plugin.on_input(messages, context)
 
         parser = self._make_parser()
-        #: Expose the live state to post-plugins / debugging via local memory.
-        self.local_memory.set("parse_state", parser.state)
-        response = ""
         if self.llm is not None:
-            # LLM seam: callable(messages) -> str | chunk iterator, or a
-            # bare chunk iterator (tests/fakes). Chunks are raw SSE
-            # delta.content pieces — the parser assembles words from them.
+            # LLM seam (stream-only contract, decision 2026-10-13): the LLM
+            # MUST be a chunk iterator — either a bare iterable or a
+            # callable(messages) -> chunk iterator. Returning a plain string
+            # is NOT supported anymore: it is the caller's responsibility to
+            # wrap it (iter(["hello world"])). The agent never iterates over
+            # characters of a str.
             gen = self.llm(messages) if callable(self.llm) else self.llm
-            stop: Optional[Dict[str, Any]] = None
-            if isinstance(gen, str):          # fake/test LLM: whole text
-                for ev in parser.feed(gen):
-                    parser.commit(ev)         # no runtime vote on a string LLM
-                parser.finalize("stop")
-            else:                             # real LLM: chunk iterator
-                for chunk in gen:
-                    if chunk == "[DONE]":
-                        break
-                    response += chunk
-                    for ev in parser.feed(chunk):
-                        status, payload = ev
-                        parser.state.status = status
-                        parser.state.word = payload
-                        voted = None
-                        for rt in self.runtime_plugins:
-                            res = rt.on_upload(parser.state)
-                            op = res.get("op", "continue")
-                            if op != "continue":
-                                voted = {"op": op, **res}
-                                break
-                        if voted is not None:
-                            stop = voted   # element NOT committed (vote rule)
-                            break
-                        parser.commit(ev)
-                    if stop is not None:
-                        break
-                parser.finalize(stop["op"] if stop else "stop")
-                if stop is not None and stop["op"] == "error":
-                    raise RuntimeError(f"runtime stopped with error: {stop}")
-            response = parser.response_text() or response
+            stop: Optional[str] = None      # finish_reason of a plugin stop
 
+            def process(ev):
+                """Deliver one ready element to ALL runtime plugins; commit
+                ONLY on unanimous True (v5 contract, 2026-10-12). Returns
+                False when a plugin stopped the loop."""
+                nonlocal stop
+                status, payload = ev
+                parser.state.status = status
+                parser.state.word = payload
+                for rt in self.runtime_plugins:
+                    if not rt.on_upload(parser.state, context):
+                        fr = getattr(parser.state,
+                                     "finish_reason", None)
+                        stop = fr or "error"
+                        parser.state.finish_reason = stop
+                        return False        # element NOT committed
+                parser.commit(ev)
+                return True
+
+            for chunk in gen:
+                if chunk == "[DONE]":
+                    break
+                for ev in parser.feed(chunk):
+                    if not process(ev):
+                        break               # plugin stop mid-chunk
+                if stop is not None:
+                    break
+            if stop is None:
+                # Tail flush goes through the SAME delivery path: the last
+                # word of the stream must be votable too (rule 8).
+                tail = parser.drain_buffer()
+                if tail is not None:
+                    process(tail)
+                parser.finalize("stop")
+            else:
+                # Plugin stopped the loop: close the tree WITHOUT flushing
+                # the un-processed raw tail into the committed output (rule 8
+                # applies to clean ends only). Parser owns this logic.
+                parser.state.finish_reason = None    # close sets the truth
+                parser.close_on_stop(stop)
+            #: Authoritative output is the COMMITTED segment tree, not the
+            #: raw transport echo: a stopped element never reaches response.
+            response = parser.response_text()
+            if stop is not None and stop == "error":
+                msg = getattr(parser.state, "error", None)
+                raise RuntimeError(f"runtime stopped with error: "
+                                   f"{msg or 'no message'}")
+
+        #: Live parser state is passed to plugins directly via context —
+        #: it is an internal mechanism, not memory data (docs/plugins.md §2.4).
+        context["parse_state"] = parser.state
         context.setdefault("response", response)
         context.setdefault("think", "".join(
             s.text for s in parser.state.segments
             if s.kind.name == "THINK").strip())
         result: Dict[str, Any] = {"response": response, "context": context,
                                   "segments": parser.state.segments,
-                                  "finish_reason": parser.state.finish_reason}
+                                  "finish_reason": parser.state.finish_reason,
+                                  "error": getattr(parser.state, "error",
+                                                   None)}
         for plugin in self.post_plugins:
             r = plugin.on_output(response, context)
             response = r.get("response", response)

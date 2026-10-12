@@ -1,0 +1,29 @@
+cascagent
+Copyright 2026 cascagent contributors
+
+This product includes software developed as part of the cascagent project
+(multi-agent recursive task decomposition system for weak hardware,
+llama.cpp backend), licensed under the Apache License, Version 2.0.
+
+You may obtain a copy of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Third-party notices
+-------------------
+This project depends on the following third-party components, each subject
+to its own license (see LICENSE files of the respective packages):
+
+  - requests (Apache-2.0)
+  - numpy    (BSD-3-Clause)
+  - PyYAML   (MIT)
+  - python-Levenshtein (GPL-2.0-or-later; used only as optional fast path
+    for edit-distance — pure-Python fallback is provided in the BK-tree
+    distance metric, see docs/algorithms.md §2)
+  - pytest   (MIT, development dependency only)

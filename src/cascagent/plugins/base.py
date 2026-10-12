@@ -24,8 +24,10 @@ Two structural decisions of 2026-10-11 shape the API below:
    hold instance state themselves; transient data goes to memory.
 
 2. Memories are BOUND ONCE at plugin registration (``bind()``), not
-   passed through every hook call. Hot-path hooks run per TOKEN, so
-   their signature stays minimal: ``on_token(token, accumulated)``.
+   passed through every hook call. Hot-path hooks run per committed
+   ELEMENT (word/special), and the ``on_token(token, accumulated)``
+   signature was removed 2026-10-12 in favour of ``on_upload(state,
+   context)`` — plugins see structured ParseState, not raw tokens.
    ALL FOUR hierarchy memories are bound: workspace / project / global /
    local (decision 2026-10-11) — any level is addressable from a hook as
    a plain attribute (e.g. task tree lives in ``self.project_memory``).
@@ -37,7 +39,7 @@ Two structural decisions of 2026-10-11 shape the API below:
 4. Naming convention: every concrete plugin class ends with the suffix
    ``Plugin`` (TaskParserPlugin, ...). Think/response splitting is NOT a
    plugin — OutputSplitterPlugin was removed (2026-10-12); stream
-   structure is produced by the built-in agent service ``StreamParser``
+   structure is produced by the built-in agent service ``ResponseParser``
    (cascagent.stream_parser, spec docs/stream_parser_model.md).
 
 Contract notes:
@@ -127,43 +129,60 @@ class PrePlugin(Plugin):
 
 class RuntimePlugin(Plugin):
     """Section RUNTIME — hot path, called on every parsed stream unit
-    (WORD / SPECIAL) produced by the agent's built-in StreamParser
+    (WORD / SPECIAL) produced by the agent's built-in ResponseParser
     (was TriggerPlugin). Budget: microseconds, NO I/O (§12.2 п.3).
 
     ``should_stop`` was removed: deciding when to cut the stream short
-    is exactly what ``on_upload``'s operation types are for. The hook
-    signature changed from raw ``on_token(token, accumulated)`` to
-    ``on_upload(state)`` (decision 2026-10-12): plugins no longer see
-    raw tokens — they vote on structured units in ParseState."""
+    is exactly what ``on_upload``'s boolean + finish_reason split is for.
+    The hook signature changed from raw ``on_token(token, accumulated)``
+    to ``on_upload(state, context)`` (decision 2026-10-12): plugins no
+    longer see raw tokens — they vote on structured units in ParseState."""
 
     name = "base_runtime"
 
-    def on_upload(self, state: "Any") -> Dict[str, Any]:
+    def on_upload(self, state: "Any",
+                  context: Dict[str, Any]) -> bool:
         """Vote on one ready element (WORD / SPECIAL) of the stream.
 
-        ``state`` is the live ``cascagent.stream_parser.ParseState``:
+        ``state`` is the live ``cascagent.stream_parser.ParseState``
+        passed BY REFERENCE (decision 2026-10-12, refined same day):
+        plugins edit it in place — there is no returned state object.
         ``state.status`` tells which kind of element is pending
         (``WORD`` — closed word in ``state.word``; ``SPECIAL`` — a
         service tag from the whitelist, also in ``state.word``; PARTIAL
         elements are NOT delivered — plugins never see half-words).
+        ``context`` is the run's shared context dict — passed BY
+        REFERENCE too: all section hooks receive the same object;
+        plugin-to-plugin data exchange goes through it.
 
-        Operation types (semantics unchanged since 2026-10-11):
-        - ``{"op": "continue"}``               — keep generating;
-        - ``{"op": "stop",    "data": ...}``   — stop WITHOUT error
-          (natural end: EOS marker seen, budget met); data may carry a
-          replacement tail for the response;
-        - ``{"op": "error",   "data": "..."}`` — stop WITH error
-          (corrupted output, guard tripped); the agent surfaces it.
+        Return contract (decision 2026-10-12, final): ``bool`` —
+        True = «all good, keep the loop running»; False = stop the
+        stream NOW. On the FIRST False the agent breaks the loop and
+        inspects ``state.finish_reason`` to decide what to do:
+        - ``"stop"``   → natural end without error (EOS, budget met);
+        - ``"error"``  → corrupted output / guard tripped; the agent
+          raises RuntimeError. For a custom message set
+          ``state.error = "..."`` alongside finish_reason — it is
+          carried into the exception text and the run result.
+        Leaving ``state.finish_reason`` untouched while returning
+        False is treated as ``"error"`` (a stop without a declared
+        reason is suspicious by definition).
+
+        So the idiomatic body is: mutate ``state`` (counters,
+        finish_reason/error) as needed, then ``return True``.
+        A bare ``Plugin`` subclass carries no stream opinion at all →
+        pass-through default ``True``.
 
         Commit rule (docs/stream_parser_model.md, §7): the element is
         applied to the segment tree (word appended to ``stack[-1].text``;
         special opens/closes a Segment) ONLY if EVERY RuntimePlugin
-        returned continue. A bare ``Plugin`` subclass carries no stream
-        opinion at all → pass-through default. Transient buffers must
-        live in ``self.local_memory`` — the agent wipes it next run(),
-        so nothing here needs manual cleanup.
+        returned True. Position info for budget guards:
+        ``state.token_offset`` (ordinal number of the current element)
+        and ``state.word_count`` (committed words so far). Transient
+        buffers must live in ``self.local_memory`` — the agent wipes it
+        next run(), so nothing here needs manual cleanup.
         """
-        return {"op": "continue"}
+        return True
 
 
 class PostPlugin(Plugin):

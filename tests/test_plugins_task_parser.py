@@ -171,7 +171,7 @@ class TestContract:
         assert set(result) == {"response", "parsed", "metadata", "action"}
 
     def test_reads_clean_response_from_context(self):
-        """Agent/StreamParser finalization hands the think-free text
+        """Agent/ResponseParser finalization hands the think-free text
         via context["response"]."""
         parent = make_parent()
         mem = Memory("test.project")

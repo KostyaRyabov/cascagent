@@ -1,8 +1,15 @@
 # cascagent — Плагинная архитектура агентов
 
-> **Статус:** ⬜ план (архитектурный слой v3 поверх работающего ядра v2).
-> Базовые классы из §6 реализуются на **Этапе 5** вместе с Research/Reflect
-> агентами; до этого Decomposer работает монолитным `DecomposerSession`.
+> **Статус:** 🟡 частично реализовано (v0.1). Реализованы и покрыты тестами:
+> базовые классы секций (§6.3, факт: `plugins/base.py` — Pre/Runtime/Post,
+> Init убран), плоская KV-память `Memory` + иерархия Workspace/Project/Agent
+> и оркестратор `Agent.run()` (§6.4 в фактическом виде, `memory.py`),
+> встроенный сервис `ResponseParser` (`stream_parser.py`, спека
+> `docs/stream_parser_model.md`) и единственный конкретный плагин
+> `TaskParserPlugin` (`plugins/task_parser.py`). НЕ реализованы (план):
+> персистентность памяти (§5.2/§6.5 PersistentStore/MemoryFactory),
+> BreakpointManager (§5.8/§6.7), каталог плагинов §7, клиент LLM, канбан,
+> CLI-оркестратор. Остальное ниже — спецификация целевого состояния.
 > Смежные документы: `docs/architecture.md` (обзор модулей),
 > `docs/protocol.md` (протокол декомпозиции), `docs/process.md` (конвейер
 > обогащения контекста), `docs/prompts.md` (тексты промптов),
@@ -15,8 +22,8 @@
 1. Миссия и философия
 2. Основные принципы
 3. Архитектура агента
-4. Четыре секции плагинов
-5. SessionMemory — 4-уровневая память
+4. Секции плагинов (Pre / Runtime / Post)
+5. Память — четыре уровня иерархии
 6. Базовые классы
 7. Каталог встроенных плагинов
 8. Конфигурации агентов
@@ -71,7 +78,7 @@
 Плагин отвечает на вопрос «как обработать данные на этой фазе цикла»,
 а не «что делать агенту». Порядок плагинов внутри секции значим и
 фиксируется конфигурацией; плагины не вызывают друг друга напрямую —
-только через SessionMemory (§5).
+только через разделяемую память (§5).
 
 ---
 
@@ -91,24 +98,35 @@
 - возможность создавать новых агентов БЕЗ написания кода — только
   конфигурацией (TOML, см. §8 и docs/config.md).
 
+Исключение из правила «вся логика в плагинах» (решение 2026-10-12):
+структурирование потока — не плагин, а **встроенный сервис агента**
+`ResponseParser` (`stream_parser.py`, спека `docs/stream_parser_model.md`).
+Он не расширяем конфигом и отсутствует в реестре плагинов.
+
 ### 3.2 Структура агента
 
 ```
 +-----------------------------------------------------+
-|                     AGENT                           |
+|                     AGENT (memory.Agent)            |
 |                                                     |
-|  system_prompt: str                                 |
-|  tools: list[MCPTool]                               |
+|  llm: callable(messages) -> str | chunk iterator    |
+|  parser_config: dict  -> ResponseParser per run()     |
 |                                                     |
-|  [INIT plugins]   [INPUT plugins]   [TRIGGER plugins]|
+|  [PRE plugins]      [RUNTIME plugins]   [POST]      |
 |                                                     |
-|  [OUTPUT plugins]      SessionMemory                |
-|                        +- super   (все проекты)     |
-|                        +- project (все агенты)      |
-|                        +- session (этот агент)      |
-|                        +- local   (per-run)         |
+|  global_memory (переживает итерации)                |
+|  local_memory  (трётся каждым run())                |
+|   ^ project_memory / workspace_memory — ссылки вверх|
 +-----------------------------------------------------+
 ```
+
+Память — четыре раздельных плоских KV-экземпляра `Memory` (не один
+четырёхскоуповый объект; эволюция модели — §5.1):
+
+- **workspace** — всё во всех проектах (персистентность — план);
+- **project** — все агенты проекта (дерево задач `tasks` живёт здесь);
+- **global** — состояние одного агента между итерациями;
+- **local** — один прогон `run()`, общие данные плагинов одного цикла.
 
 ### 3.3 Состояния агента
 
@@ -116,58 +134,50 @@
 2. **Bound** — прошёл через init-плагины, готов к работе;
 3. **Running** — выполняет run(task), использует память.
 
+В фактической реализации (v0.1) разделение Unbound/Bound снято:
+`Agent.add_plugin()` сразу биндит все четыре памяти в плагин
+(`Plugin.bind()`), отдельного этапа `bind(memory)` нет — связывание
+происходит один раз при регистрации, а не перед каждым вызовом хука.
+
 ```python
 agent = Agent(...)         # Unbound
-agent.bind()               # Bound (init-плагины отработали)
-result = agent.run(task)   # Running
+result = agent.run(messages, context)   # Bound+Running: bind — в add_plugin()
 ```
 
-Повторный bind() запрещён (бросает RuntimeError): сессия пересоздаётся
-только новым экземпляром агента — это гарантирует воспроизводимость (§2.1).
+Историческое правило «повторный bind() запрещён» снято вместе с этапом
+bind(): состояние агента между вызовами живёт в `global_memory`, новый
+запуск — новый `run()` (или новый экземпляр для полной изоляции).
 
 ---
 
-## 4. Четыре секции плагинов
+## 4. Секции плагинов (Pre / Runtime / Post)
+
+Переименование 2026-10-11 (решения лида): InitPlugin **удалён** (его роль —
+ленивая тяжёлая подготовка в PrePlugin под флагом в global-памяти),
+InputPlugin → **PrePlugin**, TriggerPlugin → **RuntimePlugin**,
+OutputPlugin → **PostPlugin**. Хук `on_token` удалён 2026-10-12: Runtime
+плагины голосуют по разобранным элементам встроенного ResponseParser через
+`on_upload(state, context)`; `should_stop` и `on_stream_end` убраны.
+Контракт уточнён 2026-10-12 (финальный): `state` и `context` передаются
+**по ссылке**, плагин редактирует state на месте и возвращает **bool** —
+`True` = продолжать цикл, `False` = остановить. При первом `False` агент
+анализирует `state.finish_reason`: `"stop"` → чистый конец без ошибки,
+`"error"` (или не задан) → RuntimeError; кастомное сообщение текста ошибки
+несёт новое поле `state.error`. op-словари `{"op": ...}` сняты. Финализация
+потока — работа парсера/агента.
 
 | Секция | Когда | Частота | Назначение |
 |--------|-------|---------|-----------|
-| **Init** | При bind() | 1 раз за сессию | Подготовка: индексы, прекомпиляция, health check |
-| **Input** | Перед каждой генерацией | N раз | Обогащение, фильтрация ввода |
-| **Trigger** | На каждом токене стрима | На каждый токен | Фильтры на лету, ранний стоп, извлечение think |
-| **Output** | После завершения генерации | N раз | Парсинг, валидация, retry, логирование |
+| **Pre** | Перед каждой генерацией | N раз | Обогащение, фильтрация ввода; ленивая тяжёлая подготовка (1-й вызов, флаг в global) |
+| **Runtime** | На каждый разобранный элемент стрима (WORD/SPECIAL) | На каждый элемент | Фильтры на лету, ранний стоп, guard-статистика |
+| **Post** | После завершения генерации | N раз | Парсинг, валидация, retry, логирование |
 
-### 4.1 Init-плагины
-
-Выполняются один раз при bind(). Используются для тяжёлой подготовки.
-
-Типичные задачи:
-
-- загрузка индексов (BK-tree, RAG, FAISS);
-- прекомпиляция системного промпта с few-shot;
-- проверка доступности LLM-эндпоинта (health check — GET /v1/models,
-  НЕ генерация: dummy-warmup-запросы сжигают время и могут сбивать
-  префиксный кэш — см. docs/performance.md);
-- инициализация подписок на события памяти.
-
-```python
-class IndexLoader(InitPlugin):
-    """Загружает BK-tree инструментов."""
-
-    def __init__(self, tool_names: list[str]):
-        self.tool_names = tool_names
-
-    def on_init(self, session, memory):
-        tree = BKTree()
-        for name in self.tool_names:
-            tree.add(name)
-        session.indices["tools"] = tree
-        memory.set_session("tools_loaded", True)
-        return session
-```
-
-### 4.2 Input-плагины
+### 4.1 Pre-плагины
 
 Выполняются перед каждым вызовом LLM. Модифицируют messages перед отправкой.
+Тяжёлая одноразовая подготовка (бывшая секция Init: загрузка BK-tree,
+прекомпиляция промпта, health check GET /v1/models без генерации) —
+лениво, при первом `on_input`, под защитным флагом в `self.global_memory`.
 
 Типичные задачи:
 
@@ -179,26 +189,26 @@ class IndexLoader(InitPlugin):
 - rate limiting.
 
 ```python
-class ContextEnricher(InputPlugin):
+class ContextEnricher(PrePlugin):        # ПЛАН — не реализован
     """CPU-обогащение через RAG по эмбеддингу brief'а. LLM НЕ решает что
     искать — поиск идёт по embedding(brief) до передачи контекста модели
     (process.md §2, зафиксировано 2026-10-10)."""
 
-    def on_input(self, messages, context, session, memory):
+    def on_input(self, messages, context):
         task = context["task"]
 
         # Кэш в local памяти (для multi-turn); детерминирован: одинаковый
         # brief -> одинаковое обогащение
         cache_key = f"enrichment_{task.id}"
-        cached = memory.get_local(cache_key)
+        cached = self.local_memory.get(cache_key)
 
         if not cached:
-            qv = self.embedder.encode(task.brief)      # единый query-вектор
-            docs = self.rag.search(qv, top_k=3)        # vector-first (BM25 — предфильтр)
+            qv = embed(task.brief)                   # models.embed — единый query-вектор
+            docs = self.rag.search(qv, top_k=3)      # vector-first (BM25 — предфильтр)
             memories = self.semantic.recall(qv, top_k=3)
             siblings = self.kanban.get_completed_siblings(task.id)
             cached = self._format(docs, memories, siblings)
-            memory.set_local(cache_key, cached)
+            self.local_memory.set(cache_key, cached)
 
         # Добавляем в последний user message — НЕ трогаем system!
         original = messages[-1]["content"]
@@ -206,112 +216,121 @@ class ContextEnricher(InputPlugin):
         return messages
 ```
 
-### 4.3 Trigger-плагины
+Правила секции (бывшие правила Init перенесены сюда):
 
-Работают на каждом токене во время стриминговой генерации. Самые мощные
-и опасные: исполняются в горячем цикле, стоимость одного плагина
-умножается на количество токенов (бюджет — §9.2, запрет I/O — §12.2 п.3).
+- видят весь список messages, но ИЗМЕНЯЮТ ТОЛЬКО user-сообщения —
+  system/assistant возвращаются байт-в-байт (префиксный кэш llama.cpp, P8);
+- тяжёлая подготовка — один раз под флагом global-памяти, не на каждый вызов.
+
+### 4.2 Runtime-плагины
+
+Работают на каждом **разобранном элементе потока** (WORD или SPECIAL из
+встроенного ResponseParser) во время стриминговой генерации. PARTIAL-элементы
+плагинам не доставляются. Самые мощные и опасные: исполняются в горячем
+цикле, стоимость одного плагина умножается на количество элементов (бюджет —
+§9.2, запрет I/O — §12.2 п.3).
 
 Типичные задачи:
 
 - ранний стоп по маркерам (например, конец финального ответа);
 - фильтрация PII на лету;
-- извлечение think-блоков;
-- принудительное форматирование;
+- guard-статистика и детекторы аномалий (зацикливание, таймауты);
 - логирование в реальном времени.
 
-Эталонный плагин секции — извлечение think-блока на лету:
+Эталонный пример секции — стоп по маркеру конца декомпозиции:
 
 ```python
-class ThinkBlockExtractor(TriggerPlugin):
-    """Разделяет <think>...</think> и финальный ответ во время стрима."""
+class StopOnDone(RuntimePlugin):         # ПЛАН — не реализован
+    """Останавливает генерацию, когда встречен маркер конца ответа."""
 
-    def __init__(self):
-        self.in_think = False
-        self.think_buffer = []
-        self.final_buffer = []
-
-    def on_token(self, token, accumulated, session, memory):
-        if "<think>" in token:
-            self.in_think = True
-        elif "</think>" in token:
-            self.in_think = False
-
-        if self.in_think:
-            self.think_buffer.append(token)
-        else:
-            self.final_buffer.append(token)
-
-        return {"action": "continue"}
-
-    def on_stream_end(self, full_response, session, memory):
-        # Сохраняем think в LOCAL для output-плагинов и HistoryLogger
-        memory.set_local("think_content", "".join(self.think_buffer))
-        memory.set_local("think_length", len("".join(self.think_buffer)))
-
-        think_buf, final_buf = self.think_buffer, self.final_buffer
-        self.think_buffer, self.final_buffer = [], []
-
-        return "".join(final_buf).strip()
+    def on_upload(self, state, context) -> bool:
+        if state.status == ResponseParser.SPECIAL and state.word == "</done>":
+            state.finish_reason = "stop"
+            return False                 # стоп цикла
+        return True                      # всё хорошо, продолжаем
 ```
 
-**API результата trigger-плагина:**
+**Контракт Runtime-плагина (`on_upload(state, context) -> bool`), решён
+2026-10-12 (финальный):**
 
 ```python
-{
-    "action": "continue" | "stop" | "modify",
-    "modified_token": str,  # опционально, только для "modify"
-    "reason": str,          # опционально, для логирования
-}
+return True                             # дефолт базы: всё хорошо, продолжать
+state.finish_reason = "stop"; return False   # стоп БЕЗ ошибки (EOS, бюджет)
+state.finish_reason = "error"; return False  # стоп С ошибкой — агент
+#                                          поднимет RuntimeError наружу;
+#                                          текст: state.error = "..." (поле)
 ```
+
+Возвращаемое значение — только `bool`; объект state наружу не возвращается
+(он и так передан по ссылке). Если плагин вернул `False`, но
+`finish_reason` не задал, агент трактует останов как `"error"` (останов
+без заявленной причины подозрителен по определению).
+
+`context` — общий словарь прогона, передаётся ВСЕМ хукам всех секций
+по ссылке (Pre/Runtime/Post видят один и тот же объект; обмен данными
+между плагинами — через него). Останов-параметры редактируются прямо на
+ParseState; счётчики позиции для budget-гардов: `state.token_offset`
+(порядковый номер текущего элемента) и `state.word_count` (число
+закоммиченных слов). Кастомное сообщение ошибки — поле `state.error`
+(попадает в текст RuntimeError и в результат прогона как `result["error"]`).
+План v5 (docs/stream_parser_model.md, «Модель Word»):
+сегмент станет лентой объектов `Word` (`segment.words`, глобальный `idx`,
+`is_hidden` от `kind`), плагинам разрешается прямой доступ — мутация текста,
+reorder и любые операции со СЛОВАМИ ПОСЛЕ их коммита (append-at-commit,
+mutate-after); до коммита слово плагинам не видно.
 
 Правила секции:
 
-- `on_token` обязан отрабатывать за микросекунды (никакого I/O!);
-- состояние плагина сбрасывается в `on_stream_end` — один экземпляр
-  переиспользуется между run();
-- порядок trigger-плагинов = конвейер: следующий получает уже модифицированный
-  токен;
-- первый вернувший `"stop"` завершает генерацию (остальные не вызываются).
+- `on_upload` обязан отрабатывать за микросекунды (никакого I/O!);
+- состояния на экземпляре плагина нет — временные буферы только в
+  `self.local_memory` (агент трёт её каждым `run()`, reset() плагинам не нужен);
+- **правило коммита**: элемент применяется к дереву сегментов (слово →
+  `stack[-1].words.append(Word(...))` — v5, см. stream_parser_model.md; special → открытие/закрытие Segment) только если ВСЕ
+  Runtime-плагины вернули `True`; первый вернувший `False` прерывает
+  голосование и останавливает поток (docs/stream_parser_model.md §7);
+- порядок runtime-плагинов значим: голосование идёт списком, останавливает
+  первый вернувший `False`.
 
-### 4.4 Output-плагины
+Контракт LLM-transport (решение 2026-10-13): LLM — ТОЛЬКО чанк-итератор
+(`callable(messages) -> iterator[str]` или голый `iterator[str]`). Особый
+путь для строчного ответа удалён из `Agent.run`; тесты используют
+`iter([...])`. Голосование `on_upload` едино для всех элементов потока.
+
+### 4.3 Post-плагины
 
 Выполняются после завершения генерации. Постобработка финального ответа.
+Финализация потока (`ResponseParser.finalize`) к этому моменту уже выполнена
+агентом: think/final разделены, ответ чистый — отдельного сплиттера нет
+(OutputSplitterPlugin удалён 2026-10-12).
 
 Типичные задачи:
 
-- парсинг ответа в структуру (список подзадач по протоколу v2,
-  docs/protocol.md §3);
-- удаление дубликатов (DuplicateDetector, порог 0.75);
+- парсинг ответа в структуру (TaskParserPlugin — ЕДИНСТВЕННЫЙ реализованный
+  плагин: protocol v2 блоки «Название / Описание», двухуровневый `<atom>`,
+  F1–F3, дедупликация, запись дерева в project-ключ `tasks`);
+- удаление дубликатов (входит в TaskParserPlugin, порог 0.75);
 - проверка качества (например, вырожденный повтор родителя = атом);
 - логирование в историю (JSONL + debug.log — ОБА блока, см. §2.4);
 - retry при ошибках парсинга.
 
 ```python
-class ResponseParser(OutputPlugin):
+class TaskResponseParser(PostPlugin):   # ПЛАН — его роль несёт TaskParserPlugin
     """Парсит текстовый ответ в список задач."""
 
     def __init__(self, parser_fn):
         self.parse = parser_fn
 
-    def on_output(self, response, context, session, memory):
+    def on_output(self, response, context):
         try:
-            parsed = self.parse(response)   # parse_decomposition из parser.py
-            memory.set_local("parsed", parsed)
-            return {
-                "response": response,
-                "parsed": parsed,
-                "action": "accept",
-            }
+            parsed = self.parse(response)  # TaskParserPlugin.parse_decomposition
+            self.local_memory.set("parsed", parsed)
+            return {"response": response, "parsed": parsed, "action": "accept"}
         except ParseError as e:
-            memory.set_local("parse_error", str(e))
-            return {
-                "response": response,
-                "action": "retry",  # попробуем ещё раз
-            }
+            self.local_memory.set("parse_error", str(e))
+            return {"response": response, "action": "retry"}
 ```
 
-**API результата output-плагина:**
+**API результата Post-плагина:**
 
 ```python
 {
@@ -322,51 +341,63 @@ class ResponseParser(OutputPlugin):
 }
 ```
 
-Важно: `retry` перезапускает ВЕСЬ цикл run() (input → генерация → output),
+Важно: `retry` перезапускает ВЕСЬ цикл run() (pre → генерация → post),
 а не только генерацию; число ретраев ограничено конфигом (`max_retries`,
-по умолчанию 2), иначе — `AgentRejectedError`.
+по умолчанию 2), иначе — `AgentRejectedError`. В фактическом `Agent.run()`
+(v0.1) не-accept просто прерывает цепочку post-плагинов и возвращается в
+результате — цикл ретраев ещё не реализован (фаза 2).
 
 ---
 
-## 5. SessionMemory — четырёхуровневая память
+## 5. Память — четыре уровня иерархии
 
 ### 5.1 Концепция уровней
 
-SessionMemory — иерархическое хранилище данных, доступное всем плагинам
+Память — иерархическое хранилище данных, доступное всем плагинам
 агента. Это единственный легальный канал коммуникации между плагинами
 (§2.4) и между агентами (через project-уровень). Изоляция (§2.1 principles)
-теперь
 задаётся **уровнем**, а не запретом разделения: агент по умолчанию видит
-только свои local/session; совместные данные явно кладутся на project или
-super уровень.
+только свои local/global; совместные данные явно кладутся на project или
+workspace уровень.
+
+**Эволюция модели (зафиксировать, чтобы не путаться):** в черновике это был
+один объект `SessionMemory` с четырьмя скоупами внутри (set_local /
+set_session / set_project / set_super). Фактическая реализация v0.1
+(`memory.py`) — противоположная: ОДИН класс `Memory` = ОДНА плоская
+KV-коробка, отвечающая только за себя; уровни — четыре отдельных
+экземпляра, связанные ссылками вверх в иерархии объектов
+Workspace → Project → Agent. Методы `set_*`/`get_*` c суффиксами уровня
+в коде НЕ используются — вместо них `self.local_memory.set(...)` и т.п.
 
 ```
 +-----------------------------------------------------------+
-|                    SUPER GLOBAL                            |
+|                    WORKSPACE                               |
 |      Общая для ВСЕХ агентов во ВСЕХ проектах               |
-|      Персистентная (переживает перезапуски)                |
+|      Персистентная (переживает перезапуски) — ПЛАН         |
 |      Примеры: общая статистика, системные конфиги          |
 +-----------------------------+-----------------------------+
                               |
 +-----------------------------v-----------------------------+
-|                    PROJECT GLOBAL                          |
+|                    PROJECT                                 |
 |      Общая для всех агентов ВНУТРИ одного проекта          |
-|      Персистентная (пока проект активен)                   |
+|      Персистентная (пока проект активен) — ПЛАН            |
+|      Здесь живёт дерево задач: ключ "tasks"                |
 |      Примеры: результаты исследований, общий контекст      |
 +-----------------------------+-----------------------------+
                               |
 +-----------------------------v-----------------------------+
-|                    SESSION GLOBAL                          |
-|      Приватная для ОДНОЙ сессии агента                     |
-|      Персистентная в рамках сессии (дампится)              |
-|      Примеры: история диалога, статистика агента           |
+|                    AGENT GLOBAL                            |
+|      Приватная для ОДНОГО агента (была "session")          |
+|      Переживает итерации run(); персистентность — ПЛАН     |
+|      Примеры: история диалога, статистика агента,          |
+|               флаги ленивой тяжёлой подготовки             |
 +-----------------------------+-----------------------------+
                               |
 +-----------------------------v-----------------------------+
 |                    LOCAL                                   |
 |      Приватная для ОДНОГО вызова run()                     |
-|      Сбрасывается в начале каждого run()                   |
-|      Примеры: think_content, parse_errors, промежуточные   |
+|      Сбрасывается в начале каждого run() (делает агент)    |
+|      Примеры: parse_error, промежуточные флаги,           |
 +-----------------------------------------------------------+
 ```
 
@@ -374,236 +405,251 @@ super уровень.
 
 | Уровень | Видимость | Персистентность | Сброс |
 |---------|-----------|-----------------|-------|
-| **local** | Только этот агент в этом run | ❌ нет | Каждый `run()` |
-| **session** | Только этот агент во всех run | ✅ дамп/SQLite namespace | При `reset_session()` |
-| **project** | Все агенты в проекте | ✅ в БД проекта | При закрытии проекта |
-| **super** | Все агенты везде | ✅ в системной БД | Никогда (или вручную) |
+| **local** | Только этот агент в этом run | ❌ нет | Каждый `run()` (автоматически) |
+| **global** | Только этот агент во всех run | 🟡 план (SQLite namespace) | При создании нового агента / очистке namespace |
+| **project** | Все агенты в проекте | 🟡 план (БД проекта) | При закрытии проекта |
+| **workspace** | Все агенты везде | 🟡 план (системная БД) | Никогда (или вручную) |
 
-Уровни session/project/super реализуются через унифицированный бэкенд
-`MemoryStore` (§6.5); session-level даёт изоляцию агентов из §2.1,
-project-level — контролируемый обмен (Producer-Consumer, §5.6).
+Персистентность верхних трёх уровней — план; в v0.1 все уровни in-memory.
+Схема: `PersistentStore` (§6.5) — отдельное хранилище (sqlite + namespace),
+а НЕ прозрачный бэкенд внутри `Memory`; синхронизация памяти ↔ БД — задача
+recovery-плагина (save/load снапшота, §6.5 «Решение по слоям»). global-level
+даст изоляцию агентов из §2.1, project-level — контролируемый обмен
+(Producer-Consumer, §5.6).
 
 ### 5.3 API памяти
 
+Фактический API (реализован, `memory.py`) — один класс на экземпляр
+уровня; адресация уровня — переменной плагина, а не суффиксом метода:
+
 ```python
-class SessionMemory:
-    """
-    4-уровневая память агента.
-
-    Levels (в порядке приватности):
-      local          — только этот run
-      session        — вся сессия этого агента
-      project        — все агенты в проекте
-      super_global   — все агенты везде
-    """
-
-    # === LOCAL (per-run, in-memory only) ===
-    def set_local(self, key: str, value: Any) -> None: ...
-    def get_local(self, key: str, default: Any = None) -> Any: ...
-    def update_local(self, key: str, updater: callable, default: Any = None) -> Any: ...
-
-    # === SESSION GLOBAL (per-agent session, persisted) ===
-    def set_session(self, key: str, value: Any) -> None: ...
-    def get_session(self, key: str, default: Any = None) -> Any: ...
-    def update_session(self, key: str, updater: callable, default: Any = None) -> Any: ...
-
-    # === PROJECT GLOBAL (shared across agents in project) ===
-    def set_project(self, key: str, value: Any) -> None: ...
-    def get_project(self, key: str, default: Any = None) -> Any: ...
-    def update_project(self, key: str, updater: callable, default: Any = None) -> Any: ...
-
-    # === SUPER GLOBAL (shared across all projects) ===
-    def set_super(self, key: str, value: Any) -> None: ...
-    def get_super(self, key: str, default: Any = None) -> Any: ...
-    def update_super(self, key: str, updater: callable, default: Any = None) -> Any: ...
-
-    # === УПРАВЛЕНИЕ ===
-    def reset_local(self) -> None: ...    # вызывается автоматически в начале run()
-    def reset_session(self) -> None: ...  # полный сброс сессии агента (local + session)
-
-    # === ПОДПИСКИ (event-driven) ===
-    def subscribe(self, key: str, callback: callable) -> None: ...
-
-    # === УТИЛИТЫ ===
-    def snapshot(self) -> dict: ...       # снимок всех четырёх уровней
+class Memory:                       # одна плоская KV-коробка
+    def set(self, key: str, value: Any) -> None: ...
+    def get(self, key: str, default: Any = None) -> Any: ...
+    def clear(self) -> None: ...
+    def subscribe(self, pattern: str, callback) -> None: ...   # glob-паттерн по ключам
+    def unsubscribe(self, pattern: str, callback=None) -> None: ...
 ```
 
-Именование методов (`*_session`, `*_project`, `*_super`) фиксируется как
-API v3; старые `*_global` из черновиков не поддерживаются (см. §5.6–§5.7).
+Владение уровнями (реализовано): `Workspace.memory`, `Project.memory`,
+`Agent.global_memory` + `Agent.local_memory`; свойства `Agent.project_memory`
+/ `Agent.workspace_memory` — ссылки вверх (могут быть None у невстроенного
+агента). Плагин получает ВСЕ четыре экземпляра один раз в `bind()` как
+атрибуты `workspace_memory / project_memory / global_memory / local_memory`.
+
+Исторический черновик API (НЕ реализован, оставлен как ориентир для
+персистентности): единый `SessionMemory` с методами `set_local/set_session/
+set_project/set_super` (+ соответствующие get), `reset_local()`,
+`reset_session()`, `subscribe(key, cb)`, `snapshot()`. Решение лида
+2026-10-11 заменил его четырьмя отдельными `Memory`; имена `*_session`/
+`*_super` выведены из обращения — в актуальной терминологии им соответствуют
+`global` и `workspace`. `snapshot()` сохраняется как цель (для breakpoint'ов,
+§5.8): снимок = `{level: dict-копия}` по четырём экземплярам.
 
 ### 5.4 Event-driven подписки
 
-Плагины могут подписываться на изменения ключей (регистрация — в init):
+Плагины могут подписываться на изменения ключей (регистрация — при
+добавлении плагина / первом on_input):
 
 ```python
-# В init-плагине
-memory.subscribe("response_duration", self._on_duration)
+# В плагине (после bind())
+self.global_memory.subscribe("response_duration", self._on_duration)
 
 # Когда где-то вызывается
-memory.set_local("response_duration", {"duration_ms": 1500})
+memory.set("response_duration", {"duration_ms": 1500})
 
 # Автоматически срабатывает
-def _on_duration(self, key, value, scope):
+def _on_duration(self, key, value):
     # обновить статистику
     pass
 ```
 
-Подписчики вызываются синхронно; исключение в подписчике логируется и НЕ
-прерывает set_*(); подписки живут до конца сессии (отписка не предусмотрена
-— сессия короткоживущая).
+Реализовано (`Memory.subscribe`): callback получает `(key, value)`;
+паттерн — glob по имени ключа (`fnmatch`, например `subscribe("tasks:*", cb)`),
+отписка есть (`unsubscribe`). Подписчики вызываются синхронно; исключение в
+подписчике логируется и НЕ прерывает set(). Черновое правило
+«callback получает (key, value, level)» снято: уровень задаётся тем, на
+каком экземпляре Memory подписались, третий аргумент не нужен.
 
-### 5.5 Жизненный цикл и создание памяти
+**Решение (зафиксировано):** скоуп подписки остаётся строго per-level —
+вариант А. Convenience-обёрток вроде `Agent.subscribe_all(pattern, cb)`
+(подписка сразу на все четыре уровня) и propagation событий от низших
+уровней к высшим НЕ вводим. Если плагину нужно отслеживать ключ, который
+может появиться на любом уровне, он явно подписывается на каждый нужный
+экземпляр Memory (`local_memory.subscribe(...)`, `project_memory.subscribe(...)`
+и т.д.). Обоснование: явность дешевле магии — propagation сделал бы
+невозможным предсказание, сколько раз вызовется callback, и усложнил бы
+отладку; а `subscribe_all` скрывал бы привязку плагина к уровню, которая
+является осмысленной частью его контракта.
 
-Память создаётся фабрикой до `bind()` — один экземпляр SessionMemory на
-агента; оркестратор передаёт его в `Agent(memory=...)`:
+### 5.5 Жизненный цикл и создание памяти (реализовано)
+
+Память НЕ создаётся отдельной фабрикой — она является частью объектов
+иерархии (`memory.py`) и конструируется вместе с ними; плагин получает
+все четыре экземпляра один раз в `bind()` (вызывается из
+`Agent.add_plugin()`). Порядок создания — сверху вниз, связи вверх
+появляются при встраивании:
 
 ```python
 # При старте системы
-factory = MemoryFactory(
-    project_id="blog-api-project",
-    super_global_db=Path("./data/super_global.db"),
-    projects_db=Path("./data/projects.db"),
-)
+workspace = Workspace(name="default")                 # workspace.memory
+project = Project(name="blog-api-project")            # project.memory
+workspace.add_project(project)                        # project.workspace = workspace
 
 # Для каждого агента в проекте
-decomposer_memory = factory.create_for_agent(
-    agent_name="decomposer",
-    session_id="decomposer-session-2026-10-10-1",
-)
-executor_memory = factory.create_for_agent(
-    agent_name="executor",
-    session_id="executor-session-2026-10-10-1",
-)
+decomposer = Agent(name="decomposer", llm=llm)        # global_memory + local_memory
+executor = Agent(name="executor", llm=llm)
+project.add_agent(decomposer)                         # decomposer.project = project
+project.add_agent(executor)
 
-# decomposer и executor делят project-level память,
-# но их session-level хранилища изолированы
+# decomposer и executor делят project-память (один объект),
+# но их global/local хранилища изолированы
 ```
 
-Namespace'ы (`MemoryFactory.create_for_agent`, код — §6.6):
+Создание агента вне проекта допустимо: тогда `project_memory` и
+`workspace_memory` плагина равны `None` — код плагина обязан это
+учитывать (или агент собирается только встроенным; строгое требование к
+встроенности — план, см. открытый вопрос §5.9).
 
-| Уровень | БД | namespace |
-|---------|----|-----------| 
-| session | projects.db | `session:{session_id}` |
-| project | projects.db | `project:{project_id}` |
-| super | super_global.db | `system` |
-
-Видимость между агентами:
+Видимость между агентами (фактический API — адресация экземпляром,
+не суффиксом метода):
 
 ```python
 # Decomposer Agent пишет на общий уровень
-decomposer_memory.set_project("research_jwt_findings", {...})
+decomposer.project_memory.set("research_jwt_findings", {...})
 
-# Executor Agent может прочитать
-jwt_info = executor_memory.get_project("research_jwt_findings")
+# Executor Agent может прочитать (тот же объект Memory)
+jwt_info = executor.project_memory.get("research_jwt_findings")
 
-# Но НЕ видит session-level decomposer'а — это СВОЙ счётчик executor'а:
-calls = executor_memory.get_session("calls_count")   # → None
+# Но НЕ видит global-счётчик decomposer'а — это СВОЙ счётчик executor'а:
+calls = executor.global_memory.get("calls_count")   # → None
 ```
 
 ### 5.6 Паттерны использования
 
-**Producer-Consumer внутри агента (Trigger → Output):**
+Все примеры — фактический API: адресация нужного уровня атрибутом плагина
+(`self.local_memory` / `self.global_memory` / `self.project_memory` /
+`self.workspace_memory`, bound в `bind()`).
+
+**Producer-Consumer внутри одного run() (Runtime → Post):**
 
 ```python
-# Trigger плагин пишет в local
-memory.set_local("think_content", think_block)
+# Runtime-плагин пишет в local (например, собирает think-сегменты)
+self.local_memory.set("think_content", state.word)
 
-# Output плагин читает
-think = memory.get_local("think_content", "")
+# Post-плагин читает
+think = self.local_memory.get("think_content", "")
 ```
+
+На практике `context` — единственный канал для внутреннего состояния
+конвейера: перед POST-фазой агент кладёт в него живой `parse_state`
+(состояние ResponseParser) и собранный из THINK-сегментов `think`. В local-
+память внутреннее состояние парсинга НЕ пишется — там только данные плагинов.
 
 **Producer-Consumer между агентами (Researcher → Executor):**
 
 ```python
-# Researcher Agent (producer) — результат исследования в проект
-memory.set_project("research_stripe_api", {
+# Researcher Agent (producer) — результат исследования в project-память
+self.project_memory.set("research_stripe_api", {
     "version": "2025-10",
     "auth": "Bearer token",
     "endpoints": {...},
 })
 
-# Executor Agent (consumer)
-stripe_info = memory.get_project("research_stripe_api")
+# Executor Agent (consumer) — тот же объект Memory через свой project
+stripe_info = self.project_memory.get("research_stripe_api")
 ```
 
-**Счётчики на уровне session (атомарное обновление):**
+**Счётчики на global-уровне (read-modify-write через get/set, переживает run()):**
 
 ```python
-memory.update_session("calls_count", lambda x: x + 1, default=0)
-memory.update_session("tokens_used", lambda x: x + tokens, default=0)
+self.global_memory.set("calls_count", self.global_memory.get("calls_count", 0) + 1)
+self.global_memory.set("tokens_used", self.global_memory.get("tokens_used", 0) + tokens)
 
-avg = memory.get_session("tokens_used") / memory.get_session("calls_count")
+avg = self.global_memory.get("tokens_used") / self.global_memory.get("calls_count")
 ```
 
-**Глобальная статистика на super-уровне (редко!):**
+**Сквозная статистика на workspace-уровне (редко!; может быть None у
+невстроенного агента — проверять):**
 
 ```python
-# В output-плагине любого агента
-memory.update_super(
-    "global_stats",
-    lambda s: {
+# В post-плагине любого агента
+if self.workspace_memory is not None:
+    s = self.workspace_memory.get(
+        "global_stats",
+        {"total_calls": 0, "total_duration_ms": 0, "total_tokens": 0},
+    )
+    self.workspace_memory.set("global_stats", {
         "total_calls": s["total_calls"] + 1,
         "total_duration_ms": s["total_duration_ms"] + duration,
         "total_tokens": s["total_tokens"] + tokens,
-    },
-    default={"total_calls": 0, "total_duration_ms": 0, "total_tokens": 0},
-)
+    })
 ```
 
 **Кэш в рамках run() (local):**
 
 ```python
-cached = memory.get_local(f"enrichment_{task.id}")
+cached = self.local_memory.get(f"enrichment_{task.id}")
 if not cached:
     cached = expensive_computation()
-    memory.set_local(f"enrichment_{task.id}", cached)
+    self.local_memory.set(f"enrichment_{task.id}", cached)
 ```
 
 **Флаги координации (local, читает оркестратор после run — §11.3):**
 
 ```python
 # Плагин A
-memory.set_local("needs_research", True)
-memory.set_local("research_query", "как работает X")
+self.local_memory.set("needs_research", True)
+self.local_memory.set("research_query", "как работает X")
 
-# Плагин B (позже в цепочке output)
-if memory.get_local("needs_research"):
-    query = memory.get_local("research_query")
+# Плагин B (позже в цепочке post)
+if self.local_memory.get("needs_research"):
+    query = self.local_memory.get("research_query")
     # запустить исследование
 ```
 
 ### 5.7 Соглашения об именовании ключей
 
-| Префикс ключа | Уровень | Пример | Кто пишет |
+| Префикс/ключ | Уровень | Пример | Кто пишет |
 |---------------|---------|--------|-----------|
-| `think_*` | local | `think_content`, `think_length` | Trigger |
-| `enrichment_*` | local | `enrichment_0.2.1` | Input |
-| `parsed`, `parse_error` | local | результат парсинга | Output |
+| `parse_state` | context | живое состояние ResponseParser (не память!) | агент (перед POST) |
+| `think_*` | local | `think_content`, `think_length` | Runtime |
+| `enrichment_*` | local | `enrichment_0.2.1` | Pre |
+| `parsed`, `parse_error` | local | результат парсинга | Post |
 | `needs_*`, флаги | local | `needs_research` | любой |
-| `*_stats`, `calls_count` | session | `think_stats`, `conversation_history` | StatisticsCollector |
-| `rate_limit_calls` | session | счётчики лимитов агента | Init/Output |
-| `research_*`, `task_*_result` | project | findings, результаты задач | Output/оркестратор |
-| `tasks` | project | иерархия задач `{id: Task}` после декомпозиции (process §1.3, data.md §1) | Output (TaskParser) |
-| `global_stats`, `system_version` | super | сквозная статистика | MetricsWriter |
+| `*_stats`, `calls_count` | global | `think_stats`, `conversation_history` | StatisticsCollector |
+| `rate_limit_calls` | global | счётчики лимитов агента | Pre/Post |
+| `research_*`, `task_*_result` | project | findings, результаты задач | Post/оркестратор |
+| `tasks` | project | иерархия задач `{id: Task}` после декомпозиции (process §1.3, data.md §1) | Post (TaskParserPlugin) |
+| `global_stats`, `system_version` | workspace | сквозная статистика | MetricsWriter |
 
 Ключи без префикса — локальные переменные одного плагина, другим секциям
 не гарантируются. Правило выбора уровня: по умолчанию пишется на самый
 приватный подходящий уровень; повышение уровня — осознанное решение
-(лидер проекта: super-уровень использовать только для статистики и
+(лидер проекта: workspace-уровень использовать только для статистики и
 системных конфигов).
 
-### 5.8 Breakpoints и recovery (решение аудита #3)
+### 5.8 Breakpoints и recovery (план — НЕ реализовано)
 
 Пересмотр черновика roadmap §3.3: отдельные `_stats`/`_breakpoints` поля
-**не вводятся** — их роль полностью берут на себя session/project уровни
-(они персистентны по построению, §5.2). Остаются только точки
-восстановления:
+**не вводятся** — их роль полностью берут на себя global/project уровни
+(когда станут персистентными, §5.2). Остаются только точки
+восстановления; черновик API ниже — цель, а не факт. РЕШЕНИЕ ЛИДА (v0.1):
+реализация отложена до появления персистентности и рабочего ядра — сначала
+проект должен работать с базовой задумкой; формат снимка при этом будет
+deep-copy через round-trip сериализацию (JSON для простых значений,
+pickle/base64 для сложных объектов) — конкретика на этапе реализации:
 
 ```python
 class BreakpointManager:
-    """Сохраняет снапшоты состояния для восстановления."""
+    """Сохраняет снапшоты состояния для восстановления.
 
-    def __init__(self, memory: SessionMemory, storage_path: Path): ...
+    PLAN: memory-аргумент — не единый SessionMemory (его больше нет,
+    §5.3), а ссылка на Agent: snapshot() = {level: dict-копия} по всем
+    четырём экземплярам памяти агента.
+    """
+
+    def __init__(self, agent: "Agent", storage_path: Path): ...
 
     def save_breakpoint(self, label: str, context: dict = None):
         """append JSONL-записи {label, timestamp, context, snapshot()}"""
@@ -612,210 +658,199 @@ class BreakpointManager:
         """последняя точка с таким label"""
 
     def restore_from(self, breakpoint: dict):
-        """local пересоздаётся из снапшота; session восстанавливается
-        целиком; project/super НЕ трогаем — они персистентные и могли
+        """local пересоздаётся из снапшота; global восстанавливается
+        целиком; project/workspace НЕ трогаем — они персистентные и могли
         измениться другими агентами пока процесс был мёртв"""
 ```
 
-Правила:
+Правила (переформулированы под v3-терминологию):
 
-- `reset_local()` не трогает session/project/super; `reset_session()`
-  чистит local + session (этот агент начинает новую сессию).
-- Breakpoint'ы пишутся в `data/breakpoints/{session_id}.jsonl` плагином
-  `AutoCheckpoint` (Output) после каждого успешного run и при FAILED
-  задачах; ротация — хранить 20 последних на сессию (gzip, открытый
-  вопрос roadmap §9.1 теперь решён в пользу JSONL+gzip).
-- Подписки (§5.4) работают на все четыре уровня; callback получает
-  `(key, value, level)`.
+- Сброса «session» больше нет: `Agent.run()` сам вызывает
+  `local_memory.clear()` в начале каждого прогона; `global_memory`
+  чистится только при создании нового агента (или cleanup-плагином).
+- Breakpoint'ы пишутся в `data/breakpoints/{agent_name}.jsonl` плагином
+  `AutoCheckpoint` (Post) после каждого успешного run и при FAILED
+  задачах; ротация — хранить 20 последних (gzip; открытый вопрос
+  roadmap §9.1 решён в пользу JSONL+gzip).
+- Подписки (§5.4) работают на всех четырёх уровнях; callback получает
+  `(key, value)` — уровень задаётся экземпляром, на котором подписались.
 - Механика `cascagent resume` (kanban как источник истины о задачах) —
   `docs/roadmap.md` §3.3; память дополняет её состоянием агента.
 - Логику MemoryEntry/актуальности semantic memory (#8) см. roadmap §4.4 —
-  это уровень `semantic.py`, а не SessionMemory.
+  это отдельный слой `semantic.py` (не реализован), а не `Memory`.
 
 ### 5.9 Гарантии и ограничения
 
-**Гарантии:**
+**Гарантии (фактические, v0.1):**
 
-1. Атомарность записи: каждая операция set/update завершается полностью
+1. Последовательность: всё однопоточно, никаких race conditions.
+2. Изоляция local: очищается агентом в начале каждого run(); не видна
+   другим run, другим агентам, другим процессам.
+3. Отсутствие коллизий: одинаковые ключи на разных уровнях — разные
+   данные (разные объекты Memory).
+4. Исключение в подписчике логируется и не прерывает set().
+
+**План (персистентность через отдельный `PersistentStore` + recovery-плагин, §6.5; в `memory.py` пока только in-memory):**
+
+1. Атомарность записи: каждая операция set завершается полностью
    или не выполняется (SQLite-транзакция на запись).
-2. Персистентность: session/project/super переживают перезапуск процесса.
-3. Изоляция local: не видна другим run, другим агентам, другим процессам.
-4. Отсутствие коллизий: одинаковые ключи на разных уровнях — разные данные.
-5. Последовательность: всё однопоточно, никаких race conditions.
+2. Персистентность: global/project/workspace переживают перезапуск
+   процесса.
 
 **Ограничения (принятые сознательно):**
 
-1. Нет распределённых транзакций: запись в project и super — отдельные
+1. Нет распределённых транзакций: запись в project и workspace — отдельные
    операции.
 2. Нет блокировок: не нужны (нет параллелизма, MVP однопоточный).
 3. Нет TTL: очистка только через cleanup-плагины (`SessionCleanup`, §7.1).
 4. Нет версионирования записей: если надо — делает плагин (например,
    version-поле в значении).
-5. Подписка не фильтруется по уровню: callback вызывается на изменение
-   ключа на ЛЮБОМ уровне (уровень приходит третьим аргументом).
+5. Подписка привязана к экземпляру: callback вызывается только на
+   изменения того Memory, на котором подписались (третий аргумент
+   «уровень» не нужен, §5.4).
+6. Открытый вопрос (перенесён из снятых §9.1–§9.3): должен ли `Agent`
+   требовать обязательной встроенности в `Project` (чтобы
+   `project_memory` никогда не был None и плагины не проверяли None)?
+   Пока — допустим None, ответственность на плагине.
 
 ---
 
 ## 6. Базовые классы
 
-Полный код базовых классов для расширения. Реализуются в модулях
-`src/cascagent/plugins/base.py` (классы плагинов и Agent) и
-`src/cascagent/memory.py` (SessionMemory).
+Фактическая реализация живёт в двух модулях: `src/cascagent/memory.py`
+(`Memory`, `Workspace`, `Project`, `Agent`) и
+`src/cascagent/plugins/base.py` (`Plugin`, `PrePlugin`, `RuntimePlugin`,
+`PostPlugin`). Раздел 6.1 показывает код как есть (v0.1); 6.2 — объектную
+иерархию уровней; 6.3 — классы плагинов; 6.4 — оркестратор `Agent.run()`;
+6.5–6.7 — **план** (персистентность, фабрика, breakpoints; к v0.1 не
+реализованы, оставлены как ориентир проектирования).
 
-### 6.1 SessionMemory
+### 6.1 Memory — плоская KV-коробка (реализовано)
+
+Один класс = один уровень = один dict. Никаких скоупов внутри; четыре
+уровня — четыре экземпляра (§5.1).
 
 ```python
-from typing import Any, Callable
-from pathlib import Path
+class Memory:
+    """A flat KV store with glob-pattern subscriptions (memory.py)."""
 
+    def __init__(self, name: str = "") -> None:
+        self.name = name
+        self._data: Dict[str, Any] = {}
+        self._subscribers: List[tuple] = []      # [(glob pattern, callback)]
 
-class SessionMemory:
-    """4-уровневая память для плагинов (§5)."""
+    # -- CRUD ---------------------------------------------------------
+    def set(self, key: str, value: Any) -> None:
+        self._data[key] = value
+        self._notify(key, value)
 
-    def __init__(
-        self,
-        session_store: MemoryStore,       # PersistentStore, namespace сессии
-        project_store: MemoryStore,       # PersistentStore, namespace проекта
-        super_global_store: MemoryStore,  # PersistentStore, namespace "system"
-    ):
-        self._local: dict[str, Any] = {}
-        self._session = session_store
-        self._project = project_store
-        self._super = super_global_store
-        self._subscribers: dict[str, list[Callable]] = {}
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._data.get(key, default)      # read callbacks НЕ вызывает
 
-    # === LOCAL (per-run, in-memory only) ===
+    def delete(self, pattern: str) -> int:
+        """Удаление по fnmatch-glob: возвращает число удалённых ключей
+        (точный ключ тоже работает — он совпадает сам с собой).
+        Silent — без событий подписчикам."""
+        doomed = [k for k in self._data if fnmatch.fnmatch(k, pattern)]
+        for k in doomed:
+            del self._data[k]
+        return len(doomed)
 
-    def set_local(self, key: str, value: Any):
-        self._local[key] = value
-        self._notify(key, value, "local")
+    def clear(self) -> None:
+        """Bulk wipe без per-key событий (вызывает Agent.run() на local)."""
+        self._data.clear()
 
-    def get_local(self, key: str, default: Any = None) -> Any:
-        return self._local.get(key, default)
+    # -- observation (glob subscriptions) ------------------------------
+    def subscribe(self, pattern: str,
+                  callback: Callable[[str, Any], None]) -> None:
+        """fnmatch-glob по именам ключей: "tasks:*", "*.error", "*" — всё."""
+        self._subscribers.append((pattern, callback))
 
-    def update_local(self, key: str, updater: Callable, default: Any = None) -> Any:
-        current = self._local.get(key, default)
-        new_value = updater(current)
-        self._local[key] = new_value
-        self._notify(key, new_value, "local")
-        return new_value
+    def unsubscribe(self, pattern: str,
+                    callback: Optional[Callable] = None) -> int:
+        before = len(self._subscribers)
+        self._subscribers = [
+            (p, cb) for p, cb in self._subscribers
+            if not (p == pattern and (callback is None or cb is callback))
+        ]
+        return before - len(self._subscribers)
 
-    # === SESSION GLOBAL (per-agent session, persisted) ===
-
-    def set_session(self, key: str, value: Any):
-        self._session.set(key, value)
-        self._notify(key, value, "session")
-
-    def get_session(self, key: str, default: Any = None) -> Any:
-        return self._session.get(key, default)
-
-    def update_session(self, key: str, updater: Callable, default: Any = None) -> Any:
-        new_value = self._session.update(key, updater, default)
-        self._notify(key, new_value, "session")
-        return new_value
-
-    # === PROJECT GLOBAL (shared across agents in project) ===
-
-    def set_project(self, key: str, value: Any):
-        self._project.set(key, value)
-        self._notify(key, value, "project")
-
-    def get_project(self, key: str, default: Any = None) -> Any:
-        return self._project.get(key, default)
-
-    def update_project(self, key: str, updater: Callable, default: Any = None) -> Any:
-        new_value = self._project.update(key, updater, default)
-        self._notify(key, new_value, "project")
-        return new_value
-
-    # === SUPER GLOBAL (shared across all projects) ===
-
-    def set_super(self, key: str, value: Any):
-        self._super.set(key, value)
-        self._notify(key, value, "super")
-
-    def get_super(self, key: str, default: Any = None) -> Any:
-        return self._super.get(key, default)
-
-    def update_super(self, key: str, updater: Callable, default: Any = None) -> Any:
-        new_value = self._super.update(key, updater, default)
-        self._notify(key, new_value, "super")
-        return new_value
-
-    # === УПРАВЛЕНИЕ ===
-
-    def reset_local(self):
-        self._local.clear()
-
-    def reset_session(self):
-        """Полный сброс сессии агента (project/super не трогаем)."""
-        self._local.clear()
-        self._session.clear()
-
-    # === ПОДПИСКИ ===
-
-    def subscribe(self, key: str, callback: Callable):
-        if key not in self._subscribers:
-            self._subscribers[key] = []
-        self._subscribers[key].append(callback)
-
-    def _notify(self, key: str, value: Any, level: str):
-        for cb in self._subscribers.get(key, []):
-            try:
-                cb(key, value, level)
-            except Exception as e:
-                print(f"[memory] subscriber error for {key}: {e}")
-
-    def snapshot(self) -> dict:
-        """Снимок всей памяти для дампинга/отладки/breakpoint'ов."""
-        return {
-            "local": dict(self._local),
-            "session": self._session.all(),
-            "project": self._project.all(),
-            "super": self._super.all(),
-        }
+    def _notify(self, key: str, value: Any) -> None:
+        for pattern, callback in self._subscribers:
+            if fnmatch.fnmatchcase(key, pattern):
+                callback(key, value)             # исключение — логируется, set() не прерывать
 ```
 
-### 6.2 AgentSession
+Отличия от чёрного черновика `SessionMemory` (снято, см. §5.3): нет
+суффиксов `_local/_session/_project/_super`, нет `reset_local()/
+reset_session()` (очистку local делает агент через `clear()`), нет
+`snapshot()` (цель для breakpoint'ов, §5.8), подписка — glob-паттерн, а
+не точный ключ, callback `(key, value)` без третьего аргумента.
+
+### 6.2 Иерархия Workspace / Project / Agent (реализовано)
 
 ```python
-from dataclasses import dataclass, field
+class Workspace:
+    def __init__(self, name="workspace", **config):
+        self.projects: Dict[str, Project] = {}
+        self.memory = Memory(name=f"{name}.workspace")
+    def add_project(self, project) -> Project:   # project.workspace = self
 
+class Project:
+    def __init__(self, name, workspace=None, **config):
+        self.agents: Dict[str, Agent] = {}
+        self.workspace = workspace
+        self.memory = Memory(name=f"{name}.project")
+    @property
+    def workspace_memory(self): ...              # ссылка вверх или None
+    def add_agent(self, agent) -> Agent:         # agent.project = self
 
-@dataclass
-class AgentSession:
-    """Состояние сессии агента."""
-    agent_name: str
-    system_prompt: str
-    tools: list = field(default_factory=list)
-
-    # Заполняется init-плагинами
-    cache_key: str | None = None
-    indices: dict = field(default_factory=dict)
-    precompiled_prompt: str | None = None
-    metadata: dict = field(default_factory=dict)
+class Agent:
+    def __init__(self, name, project=None, llm=None,
+                 pre_plugins=(), runtime_plugins=(), post_plugins=(),
+                 parser_config=None):
+        self.global_memory = Memory(name=f"{name}.global")
+        self.local_memory  = Memory(name=f"{name}.local")
+        ...                                      # add_plugin() биндит все 4 уровня
+    @property
+    def project_memory(self): ...                # self.project.memory или None
+    @property
+    def workspace_memory(self): ...              # проект → workspace или None
 ```
 
-### 6.3 Базовые классы плагинов
+Черновик `AgentSession` (dataclass с `cache_key/indices/precompiled_prompt`,
+заполняемым Init-плагинами) **снят**: Init-секции больше нет, ленивая
+тяжёлая подготовка хранит свои артефакты в `global_memory` под ключами
+domain-плагинов (например `indices`, `precompiled_prompt`) — отдельный
+объект состояния не нужен. Поле `tools` появится вместе с MCP-слоем
+(roadmap §4, не реализовано).
 
-```python
-from abc import ABC, abstractmethod
-
+### 6.3 Базовые классы плагинов (реализовано)
 
 > **v3 (2026-10-11, решения лида).** Секции переименованы: InitPlugin убран
 > (его роль — ленивая тяжёлая подготовка в PrePlugin), InputPlugin → PrePlugin,
 > TriggerPlugin → RuntimePlugin, OutputPlugin → PostPlugin. Из API убраны
 > `reset()` (очистка — ответственность агента: `run()` стирает local-скоуп
-> памяти), `should_stop` и `on_stream_end` (семантика останова живёт в op-типах
-> `on_token`; финализация потока — работа PostPlugin). Память биндится в плагин
+> памяти), `should_stop` и `on_stream_end` (семантика останова живёт в
+> bool-возврате `on_upload` + `state.finish_reason` — см. §4.2; с 2026-10-12 хук
+> `on_token` удалён — плагины голосуют по
+> разобранным элементам встроенного ResponseParser; финализация потока — работа
+> парсера/агента). Память биндится в плагин
 > ОДИН РАЗ (`bind()`), а не прокидывается аргументом в каждый хук — хот-путь
-> на токен не тащит лишние параметры. Хуки работают с двумя скоупами:
-> `self.global_memory` (переживает итерации) и `self.local_memory`
-> (очищается агентом перед каждым `run()`).
+> на элемент потока не тащит лишние параметры. Плагин видит ВСЕ четыре уровня:
+> `self.workspace_memory / project_memory / global_memory / local_memory`
+> (верхние могут быть None у невстроенного агента, §5.5).
 
 ```python
 class Plugin(ABC):                     # общий предок: name/config/bind()
-    ...
+    name = "base"                      # ключ PLUGIN_REGISTRY (§12.1)
+
+    def __init__(self, **config):      # self.config — TOML-параметры как есть
+        ...                            # + 4 атрибута *_memory = None до bind()
+
+    def bind(self, workspace_memory=None, project_memory=None,
+             global_memory=None, local_memory=None) -> "Plugin":
+        """Wire ALL hierarchy memories (called once by Agent.add_plugin)."""
 
 class PrePlugin(Plugin):               # секция PRE (был InputPlugin)
     name = "base_pre"
@@ -828,11 +863,16 @@ class PrePlugin(Plugin):               # секция PRE (был InputPlugin)
 class RuntimePlugin(Plugin):           # секция RUNTIME (был TriggerPlugin)
     name = "base_runtime"
 
-    def on_token(self, token: str, accumulated: str) -> dict:
-        """{"op": "continue"} | {"op": "stop", "data": ...}
-        (останов без ошибки) | {"op": "error", "data": "..."}
-        (останов с ошибкой). Дефолт: pass-through."""
-        return {"op": "continue"}
+    def on_upload(self, state, context) -> bool:
+        """Голосование по готовому элементу потока (WORD/SPECIAL) от
+        встроенного ResponseParser; state — живой ParseState ПО ССЫЛКЕ
+        (state.status, state.word, state.token_offset, state.word_count,
+        state.finish_reason, state.error) — редактируется на месте.
+        Возврат bool: True = всё хорошо, продолжать цикл; False = стоп
+        (агент смотрит state.finish_reason: "stop" → чистый конец,
+        "error"/не задан → RuntimeError; текст ошибки — state.error).
+        context — общий словарь прогона (по ссылке). Дефолт: True."""
+        return True
 
 class PostPlugin(Plugin):              # секция POST (был OutputPlugin)
     name = "base_post"
@@ -843,178 +883,71 @@ class PostPlugin(Plugin):              # секция POST (был OutputPlugin)
            "action": accept|retry|reject}."""
 ```
 
-### 6.4 Agent (оркестратор)
+Единственная конкретная реализация v0.1 — `TaskParserPlugin`
+(`plugins/task_parser.py`, PostPlugin); реестра `PLUGIN_REGISTRY` и
+загрузчика entry points пока нет (§12.1 — план).
+
+### 6.4 Agent (оркестратор, реализовано)
+
+Фактический цикл `run()` (memory.py) — без `AgentResult`/`bind(memory)` из
+черновика: результат это dict, память принадлежит самому агенту.
 
 ```python
-import time
-from dataclasses import dataclass, field
-from typing import Any
-
-
-@dataclass
-class AgentResult:
-    response: str
-    parsed: Any = None
-    metadata: dict = field(default_factory=dict)
-
-
-class AgentRejectedError(Exception):
-    """Output-плагины отклонили ответ (ретраи исчерпаны)."""
-
-
 class Agent:
-    """Агент как композиция промпта + плагинов + инструментов."""
-
-    def __init__(
-        self,
-        name: str,
-        system_prompt: str,
-        llm_client,
-        init_plugins=None,
-        input_plugins=None,
-        trigger_plugins=None,
-        output_plugins=None,
-        tools=None,
-        max_retries: int = 2,
-    ):
-        self.name = name
-        self.system_prompt = system_prompt
-        self.llm = llm_client
-        self.tools = tools or []
-        self.max_retries = max_retries
-
-        self.init_plugins = init_plugins or []
-        self.input_plugins = input_plugins or []
-        self.trigger_plugins = trigger_plugins or []
-        self.output_plugins = output_plugins or []
-
-        self.session = None
-        self.memory = None
-        self._retries = 0
-
-    def bind(self, memory: SessionMemory | None = None) -> "Agent":
-        """Инициализация сессии. Вызывается ровно один раз.
-
-        memory — готовая 4-уровневая память из MemoryFactory (§5.5);
-        если не передана — создаётся изолированная (все store'ы in-memory,
-        удобно в тестах).
-        """
-        if self.session is not None:
-            raise RuntimeError("Agent already bound")
-
-        self.memory = memory or SessionMemory(
-            session_store=InMemoryStore(),
-            project_store=InMemoryStore(),
-            super_global_store=InMemoryStore(),
-        )
-        self.session = AgentSession(
-            agent_name=self.name,
-            system_prompt=self.system_prompt,
-            tools=self.tools,
-        )
-
-        for plugin in self.init_plugins:
-            self.session = plugin.on_init(self.session, self.memory)
-
-        return self
-
-    def run(self, task, context: dict | None = None) -> AgentResult:
-        """Полный цикл: input -> LLM (с triggers) -> output."""
-        if not self.session:
-            raise RuntimeError("Agent must be bound before run()")
-
-        # СБРОС local памяти
-        self.memory.reset_local()
-
-        context = dict(context or {})
-        context["task"] = task
-        context["call_start_time"] = time.time()
-
-        # Формируем messages (system — статический префикс!)
-        messages = [
-            {"role": "system",
-             "content": self.session.precompiled_prompt or self.system_prompt},
-            {"role": "user", "content": f"Задача: {task.brief}"},
-        ]
-
-        # INPUT плагины
-        for plugin in self.input_plugins:
-            messages = plugin.on_input(messages, context, self.session, self.memory)
-
-        context["full_prompt"] = "\n\n".join(m["content"] for m in messages)
-
-        # ГЕНЕРАЦИЯ с TRIGGER плагинами
-        raw_response = self._generate_with_triggers(messages, context)
-
-        context["duration_ms"] = int((time.time() - context["call_start_time"]) * 1000)
-        context["raw_response"] = raw_response
-        self.memory.set_local("response_duration", {
-            "duration_ms": context["duration_ms"],
-            "task_id": task.id,
-        })
-
-        # OUTPUT плагины
-        response = raw_response
-        parsed = None
-        metadata = {}
-
-        for plugin in self.output_plugins:
-            result = plugin.on_output(response, context, self.session, self.memory)
-            response = result.get("response", response)
-            parsed = result.get("parsed", parsed)
-            metadata.update(result.get("metadata", {}))
-
-            action = result.get("action", "accept")
-            if action == "retry":
-                if self._retries >= self.max_retries:
-                    raise AgentRejectedError(result)
-                self._retries += 1
-                return self.run(task, context)   # повтор всего цикла
-            elif action == "reject":
-                raise AgentRejectedError(result)
-
-        self._retries = 0
-        return AgentResult(response=response, parsed=parsed, metadata=metadata)
-
-    def _generate_with_triggers(self, messages, context) -> str:
-        """Стриминговая генерация с применением trigger-плагинов."""
-        accumulated = ""
-
-        for token in self.llm.stream(messages):
-            final_token = token
-            should_stop = False
-
-            for plugin in self.trigger_plugins:
-                if plugin.should_stop(accumulated + final_token,
-                                      self.session, self.memory):
-                    should_stop = True
-                    break
-
-                result = plugin.on_token(final_token, accumulated,
-                                         self.session, self.memory)
-
-                if result["action"] == "stop":
-                    should_stop = True
-                    break
-                elif result["action"] == "modify":
-                    final_token = result.get("modified_token", final_token)
-
-            accumulated += final_token
-            if should_stop:
-                break
-
-        # Финализация
-        for plugin in self.trigger_plugins:
-            accumulated = plugin.on_stream_end(accumulated,
-                                               self.session, self.memory)
-
-        return accumulated
+    def run(self, messages: list, context: dict | None = None) -> dict:
+        # 1. local_memory.clear()                    # изоляция прогона (§5.6)
+        # 2. PRE:    messages = p.on_input(messages, context)   # цепочкой
+        # 3. LLM+RUNTIME:
+        #    parser = self._make_parser()            # свежий ResponseParser
+        #    gen = llm(messages)                     # ТОЛЬКО chunk-iterator
+        #    for chunk in gen:                       # (str не поддерживается)
+        #        for ev in parser.feed(chunk):       # WORD/SPECIAL элементы
+        #            process(ev):
+        #            голосуют ВСЕ runtime-плагины on_upload(state, context)
+        #            -> bool до первого False; все True -> parser.commit(ev)
+        #              (commit создаёт Word и инкрементит word_count);
+        #            первый False -> стоп (finish_reason: "stop"|"error",
+        #            не задан -> "error"), элемент НЕ коммитится
+        #    чистый конец: tail = parser.drain_buffer(); process(tail);
+        #      parser.finalize("stop")
+        #    стоп плагина: parser.close_on_stop(stop)  # хвост НЕ флашится
+        #    finish_reason == "error" -> RuntimeError(state.error)
+        #    response = parser.response_text()       # из commit-дерева, не эхо
+        # 4. context["response"], context["think"]   # think из THINK-сегментов
+        #    context["parse_state"] = parser.state   # живой state для POST (§5.6)
+        # 5. POST:   r = p.on_output(response, context)  # цепочкой
+        #    result = {"response", "context", "segments", "finish_reason",
+        #              "error", "parsed", "metadata", "action"}
+        #    action != "accept" -> выход из цепочки   # retry/reject — план:
+        #    # max_retries/AgentRejectedError в код ещё не завезены (§9.3)
+        return result
 ```
 
-### 6.5 MemoryStore — унифицированный бэкенд
+Отличия от черновика §6.4 (снято): нет `init_plugins/input_plugins/
+trigger_plugins/output_plugins` (секции pre/runtime/post), нет отдельного
+`bind(memory)` (память создаётся в `__init__`, биндинг плагинов делает
+`add_plugin()`), нет `_generate_with_triggers` с `should_stop/on_token/
+on_stream_end` (голосование по элементам `on_upload`), нет `tools` и
+`system_prompt` параметром (промпт приносит вызывающий в `messages`;
+`SYSTEM_PROMPT` — константа модуля task_parser). Контракт transport
+(2026-10-13): только chunk-iterator; все элементы проходят голосование
+`on_upload`, ответ берётся из commit-дерева (`parser.response_text()`),
+хвостовой сброс буфера — методом `parser.drain_buffer()`.
 
-Все персистентные уровни памяти строятся на одном абстрактном KV-хранилище
-(`src/cascagent/memory.py`):
+### 6.5 MemoryStore — унифицированный бэкенд (ПЛАН, не реализовано)
+
+Все персистентные уровни памяти планируется строить на одном абстрактном
+KV-хранилище (sqlite; синхронизация с `Memory` — через recovery-плагин, см. «Решение по слоям» ниже). К v0.1 ни один
+класс ниже не существует в коде — раздел описывает целевой дизайн.
+
+**Решение по слоям (зафиксировано):** разделение двух слоёв остаётся как
+описано — `Memory` (уровень агента/плагина: set/get/clear + подписки) и
+`PersistentStore` (уровень хранилища: sqlite + namespace). Прослойку
+«Memory поверх Store» (backend-параметр конструктора Memory) НЕ вводим:
+подписки остаются нативной механикой чистого in-memory `Memory`, а
+персистентность реализуется отдельным recovery-плагином (save/load снапшота
+§11.4.1 ↔ таблицы memory), а не прозрачным бэкендом. Это сохраняет простой
+тестируемый core и явный контроль над моментом записи на диск.
 
 ```python
 import json
@@ -1032,12 +965,6 @@ class MemoryStore(ABC):
 
     @abstractmethod
     def get(self, key: str, default: Any = None) -> Any: ...
-
-    def update(self, key: str, updater: Callable, default: Any = None) -> Any:
-        current = self.get(key, default)
-        new_value = updater(current)
-        self.set(key, new_value)
-        return new_value
 
     @abstractmethod
     def all(self) -> dict: ...
@@ -1135,58 +1062,56 @@ class PersistentStore(MemoryStore):
 - Значения должны быть JSON-сериализуемы; сложные объекты (эмбеддинги)
   хранятся в semantic memory (`semantic.py`), не здесь.
 
-### 6.6 MemoryFactory
+### 6.6 MemoryFactory (ПЛАН, не реализовано)
 
-```python
-class MemoryFactory:
-    """Создаёт SessionMemory с правильными store'ами (§5.5)."""
+Фабрика была нужна чёрной модели `SessionMemory` (три store'а на один
+объект). В v3 память создаётся объектами иерархии (§5.5), поэтому от
+фабрики остаётся только задача «подключить sqlite-бэкенды к нужным
+namespace'ам» — она ляжет на конструкторы `Workspace/Project/Agent`,
+когда придёт персистентность. Черновик namespace'ов (термины session →
+global, super → workspace):
 
-    def __init__(
-        self,
-        project_id: str,
-        super_global_db: Path = Path("./data/super_global.db"),
-        projects_db: Path = Path("./data/projects.db"),
-    ):
-        self.project_id = project_id
-        self.super_global_db = super_global_db
-        self.projects_db = projects_db
+| Уровень | БД | namespace |
+|---------|----|-----------|
+| global | projects.db | `agent:{agent_name}` (или session-id — решится при реализации) |
+| project | projects.db | `project:{project_id}` |
+| workspace | super_global.db | `system` |
 
-    def create_for_agent(self, agent_name: str, session_id: str) -> SessionMemory:
-        """
-        - local:     plain dict (приватный, не персистентный)
-        - session:   PersistentStore projects.db, namespace=session:{session_id}
-        - project:   PersistentStore projects.db, namespace=project:{project_id}
-        - super:     PersistentStore super_global.db, namespace="system"
-        """
-        return SessionMemory(
-            session_store=PersistentStore(
-                self.projects_db, namespace=f"session:{session_id}"
-            ),
-            project_store=PersistentStore(
-                self.projects_db, namespace=f"project:{self.project_id}"
-            ),
-            super_global_store=PersistentStore(
-                self.super_global_db, namespace="system"
-            ),
-        )
-```
+### 6.7 BreakpointManager (ПЛАН, не реализовано)
 
-### 6.7 BreakpointManager
+Черновик ниже написан под снятый `SessionMemory`; при реализации
+(`breakpoints.py` нет в дереве) конструктор принимает `Agent`, а
+`snapshot()` строится копированием четырёх экземпляров `Memory`
+(§5.8; контракт формы снимка `{level: dict-копия}` зафиксирован в §11.4.1). Логику save/load/restore оставляем как ориентир формата JSONL;
+метод `restore_from()` переписан под фактический API v0.1
+(`Memory.set/get/clear`, без суффиксов-скоупов):
 
 ```python
 class BreakpointManager:
     """Точки восстановления (§5.8). Формат — JSONL, append-only."""
 
-    def __init__(self, memory: SessionMemory, storage_path: Path):
-        self.memory = memory
+    def __init__(self, agent: "Agent", storage_path: Path):
+        # ПЛАН: память агента — четыре экземпляра Memory (§5.3),
+        # а не единый SessionMemory из черновика.
+        self.agent = agent
         self.storage = storage_path
 
     def save_breakpoint(self, label: str, context: dict | None = None):
+        # ПЛАН: snapshot() = {level: dict-копия} по четырём Memory (§5.8);
+        # метода Agent.snapshot() в v0.1 ещё нет.
+        snap = {
+            "local":     dict(self.agent.local_memory._data),
+            "global":    dict(self.agent.global_memory._data),
+            "project":   dict(self.agent.project_memory._data)
+                         if self.agent.project_memory else {},
+            "workspace": dict(self.agent.workspace_memory._data)
+                         if self.agent.workspace_memory else {},
+        }
         bp = {
             "label": label,
             "timestamp": datetime.now().isoformat(),
             "context": context or {},
-            "snapshot": self.memory.snapshot(),
+            "snapshot": snap,
         }
         self.storage.parent.mkdir(parents=True, exist_ok=True)
         with open(self.storage, "a", encoding="utf-8") as f:
@@ -1204,21 +1129,32 @@ class BreakpointManager:
         return last
 
     def restore_from(self, breakpoint: dict):
-        """local пересоздаётся; session восстанавливается целиком;
-        project/super НЕ трогаем (персистентны, могли измениться другими
-        агентами пока процесс был мёртв)."""
+        """local пересоздаётся; global (был \"session\") восстанавливается
+        целиком; project/workspace НЕ трогаем (персистентны, могли измениться
+        другими агентами пока процесс был мёртв)."""
         snap = breakpoint["snapshot"]
-        self.memory.reset_local()
+        local = self.agent.local_memory
+        local.clear()                        # bulk wipe без per-key событий
         for k, v in snap.get("local", {}).items():
-            self.memory.set_local(k, v)
-        self.memory._session.clear()
-        for k, v in snap.get("session", {}).items():
-            self.memory.set_session(k, v)
+            local.set(k, v)
+        gmem = self.agent.global_memory
+        gmem.clear()
+        for k, v in snap.get("global", {}).items():
+            gmem.set(k, v)
 ```
 
 ---
 
-## 7. Каталог встроенных плагинов
+## 7. Каталог встроенных плагинов (ПЛАН)
+
+**Ниже — целевой каталог, а не факт v0.1.** Реализован ровно один плагин:
+`TaskParserPlugin` (PostPlugin, `plugins/task_parser.py`) — парсинг
+декомпозиции + F1–F3 + подстановка дерева в project-ключ `tasks`.
+Названия секций в таблицах — старые (Init/Input/Trigger/Output);
+соответствие v3: Init → Pre (ленивая подготовка по флагу в global),
+Input → Pre, Trigger → Runtime (`on_upload`), Output → Post. Все
+остальные строки — backlog аудита (привязка «пробел → плагин»:
+docs/roadmap.md §7).
 
 ### 7.1 Init-плагины
 
@@ -1262,7 +1198,7 @@ class BreakpointManager:
 
 | Плагин | Назначение |
 |--------|-----------|
-| `TaskParser` (`ResponseParser`) | Единый конвейер пост-обработки decompose-ответа (process §1.3), три стадии в одном проходе: **парсинг** protocol §3 (блоки «Название / Описание» через пустую строку, двухуровневый `<atom>`) → `Task[]` (все поля — в `__init__`: created_at → snowflake id, `embedding = embed(brief)`, depth от parent; порядок детей = позиция в списке, поля `order` нет); **фильтрация/проверка** F1–F3 (F1 brief==description ⇒ атом; F2 семантическая близость brief ребёнка к brief родителя ≥ порога ⇒ ребёнок удаляется; F3 у родителя не осталось детей ⇒ родитель становится атомом) по эмбеддингам стадии 1, без повторного кодирования; **сохранение** — подставляет отфильтрованное поддерево детей нужному родителю в уже заполненный project-ключ `tasks` (`parent.subtasks = List[Task]`, прямые ссылки; не перезаписывает дерево целиком); атом ⇒ `description=None`, `is_atom=True` |
+| `TaskParser` (`TaskResponseParser`) | Единый конвейер пост-обработки decompose-ответа (process §1.3), три стадии в одном проходе: **парсинг** protocol §3 (блоки «Название / Описание» через пустую строку, двухуровневый `<atom>`) → `Task[]` (все поля — в `__init__`: created_at → snowflake id, `embedding = embed(brief)`, depth от parent; порядок детей = позиция в списке, поля `order` нет); **фильтрация/проверка** F1–F3 (F1 brief==description ⇒ атом; F2 семантическая близость brief ребёнка к brief родителя ≥ порога ⇒ ребёнок удаляется; F3 у родителя не осталось детей ⇒ родитель становится атомом) по эмбеддингам стадии 1, без повторного кодирования; **сохранение** — подставляет отфильтрованное поддерево детей нужному родителю в уже заполненный project-ключ `tasks` (`parent.subtasks = List[Task]`, прямые ссылки; не перезаписывает дерево целиком); атом ⇒ `description=None`, `is_atom=True` |
 | `DuplicateFilter` | Удаляет дубликаты подзадач (DuplicateDetector, порог 0.75) |
 | `QualityValidator` | Проверки: пустой ответ, вырожденный повтор родителя, мусор |
 | `RefusalDetector` | Детект отказа модели → action=retry с reframe или ошибка (#5) |
@@ -1280,10 +1216,14 @@ class BreakpointManager:
 
 ---
 
-## 8. Конфигурации агентов
+## 8. Конфигурации агентов (ПЛАН)
 
-Агенты описываются в TOML (см. `docs/config.md`): список секций и параметров
-плагинов. Порядок плагинов в списке = порядок исполнения.
+Конфигурационный слой не реализован: `docs/config.md` — тоже черновик,
+TOML-загрузчика и реестра в коде нет. Агенты v0.1 собираются кодом
+(примеры §11). Названия ключей ниже — старые (`init/input/trigger/output`);
+при реализации соответствуют секциям v3 `pre/runtime/post` (Init-ключа не
+будет — его роль у ленивой подготовки в Pre, §4.2). Порядок плагинов в
+списке = порядок исполнения.
 
 ### 8.1 Decomposer (декомпозиция задач)
 
@@ -1366,7 +1306,7 @@ trigger = [
   { plugin = "LengthGuard", warn_at_tokens = 6000 },
 ]
 output = [
-  { plugin = "ResponseParser", parser = "research_findings" },
+  { plugin = "TaskResponseParser", parser = "research_findings" },
   { plugin = "HistoryLogger" },
 ]
 max_iterations = 5                               # защита от зацикливания
@@ -1390,7 +1330,7 @@ trigger = [
   { plugin = "ThinkBlockExtractor" },
 ]
 output = [
-  { plugin = "ResponseParser", parser = "reflect_decision" },  # retry|reframe|give_up
+  { plugin = "TaskResponseParser", parser = "reflect_decision" },  # retry|reframe|give_up
   { plugin = "HistoryLogger" },
 ]
 max_retries = 1
@@ -1408,11 +1348,12 @@ max_retries = 1
 | Think-извлечение | да | да | да | да |
 | Retry | 2 | 1 | — | 1 |
 | SemanticStore | нет | да | нет | нет |
-| Изоляция вызова | reset_local() | reset_local() | reset_local() | reset_local() |
+| Изоляция вызова | local.clear() в run() | то же | то же | то же |
 
-### 8.6 Конфигурация памяти
+### 8.6 Конфигурация памяти (ПЛАН)
 
-Общая для всех агентов проекта (в `config.toml`, см. `docs/config.md`):
+Общая для всех агентов проекта (в `config.toml`, см. `docs/config.md`;
+к v0.1 ничего не читается — память полностью in-process, §5.2):
 
 ```toml
 [memory]
@@ -1430,266 +1371,283 @@ auto_cleanup_on_start = true
 max_session_age_days = 30
 ```
 
-`MemoryFactory` (§6.6) строится из этих значений при старте CLI; session_id
-формируется как `{agent_name}-{start_timestamp}` и попадает в breakpoint-файл
-и trace (#4, #6).
+Эти значения пойдут в конструкторы иерархии (`Workspace/Project/Agent`),
+когда придёт sqlite-персистентность (§6.5–6.6 — план); session/agent-id
+попадёт в breakpoint-файл и trace (#4, #6).
 
 ---
 
 ## 9. Жизненный цикл
 
-### 9.1 Последовательность фаз одного run()
+### 9.1 Последовательность фаз одного run() (реализовано)
 
 ```
-run(task)
+run(messages, context)
   |
-  +-- memory.reset_local()          # local чист; session/project/super живут
-  +-- build messages [system=static prefix, user=brief]
-  +-- INPUT plugins   (цепочкой: enrichment -> filters -> trim)
-  |     читают project/session/super, пишут local (промежуточное)
-  +-- GENERATION      (стрим токенов)
-  |     для каждого токена: TRIGGER plugins (цепочкой)
-  |     should_stop / action=stop -> прервать стрим
-  |     конец стрима: on_stream_end каждого trigger
-  +-- OUTPUT plugins  (парсинг -> дубликаты -> логирование)
-  |     читают local; пишут session (своя статистика/история),
-  |     project (результаты для других агентов), super (сквозные суммы);
-  |     AutoCheckpoint сохраняет breakpoint (§5.8)
-  |     action=retry -> повтор ВСЕГО run() (до max_retries)
-  |     action=reject -> AgentRejectedError
-  +-- return AgentResult(response, parsed, metadata)
+  +-- local_memory.clear()            # local чист; global/project/workspace живут
+  +-- PRE plugins   (цепочкой: messages = p.on_input(messages, context))
+  |     читают project/global/workspace, пишут local (промежуточное)
+  +-- GENERATION + RUNTIME (стрим chunk'ами через встроенный ResponseParser)
+  |     для каждого ГОТОВОГО элемента (WORD/SPECIAL):
+  |       st.token_offset += 1
+  |       голосуют все runtime-плагины on_upload(state, context) -> bool
+  |       все True -> parser.commit(ev) (+word_count);
+  |       первый False -> стоп по state.finish_reason, элемент не коммитится
+  |     конец стрима: parser.finalize("stop"|"error") -> флаш хвоста буфера
+  |     finish_reason == "error" -> RuntimeError(state.error)
+  +-- context["response"], context["think"]   # think = THINK-сегменты дерева
+  +-- POST plugins  (парсинг TaskParserPlugin -> ...)
+  |     читают local/context; пишут parsed/metadata/action в результат;
+  |     могут писать global (статистика), project (tasks), workspace (суммы)
+  |     action != "accept" -> выход из цепочки
+  |     # retry/reject-цикл (max_retries, AgentRejectedError) — ПЛАН, в коде нет
+  +-- return {"response", "context", "segments", "finish_reason", "error",
+              "parsed", "metadata", "action"}
       # local будет очищен в начале следующего run
 ```
 
-Тайминг-оверхед памяти: local — наносекунды (dict); session/project/super —
-SQLite-запись на ключ (<1 мс локально); горячий путь триггеров использует
-только local (§12.2 п.3).
+Тайминг-оверхед памяти: все четыре уровня — dict (наносекунды);
+SQLite-запись (<1 мс на ключ) появится с персистентностью (§5.2 — план).
+Горячий путь runtime-плагинов использует только живые атрибуты state/local
+(§12.2 п.3).
 
 ### 9.2 Тайминги и частоты
 
 | Фаза | Частота | Бюджет времени (референс GTX 1650 Ti) |
 |------|---------|----------------------------------------|
-| bind()/init | 1 раз за сессию | 0.1–2 c (загрузка индексов) |
-| input-плагины | перед каждым вызовом LLM | RAG/semantic: <50 мс; Selective Context: <200 мс |
-| trigger на токен | каждый токен стрима | суммарно все плагины < 0.1 мс/токен |
-| output-плагины | после генерации | парсинг+детекторы < 20 мс; запись истории < 5 мс |
-| retry | по необходимости | полный повтор цикла (дорого! лимит 2) |
+| add_plugin()/bind() | 1 раз при сборке агента | ~0 (dict-биндинг); загрузка индексов — план, 0.1–2 c |
+| pre-плагины | перед каждым вызовом LLM | RAG/semantic: <50 мс; Selective Context: <200 мс (план) |
+| runtime на элемент | каждый разобранный элемент потока | суммарно все плагины < 0.1 мс/элемент |
+| post-плагины | после генерации | парсинг+детекторы < 20 мс; запись истории < 5 мс |
+| retry | по необходимости | полный повтор цикла (дорого! лимит 2) — план |
 
 Генерация остаётся доминирующей статьёй затрат (30–55 tok/s); плагины не
-должны замедлять её заметнее, чем на 5% (проверяется `scripts/benchmark.py`).
+должны замедлять её заметнее, чем на 5% (проверяется `scripts/benchmark.py` —
+скрипт не реализован, roadmap фаза 2).
 
 ### 9.3 Обработка ошибок
 
 | Источник ошибки | Поведение |
 |-----------------|-----------|
-| Init-плагин упал | bind() падает — агент не создаётся (fail fast) |
-| Input-плагин упал | исключение логируется, плагин пропускается, цикл продолжается |
-| Trigger-плагин упал | плагин отключается на текущий стрим, остальные работают |
-| Output-плагин вернул retry | повтор run(), при исчерпании — AgentRejectedError |
-| LLM недоступна | клиент ретраит с backoff; после лимита — TaskFailedError в оркестратор |
+| Pre-плагин упал | **факт v0.1: исключение летит из run()** (fail fast); «логируется и пропускается» — план |
+| Runtime-плагин вернул False (finish_reason="stop") | поток останавливается без ошибки |
+| Runtime-плагин вернул error | finalize("error") + RuntimeError(data) |
+| Runtime-плагин упал | **факт v0.1: исключение летит из run()**; «отключается на текущий стрим» — план |
+| Post-плагин вернул retry/reject | **факт v0.1: только выход из цепочки post**; повтор run()/AgentRejectedError — план |
+| LLM недоступна | клиент ретраит с backoff; после лимита — TaskFailedError в оркестратор (план) |
 
-Принцип: отказ вспомогательного плагина НЕ должен срывать основной вызов LLM;
-отказ критического (ResponseParser) — обязан быть виден, а не проглочен.
+Принцип (целевой): отказ вспомогательного плагина НЕ должен срывать основной
+вызов LLM; отказ критического (TaskParserPlugin) — обязан быть виден, а не
+проглочен. Пока изоляции try/except в цикле агента нет — все исключения
+прокидываются вызывающему (зафиксировано в §4.1).
 
 ---
 
-## 10. Структура проекта
+## 10. Структура проекта (реализовано)
 
-Плагинный слой добавляет в дерево (docs/architecture.md §10.1) следующие модули:
+Фактическое дерево плагинного слоя (ветка `plugin`):
 
 ```
 src/cascagent/
-├── memory.py                      # SessionMemory, MemoryStore, InMemoryStore,
-│                                  # PersistentStore, MemoryFactory (§6.1, §6.5, §6.6)
-├── breakpoints.py                 # BreakpointManager (§6.7)
-├── agent.py                       # Agent, AgentSession, AgentResult (§6)
+├── memory.py                      # Memory, Workspace, Project, Agent (§6.1–6.2, §6.4)
+├── stream_parser.py               # встроенный сервис потока (не плагин;
+│                                  # docs/stream_parser_model.md)
+├── models.py                      # Task/SnowflakeID — данные (docs/data.md)
 ├── plugins/
-│   ├── __init__.py                # реестр PLUGIN_REGISTRY
-│   ├── base.py                    # InitPlugin/InputPlugin/TriggerPlugin/OutputPlugin
-│   ├── init/
-│   │   ├── index_loader.py        # IndexLoader
-│   │   ├── prompt_compiler.py     # PromptCompiler
-│   │   ├── health_checker.py      # HealthChecker
-│   │   ├── checkpoint_loader.py   # CheckpointLoader
-│   │   ├── session_cleanup.py     # SessionCleanup
-│   │   └── statistics.py          # StatisticsCollector, RateLimiter
-│   ├── input/
-│   │   ├── context_enricher.py    # ContextEnricher (обёртка над enricher.py)
-│   │   ├── safety_filter.py       # SafetyInputFilter
-│   │   ├── injection_guard.py     # PromptInjectionGuard
-│   │   ├── history_trimmer.py     # HistoryTrimmer
-│   │   └── variables.py           # VariableSubstitution
-│   ├── trigger/
-│   │   ├── think_extractor.py     # ThinkBlockExtractor
-│   │   ├── early_stop.py          # EarlyStopper
-│   │   ├── timeouts.py            # FirstTokenTimeout, TotalResponseTimeout
-│   │   ├── stuck_detector.py      # StuckDetector
-│   │   └── pii_filter.py          # PIIFilter
-│   └── output/
-│       ├── response_parser.py     # ResponseParser
-│       ├── duplicate_filter.py    # DuplicateFilter
-│       ├── quality_validator.py   # QualityValidator (+RefusalDetector)
-│       ├── auto_checkpoint.py     # AutoCheckpoint
-│       ├── history_logger.py      # HistoryLogger
-│       ├── semantic_store.py      # SemanticStore
-│       └── metrics.py             # MetricsCollector, MetricsWriter, QualityScorer
-tests/unit/test_memory.py          # 4 уровня: set/get/update, изоляция session/project,
-                                   # подписки, snapshot; PersistentStore на tmp SQLite
-tests/unit/test_breakpoints.py     # save/load/restore, project/super не трогаются
-tests/unit/test_agent.py           # Agent: bind(memory)/run/retry/triggers (fake LLM)
-tests/unit/test_plugins_*.py       # по файлу на секцию плагинов
+│   ├── __init__.py                # ре-экспорт базовых классов + TaskParserPlugin
+│   │                              # (PLUGIN_REGISTRY — план, §12.1)
+│   ├── base.py                    # Plugin/PrePlugin/RuntimePlugin/PostPlugin (§6.3)
+│   └── task_parser.py             # TaskParserPlugin: SYSTEM_PROMPT, parse_decomposition,
+│                                  # similarity/is_parent_repeat/is_duplicate, on_output (§7.4)
+tests/
+├── test_models.py                 # Task/SnowflakeID (docs/data.md)
+├── test_bk_tree.py                # BK-tree (docs/algorithms.md)
+├── test_plugins_base.py           # базовые классы, bind(), иерархия Workspace/Project/Agent
+├── test_plugins_task_parser.py    # парсинг+F1–F3+подстановка в project tasks, snapshot промпта
+└── conftest.py                    # фикстуры (в корне проекта)
 ```
 
-Существующие модули (`enricher.py`, `parser.py`, `detector.py`) остаются
-единственными реализациями логики — плагины только тонкие обёртки над ними
-(CPU-слой не дублируется).
+План (в дереве отсутствует, см. §6.5–6.7, §7): `breakpoints.py`, подкаталоги
+`plugins/init|input|trigger|output/` со списанными плагинами,
+`test_stream_parser.py`/`test_memory.py` (Memory и ResponseParser пока
+покрываются тестами базовых классов и task_parser), `test_plugins_*.py` по
+файлу на секцию. Модули-предшественники `parser.py` и `detector.py` **удалены**
+— их логика поглощена `TaskParserPlugin`; `enricher.py` в текущем дереве
+отсутствует (RAG — plan, roadmap фаза 2).
 
 ---
 
 ## 11. Примеры использования
 
-### 11.1 Hello World через Agent API
+### 11.1 Hello World через Agent API (реализовано)
 
 ```python
-from cascagent.agent import Agent
-from cascagent.client import LlamaCppClient
-from cascagent.plugins.base import InputPlugin, TriggerPlugin, OutputPlugin
-from cascagent.plugins.trigger.think_extractor import ThinkBlockExtractor
-from cascagent.plugins.output.response_parser import ResponseParser
+from cascagent.memory import Project, Agent
+from cascagent.models import Task
+from cascagent.plugins.task_parser import SYSTEM_PROMPT, TaskParserPlugin
 
-client = LlamaCppClient(url="http://127.0.0.1:8080/v1")
-
+project = Project(name="blog-api")
 agent = Agent(
     name="decomposer",
-    system_prompt=SYSTEM_PROMPT,            # ~110 токенов из parser.py
-    llm_client=client,
-    trigger_plugins=[ThinkBlockExtractor()],
-    output_plugins=[ResponseParser(parse_decomposition)],
-).bind()
+    project=project,                          # даёт плагину project_memory
+    llm=client,                               # callable(messages)->str|chunk-iter
+    post_plugins=[TaskParserPlugin(threshold=0.75)],
+)
+project.add_agent(agent)
 
-result = agent.run(Task(id="0", brief="Написать Hello World на Python"))
+messages = [
+    {"role": "system", "content": SYSTEM_PROMPT},   # статический префикс (P8)
+    {"role": "user", "content": f"Задача: {task.brief}"},
+]
+result = agent.run(messages, context={"task": task})
 
-if result.parsed == "<atom>":
+if result["parsed"] == "<atom>":
     print("Задача атомарна -> Executor")
 else:
-    for sub in result.parsed:
+    for sub in result["parsed"]:
         print(f"- {sub.brief}")
 ```
 
-Think-блок при этом уже лежит в памяти для честного логирования (§2.4):
+Think и состояние потока — в результате и local памяти (§2.4):
 
 ```python
-think = agent.memory.get_local("think_content")   # str
-n = agent.memory.get_local("think_length")        # int
+think = result["context"]["think"]              # THINK-сегменты дерева
+segments = result["segments"]                   # всё дерево сегментов
+state = result["context"]["parse_state"]         # живой ParseState этого run
 ```
 
-### 11.2 Свой input-плагин: подстановка имени проекта
+### 11.2 Свой pre-плагин: подстановка имени проекта
 
 ```python
-class ProjectVars(InputPlugin):
+from cascagent.plugins.base import PrePlugin
+
+class ProjectVars(PrePlugin):
     name = "project_vars"
 
     def __init__(self, variables: dict[str, str]):
+        super().__init__()
         self.variables = variables
 
-    def on_input(self, messages, context, session, memory):
+    def on_input(self, messages, context):      # память — self.*_memory (bind)
         messages[-1]["content"] = messages[-1]["content"].format(**self.variables)
         return messages
-
-# в конфиге: { plugin = "ProjectVars", variables = { project_name = "blog" } }
 ```
 
 ### 11.3 Producer-Consumer: координация Research через память
 
 ```python
-class ResearchNeededDetector(OutputPlugin):
+from cascagent.plugins.base import PostPlugin
+
+class ResearchNeededDetector(PostPlugin):
     """CPU-эвристика: пустой/нерелевантный decompose-ответ -> флаг исследования."""
     name = "research_needed"
 
-    def on_output(self, response, context, session, memory):
+    def on_output(self, response, context):
         if not context["task"].parent_result and len(response) < 40:
-            memory.set_local("needs_research", True)
-            memory.set_local("research_query", context["task"].brief)
+            self.local_memory.set("needs_research", True)
+            self.local_memory.set("research_query", context["task"].brief)
         return {"response": response, "action": "accept"}
 
 # Оркестратор ПОСЛЕ run() читает флаги (не агенты между собой!):
-result = decomposer.run(task)
-if decomposer.memory.get_local("needs_research"):
-    finding = researcher.run(decomposer.memory.get_local("research_query"))
-    research_cache.save(task.brief, finding)
+result = decomposer.run(messages, context={"task": task})
+if decomposer.local_memory.get("needs_research"):
+    finding = researcher.run([...])       # local переживает run до следующего запуска
 ```
 
 ### 11.4 Статистика через подписки
 
 ```python
-class ThinkStats(InitPlugin):
+class ThinkStats(PostPlugin):
     name = "think_stats"
 
-    def __init__(self):
-        self._memory = None          # захватывается в on_init для callback'а
+    def bind(self, **memories):                 # вызывается add_plugin()
+        super().bind(**memories)
+        self.global_memory.subscribe("response_duration", self._on_done)
+        self.global_memory.set("think_stats", {"calls": 0, "total_ms": 0, "max_ms": 0})
 
-    def on_init(self, session, memory):
-        self._memory = memory
-        memory.subscribe("response_duration", self._on_done)
-        memory.set_session("think_stats", {"calls": 0, "total_ms": 0, "max_ms": 0})
-        return session
-
-    def _on_done(self, key, value, scope):
-        m = self._memory
-        m.update_session("think_stats", lambda s: {
+    def _on_done(self, key, value):             # callback (key, value) — без scope
+        s = self.global_memory.get("think_stats")
+        self.global_memory.set("think_stats", {
             "calls": s["calls"] + 1,
             "total_ms": s["total_ms"] + value["duration_ms"],
             "max_ms": max(s["max_ms"], value["duration_ms"]),
         })
 
-# после серии run() статистика читается из session-уровня:
-stats = agent.memory.get_session("think_stats")     # {"calls": 12, ...}
-snap = agent.memory.snapshot()                     # отладочный дамп памяти
+    def on_output(self, response, context):
+        self.global_memory.set("response_duration", {
+            "duration_ms": context.get("duration_ms", 0),
+            "task_id": context["task"].id,
+        })
+        return {"response": response, "action": "accept"}
+
+# после серии run() статистика читается с global-уровня:
+stats = agent.global_memory.get("think_stats")  # {"calls": 12, ...}
+dump = dict(agent.global_memory._data)          # отладочный дамп (snapshot() — план, §5.8)
 ```
 
-Простейшая альтернатива без подписки — прямо в output-плагине:
+Подписка glob'ом по семейству ключей — так же, другим паттерном:
+`self.project_memory.subscribe("tasks:*", cb)`. Скоуп строго per-level
+(решение зафиксировано, §5.4): если ключ может появиться на нескольких
+уровнях, подписываемся явно на каждый из них; обёрток и propagation нет.
+Простейшая альтернатива без подписки — прямо в post-плагине:
 
 ```python
-memory.update_session("calls_count", lambda x: x + 1, default=0)
+self.global_memory.set("calls_count", self.global_memory.get("calls_count", 0) + 1)
 ```
 
-### 11.5 Полная сборка REST API-агента (code, не TOML)
+### 11.4.1 Снимок памяти (snapshot) — ПЛАН
+
+Метода `Agent.snapshot()` в v0.1 **нет** (проверено по дереву: ни в
+`memory.py`, ни в плагинах). Для отладочного дампа сейчас допустим прямой
+доступ к `_data`, но это внутренний атрибут — не API. Целевая форма
+(реализация вместе с breakpoint'ами, §6.7):
 
 ```python
-def make_decomposer(client, rag, semantic, kanban) -> Agent:
-    return Agent(
+def snapshot(self) -> Dict[str, Dict[str, Any]]:
+    """{level: dict-копия} по четырём экземплярам Memory агента."""
+    return {
+        "local":     dict(self.local_memory._data),
+        "global":    dict(self.global_memory._data),
+        "project":   dict(self.project_memory._data) if self.project_memory else {},
+        "workspace": dict(self.workspace_memory._data) if self.workspace_memory else {},
+    }
+```
+
+Семантика снимка согласована с формой JSONL-записи BreakpointManager
+(§6.7); формат `{level: {...}}` фиксируем как контракт ещё до реализации,
+чтобы тесты breakpoint'ов писались против него сразу.
+
+### 11.5 Полная сборка Decomposer-проекта (code, не TOML)
+
+```python
+def make_decompose_project(client) -> Project:
+    project = Project(name="blog-api")
+    agent = Agent(
         name="decomposer",
-        system_prompt=SYSTEM_PROMPT,
-        llm_client=client,
-        init_plugins=[PromptCompiler(), HealthChecker(client)],
-        input_plugins=[ContextEnricher(rag, semantic, kanban, max_tokens=500)],
-        trigger_plugins=[ThinkBlockExtractor()],
-        output_plugins=[
-            ResponseParser(parse_decomposition),
-            DuplicateFilter(threshold=0.75),
-            HistoryLogger(history),
-        ],
-    ).bind()
+        project=project,
+        llm=client,
+        parser_config={"max_depth": 2, "fuzzy_max_distance": 1},  # [parser] — plan
+        post_plugins=[TaskParserPlugin(threshold=0.75)],
+    )
+    project.add_agent(agent)
+    return project
 ```
 
 ---
 
 ## 12. Расширение системы
 
-### 12.1 Реестр плагинов и entry points
+### 12.1 Реестр плагинов и entry points (ПЛАН)
 
-Все встроенные плагины регистрируются в реестре; конфиг ссылается на плагин
+Реестра в коде нет: `plugins/__init__.py` только ре-экспортирует базовые
+классы и `TaskParserPlugin`. Целевой дизайн — конфиг ссылается на плагин
 по имени строки:
 
 ```python
-# src/cascagent/plugins/__init__.py
+# src/cascagent/plugins/__init__.py  (PLAN)
 PLUGIN_REGISTRY: dict[str, type] = {
-    "IndexLoader": IndexLoader,
-    "PromptCompiler": PromptCompiler,
-    "ContextEnricher": ContextEnricher,
-    "ThinkBlockExtractor": ThinkBlockExtractor,
-    "ResponseParser": ResponseParser,
-    # ...
+    "TaskParserPlugin": TaskParserPlugin,   # единственный встроенный пока
+    # "IndexLoader", "ContextEnricher", ... — по мере реализации §7
 }
 
 def build_plugin(spec: dict) -> object:
@@ -1699,62 +1657,65 @@ def build_plugin(spec: dict) -> object:
     return cls(**kwargs)
 ```
 
-Внешние пакеты могут добавлять плагины через entry point группы
-`cascagent.plugins` (pyproject.toml):
+Внешние пакеты смогут добавлять плагины через entry point группы
+`cascagent.plugins` (pyproject.toml — секции entry-points там пока нет):
 
 ```toml
 [project.entry-points."cascagent.plugins"]
 my_limiter = "mypackage.plugins:TokenBudgetLimiter"
 ```
 
-Загрузчик дописывает PLUGIN_REGISTRY найденными entry points при старте CLI.
+Загрузчик допишет PLUGIN_REGISTRY найденными entry points при старте CLI.
 
 ### 12.2 Правила расширения (обязательны к соблюдению)
 
 1. **Плагин не имеет скрытого состояния между run()** — всё состояние только
-   в SessionMemory (иначе ломается воспроизводимость §2.1).
-2. **Input-плагины не трогают system-сообщение** — статический префикс нужен
+   в памяти четырёх уровней (иначе ломается воспроизводимость §2.1).
+2. **Pre-плагины не трогают system-сообщение** — статический префикс нужен
    для префиксного кэша llama.cpp; динамика живёт в user.
-3. **Trigger-плагины без I/O и аллокаций в горячем пути** — никаких сетевых
-   вызовов, записей на диск, эмбеддингов на токен.
-4. **Output-плагины идемпотентны** — повторный прогон на том же ответе даёт
-   тот же результат (retry полагается на это).
+3. **Runtime-плагины без I/O и аллокаций в горячем пути** — никаких сетевых
+   вызовов, записей на диск, эмбеддингов на элемент потока.
+4. **Post-плагины идемпотентны** — повторный прогон на том же ответе даёт
+   тот же результат (retry полагается на это; сам retry-цикл — план §9.3).
 5. **Никаких обращений к другим агентам напрямую** — координация только через
-   оркестратор и флаги памяти (§11.3) или project-уровень SessionMemory
+   оркестратор и флаги local-памяти (§11.3) или project-уровень
    (Producer-Consumer, §5.6).
 6. **Данные кладутся на самый приватный подходящий уровень** (§5.7): local →
-   session → project → super; запись в project/super из input/trigger
-   запрещена (только output и init).
+   global → project → workspace; запись в project/workspace из pre/runtime
+   запрещена (только post и ленивая подготовка в pre по флагу).
 7. **Без эвристик атомарности** — `is_atom` решает модель (`<atom>`),
-   QualityValidator проверяет лишь формат (ADR-007). Единственные
-   детерминированные CPU-исключения — правила F1–F3 плагина TaskParser
+   QualityValidator проверяет лишь формат (ADR-003). Единственные
+   детерминированные CPU-исключения — правила F1–F3 плагина TaskParserPlugin
    (process §1.3: degenerate-repeat родителя и brief==description);
    они не «угадывают» атомарность текста, а реализуют правило protocol §3.7.
 8. **Логируем честно** — think и final пишутся всегда, даже если downstream
    использует только final (§2.4).
 9. **Каждый плагин = unit-тесты с fake LLM/fake memory**, coverage >80%.
-   Fake-память — SessionMemory со всеми InMemoryStore (§6.5).
+   Fake-память — обычные `Memory`-экземпляры (все четыре dict'ом, §6.1);
+   fake LLM — callable/строка на seam'е `Agent.llm` (§6.4).
 
 ### 12.3 Матрица обратной совместимости API
 
 | API | Гарантируется стабильным? | Примечание |
 |-----|---------------------------|------------|
-| SessionMemory get/set/update по 4 уровням + subscribe/snapshot | да (semver minor) | ключи — domain плагинов; `*_global` не вводятся |
-| MemoryStore / PersistentStore API (set/get/update/all/clear) | да (semver minor) | схема таблицы `memory(namespace,key,value,updated_at)` — стабильна |
-| BreakpointManager JSONL-формат | нет до 1.0.0 | при смене формата — версионирование записи `v` |
-| Сигнатуры on_init/on_input/on_token/on_output | да (semver major на ломку) | новые optional-параметры — minor |
-| Результат trigger `{"action": ...}` | да | новые действия добавляются расширением enum |
-| Поля AgentSession | нет | внутренняя структура, может меняться |
-| PLUGIN_REGISTRY | да | имена встроенных плагинов не переиспользуются |
+| Memory get/set/delete(glob)/clear + subscribe/unsubscribe (glob) | да (semver minor) | ключи — domain плагинов; delete по fnmatch-glob, silent (без событий); уровни задаются экземпляром, суффиксов не вводим; скоуп подписки строго per-level (вариант А, §5.4) — без обёрток и propagation |
+| Иерархия Workspace/Project/Agent (add_*, *_memory свойства) | да (semver minor) | project/workspace могут быть None у невстроенного агента |
+| Сигнатуры on_input/on_upload(state, context)/on_output | да (semver major на ломку) | context — общий словарь прогона, передаётся всем хукам по ссылке (решение 2026-10-12); новые optional-параметры — minor |
+| bind(workspace/project/global/local_memory) | да (semver major на ломку) | порядок/наборы keyword-аргументов фиксированы |
+| Контракт runtime: bool-возврат (False = стоп), причина в state.finish_reason ("stop"/"error"), текст в state.error | нет до 1.0.0 | op-словари сняты (2026-10-12); возврат ParseState заменён на bool (2026-10-12); новые значения finish_reason добавляются расширением enum |
+| Результат run() (dict: response/context/segments/parsed/metadata/action) | нет до 1.0.0 | поля добавляются; удаление — major |
+| PersistentStore API (set/get/all/clear) | да (semver minor) — ПЛАН | схема таблицы `memory(namespace,key,value,updated_at)` |
+| BreakpointManager JSONL-формат | нет до 1.0.0 — ПЛАН | при смене формата — версионирование записи `v` |
+| PLUGIN_REGISTRY | да — ПЛАН | имена встроенных плагинов не переиспользуются |
 
 ### 12.4 Roadmap плагинного слоя
 
 | Версия | Что добавляется |
 |--------|-----------------|
-| 0.5.x | Этап 5: base-классы + memory (local+session on InMemoryStore) + ThinkBlockExtractor/ResponseParser/HistoryLogger; Decomposer переведён на Agent |
-| 0.5.x+ | Персистентность: PersistentStore + MemoryFactory (project/session namespace'ы); super-уровень и AutoCheckpoint/BreakpointManager — вместе с #3 из roadmap (§8 чек-лист) |
-| 0.6.x | Researcher/Reflector как конфигурации (§8.3–8.4); EntryPoints для внешних плагинов |
-| 0.7.x | SafetyInputFilter/PIIFilter; RateLimiter; multi-turn HistoryTrimmer |
+| 0.1.x (сейчас) | done: base-классы (Pre/Runtime/Post) + 4-уровневая память + ResponseParser + Agent.run + TaskParserPlugin |
+| 0.2.x | retry/reject-цикл в Agent (max_retries, AgentRejectedError); изоляция падений плагинов (§9.3); snapshot()/breakpoints (#3) |
+| 0.3.x | Персистентность: sqlite-бэкенд за тем же API `Memory` + namespace'ы (§6.5–6.6); SessionCleanup |
+| 0.4.x | Каталог §7 по одному (HistoryLogger, StatisticsCollector, EarlyStopper…); PLUGIN_REGISTRY + TOML-конфигурации (§8, §12.1); entry points |
 | 1.0.0 | Заморозка API секций; плагины — единственный способ расширения агентов |
 
 ---

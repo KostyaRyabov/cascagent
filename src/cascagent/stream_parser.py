@@ -1,6 +1,8 @@
-"""StreamParser — built-in agent service that structures an LLM stream.
+"""ResponseParser — built-in agent service that structures an LLM stream.
 
-NOT a plugin (leader decision 2026-10-12; OutputSplitterPlugin was removed
+Renamed from ``StreamParser`` (leader decision 2026-10-13: there is only ONE
+parser in the project and it is called ResponseParser). NOT a plugin
+(leader decision 2026-10-12; OutputSplitterPlugin was removed
 in favour of this service). Specification: docs/stream_parser_model.md
 (final model v3 — flat ``segments`` list + open ``stack``, no ``Unit``,
 no tree ``root``; every Segment has an explicit kind, RESPONSE == «outside
@@ -9,8 +11,12 @@ of tags»).
 Responsibility: consume raw streamed chunks (llama.cpp SSE ``delta.content``
 or plain token strings), split them into words / service tags and maintain
 the single live ``ParseState``. Runtime plugins vote on each ready element
-via ``RuntimePlugin.on_upload(state)``; an element is applied to the
-segment tree ONLY when every plugin returned ``{"op": "continue"}``.
+via ``RuntimePlugin.on_upload(state, context) -> bool`` (decision 2026-10-12:
+state/context are passed by reference — the hook edits state in place and
+returns True to keep the loop running / False to stop it; the agent then
+inspects ``state.finish_reason`` ("stop" = clean end, "error"/unset = raise,
+custom text in ``state.error``)); an element is applied to the segment tree
+ONLY when every plugin returned True.
 
 Fixed rules (docs/stream_parser_model.md §«Правила»):
 1. Punctuation is not a unit type — it only closes the current word.
@@ -49,7 +55,12 @@ _SELF_CLOSING_RE = re.compile(r"/\s*$")
 
 
 class ParseStatus(str, Enum):
-    """How far the tokens of the current iteration formed an element."""
+    """How far the tokens of the current iteration formed an element.
+
+    Element-status enum. The parser service itself is ``ResponseParser``
+    (renamed from StreamParser, leader decision 2026-10-13); the live
+    mutable state object passed to RuntimePlugins stays ``ParseState``.
+    """
 
     PARTIAL = "partial"  # element unfinished — wait for more chunks
     WORD = "word"        # word explicitly closed (space/punct/message end)
@@ -64,14 +75,101 @@ class SegmentKind(str, Enum):
 
 
 @dataclass
+class Word:
+    """One committed element of the editable segment tape (model v5,
+    implemented 2026-10-13; decisions A–F in docs/stream_parser_model.md).
+
+    Lifecycle rule: the parser creates a Word ONLY at commit time (the
+    WORD/SPECIAL event passed every RuntimePlugin vote) — append-at-commit,
+    mutate-after. Plugins may then edit ``text``, reorder/remove/add words
+    through direct access to ``segment.words`` (leader decision 2026-10-13:
+    words and segments are the ONLY things you manage — no flat-text
+    editing API).
+    """
+
+    text: str = ""                # word text INCLUDING its closing delimiter
+                                  # (decision C: no separate tail field)
+    segment: "Segment" = None     # direct link to the owning segment
+                                  # (decision A: links, not indices)
+    idx: int = 0                  # GLOBAL ordinal from the start of the
+                                  # response generation (decision F)
+    is_hidden: bool = False       # inherited from the segment on creation
+                                  # (decision E: e.g. THINK → hidden);
+                                  # per-word override allowed afterwards
+
+    def __post_init__(self) -> None:
+        # Any mutation of the words list invalidates the segment's lazy
+        # text cache (decision B).
+        if self.segment is not None:
+            self.segment._text_cache = None
+
+
+@dataclass
 class Segment:
-    """One output block. ``text`` accumulates ONLY confirmed elements
-    (every RuntimePlugin voted continue)."""
+    """One output block. ``words`` is the primary representation (v5):
+    ONLY confirmed elements land here (every RuntimePlugin voted continue).
+    ``text`` stays a backwards-compatible derived view (lazy, cached until
+    the words list is touched)."""
 
     kind: SegmentKind
-    text: str = ""                        # only CONFIRMED word/special content
+    words: List[Word] = field(default_factory=list)
     finish_reason: Optional[str] = None   # None = open; stop|length|aborted|unclosed
     segments: List["Segment"] = field(default_factory=list)  # subsegments
+    #: Lazy cache for the derived ``text`` (decision B); invalidated by
+    #: Word.__post_init__ and by any structural change of ``words``.
+    _text_cache: Optional[str] = None
+
+    @property
+    def is_hidden(self) -> bool:
+        """Decision E: visibility is bound to SegmentKind — THINK and
+        TOOL_CALL segments are hidden from the user stream; RESPONSE is
+        visible. Words inherit this value at commit time."""
+        return self.kind in (SegmentKind.THINK, SegmentKind.TOOL_CALL)
+
+    @property
+    def text(self) -> str:
+        """Derived: ''.join(w.text for w in words), lazily cached (B)."""
+        if self._text_cache is None:
+            self._text_cache = "".join(w.text for w in self.words)
+        return self._text_cache
+
+    @text.setter
+    def text(self, value: str) -> None:
+        """Back-compat setter (old code/tests wrote raw text into a
+        segment): replaces the whole word list with a single Word.
+        ``idx`` stays untouched — global renumbering is owned by the
+        parser's tape rebuild (ParseState.words)."""
+        self.words = [Word(text=value, segment=self, is_hidden=self.is_hidden)]
+
+    # --- direct word management (leader decision 2026-10-13: manage
+    #     words/segments directly; these helpers keep idx consistent) ---
+    def add_word(self, word: "Word") -> "Word":
+        """Append an existing/new Word to this segment (fixes the link;
+        global ``idx`` is owned by the parser tape)."""
+        word.segment = self
+        self.words.append(word)
+        self._text_cache = None
+        return word
+
+    def remove_word(self, word: "Word") -> bool:
+        """Remove a Word object from this segment."""
+        try:
+            self.words.remove(word)
+        except ValueError:
+            return False
+        self._text_cache = None
+        return True
+
+    def move_word(self, word: "Word", to_pos: int) -> None:
+        """Reorder: move an existing Word to position ``to_pos``."""
+        self.words.remove(word)
+        self.words.insert(max(0, min(to_pos, len(self.words))), word)
+        self._text_cache = None
+
+    def reindex(self) -> None:
+        """Invalidate the text cache after any external mutation of
+        ``words`` (reorder/remove/insert done through the raw list)."""
+        self._text_cache = None
 
 
 @dataclass
@@ -85,12 +183,25 @@ class ParseState:
     # --- word reconstruction ---
     buffer: str = ""                      # raw un-assembled tail
 
+    # --- stream position (decision 2026-10-12; two counters per leader
+    #     decision 2026-10-13: tokens AND words, global over the response) ---
+    token_offset: int = 0                 # ordinal number of the current
+                                          # element delivered to plugins
+    token_count: int = 0                  # raw chunks fed (transport units)
+    word_count: int = 0                   # committed WORDs so far
+
     # --- segments ---
     segments: List[Segment] = field(default_factory=list)  # all collected
     stack: List[Segment] = field(default_factory=list)     # OPEN ones; [-1] = current
 
+    #: Global word tape (decision F): every committed Word in generation
+    #: order, across all segments. ``word.idx == len(words)`` at commit →
+    #: idx is the position in this list AND equals the word_count counter.
+    words: List["Word"] = field(default_factory=list)
+
     # --- stream / protocol ---
     finish_reason: Optional[str] = None   # stop | length | tool_calls | ...
+    error: Optional[str] = None           # custom message when finish_reason == "error"
     done: bool = False                    # [DONE] received
 
     @property
@@ -158,12 +269,12 @@ class BKTree:
         return out
 
 
-class StreamParser:
+class ResponseParser:
     """Chunk-by-chunk structuring service owned by the Agent.
 
     Usage (the agent drives this loop inside run()):
 
-        parser = StreamParser(whitelist=["think", "tool_call"], ...)
+        parser = ResponseParser(whitelist=["think", "tool_call"], ...)
         for chunk in llm.stream(messages):
             for ev in parser.feed(chunk):        # [(WORD|SPECIAL, payload)]
                 if not all plugins vote continue:
@@ -222,6 +333,7 @@ class StreamParser:
         st = self.state
         if st.done:
             raise RuntimeError("stream already finalized ([DONE] received)")
+        st.token_count += 1               # raw transport counter (chunks)
         st.buffer += chunk
         self._chunks_in_buffer += 1
         events: List[Tuple[ParseStatus, Optional[str]]] = []
@@ -229,10 +341,13 @@ class StreamParser:
             ev = self._next_event()
             if ev is None:
                 break
+            # ordinal position of the element being delivered to plugins
+            st.token_offset += 1
             events.append(ev)
         # rule 9: buffer overflow → flush the remainder as one WORD
         if (self._chunks_in_buffer >= self.max_buffer_chunks
                 and st.buffer.strip()):
+            st.token_offset += 1
             events.append(self._flush_buffer_as_word())
         return events
 
@@ -246,12 +361,43 @@ class StreamParser:
         if status is ParseStatus.WORD:
             assert payload is not None
             target = st.current or self._ensure_response_segment()
-            target.text += payload + " "
+            # v5 Word model: append-at-commit. text carries the closing
+            # delimiter (decision C); idx is GLOBAL over the response tape
+            # (decision F) — equal to word_count before increment; the Word
+            # links back to its segment (decision A) and inherits visibility
+            # from Segment.kind (decision E).
+            word = Word(text=payload + " ", segment=target,
+                        idx=st.word_count, is_hidden=target.is_hidden)
+            target.words.append(word)
+            target._text_cache = None
+            st.words.append(word)          # global tape (idx == position)
+            st.word_count += 1             # committed words counter
         elif status is ParseStatus.SPECIAL:
             assert payload is not None
             self._apply_special(payload)
         else:                                 # PARTIAL is never committed
             raise ValueError(f"cannot commit a partial element: {event!r}")
+
+    def drain_buffer(self) -> Optional[Tuple[ParseStatus, Optional[str]]]:
+        """Turn the raw buffer remainder into one votable WORD event.
+
+        Shared by rule 9 (max_buffer_chunks overflow), the agent's
+        post-stream tail flush and finalize(). Clears the buffer and the
+        chunk counter, advances ``token_offset`` (the element is being
+        DELIVERED to plugins — they decide via vote whether commit()
+        applies it to the segment tree). Returns None when the buffer is
+        empty or already consumed (rule 7: PARTIAL is never an event).
+        """
+        st = self.state
+        leftover = st.buffer.strip()
+        if not leftover:
+            st.buffer = ""
+            self._chunks_in_buffer = 0
+            return None
+        st.buffer = ""
+        self._chunks_in_buffer = 0
+        st.token_offset += 1
+        return (ParseStatus.WORD, leftover)
 
     def finalize(self, reason: str = "stop") -> ParseState:
         """Close the stream ([DONE] / finish_reason). Rule 8.
@@ -262,12 +408,12 @@ class StreamParser:
         """
         st = self.state
         if not st.done:
-            if st.buffer.strip():
-                leftover = st.buffer.strip()
-                st.buffer = ""
-                self._chunks_in_buffer = 0
-                target = st.current or self._ensure_response_segment()
-                target.text += leftover + " "
+            tail = self.drain_buffer()
+            if tail is not None:
+                # Rule-8 tail flush IS a committed word: deliver it through
+                # the same WORD/SPECIAL pipeline (token_offset counter) so
+                # the last word of the stream still gets its runtime vote.
+                self.commit(tail)
             st.status = ParseStatus.WORD
             st.word = None
             while len(st.stack) > 1:          # keep RESPONSE at the bottom
@@ -280,6 +426,36 @@ class StreamParser:
                 resp = st.stack.pop(0)
                 if resp.finish_reason is None:
                     resp.finish_reason = reason
+        return st
+
+    def close_on_stop(self, reason: str) -> ParseState:
+        """Close the segment tree after a runtime-plugin stop.
+
+        Unlike finalize(), this NEVER touches the raw buffer: an element
+        rejected by a voter must not leak into the committed output
+        (rule 8 applies to clean ends only). Every still-open segment
+        closes with finish_reason="unclosed"; the implicit RESPONSE
+        segment and the state itself take the protocol ``reason``.
+        """
+        st = self.state
+        if st.done:
+            return st
+        # Discard the un-voted tail without advancing token_offset —
+        # those chunks were never delivered as elements.
+        st.buffer = ""
+        self._chunks_in_buffer = 0
+        st.status = ParseStatus.WORD
+        st.word = None
+        while len(st.stack) > 1:          # keep RESPONSE at the bottom
+            top = st.stack.pop()
+            if top.finish_reason is None:
+                top.finish_reason = "unclosed"
+        st.finish_reason = reason
+        st.done = True
+        if st.stack and st.stack[0].kind is SegmentKind.RESPONSE:
+            resp = st.stack.pop(0)
+            if resp.finish_reason is None:
+                resp.finish_reason = reason
         return st
 
     def response_text(self) -> str:
@@ -407,7 +583,7 @@ class StreamParser:
         canonical = self._fuzzy_tag(name)
         if canonical is None:                 # defensive: text fallback
             target = st.current or self._ensure_response_segment()
-            target.text += f"<{body}> "
+            self._append_noise(target, f"<{body}> ")
             return
         kind = self.tag_kinds.get(canonical, SegmentKind(canonical))
         if self._is_self_closing_body(body):  # rule 5: stack untouched
@@ -429,7 +605,7 @@ class StreamParser:
                     return
             # stray closer (no opener anywhere) → noise, kept as text
             target = st.current or self._ensure_response_segment()
-            target.text += f"</{canonical}> "
+            self._append_noise(target, f"</{canonical}> ")
             return
         # opening tag
         # rule 4: tool_call inside think — anomaly
@@ -451,11 +627,22 @@ class StreamParser:
         # depth limit (rule 3): deeper than allowed → literal text
         if len(st.stack) >= self.max_depth:
             target = st.current or self._ensure_response_segment()
-            target.text += f"<{canonical}> "
+            self._append_noise(target, f"<{canonical}> ")
             return
         seg = Segment(kind=kind)
         st.segments.append(seg)
         st.stack.append(seg)
+
+    def _append_noise(self, target: Segment, text: str) -> None:
+        """Append a literal-text fragment (noise tag / stray closer /
+        depth-limit fallback) as a Word — v5 keeps ``words`` the single
+        primary representation of segment content."""
+        word = Word(text=text, segment=target,
+                    idx=self.state.word_count, is_hidden=target.is_hidden)
+        target.words.append(word)
+        target._text_cache = None
+        self.state.words.append(word)
+        self.state.word_count += 1
 
     def _ensure_response_segment(self) -> Segment:
         """RESPONSE == «вне тегов» (rule 2): implicit bottom-of-stack segment."""

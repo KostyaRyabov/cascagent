@@ -1,6 +1,12 @@
 # Модель парсера стрима LLM (итоговая, согласованная)
 
-Статус: обсуждение/проектирование — в коде ещё не реализовано.
+Статус: реализовано в `src/cascagent/stream_parser.py` (v0.1): класс
+парсера `ResponseParser`, базовая модель ниже + счётчики
+`token_offset`/`word_count`. Модель Word v5 (согласована 2026-10-12)
+реализована 2026-10-13 — см. раздел «Модель Word (v5 … РЕАЛИЗОВАНО)».
+Фактическое окно буфера: `max_buffer_chunks=256` (параметр конструктора
+ResponseParser, НЕ состояние; переполнение сбрасывает буфер одним WORD —
+правило 9).
 
 ## Раунд правок v2
 
@@ -20,7 +26,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
-class ParseStatus(str, Enum):
+class ResponseParser(str, Enum):
     """Насколько токены текущей итерации сформировали элемент."""
     PARTIAL = "partial"   # элемент ещё не дописан — ждём следующие чанки
     WORD = "word"         # слово явно замкнуто (пробел/пунктуация/граница сообщения)
@@ -47,12 +53,17 @@ class ParseState:
     """Единственное ТЕКУЩЕЕ состояние парсера."""
 
     # --- статус текущего элемента ---
-    status: ParseStatus = ParseStatus.PARTIAL
+    status: ResponseParser = ResponseParser.PARTIAL
     word: Optional[str] = None            # заполняется только при WORD / SPECIAL
 
     # --- реконструкция слов ---
     buffer: str = ""                      # просто строка недособранных токенов;
                                           # слово готово -> word = buffer; buffer = ""
+
+    # --- позиция в потоке (решение 2026-10-12) ---
+    token_offset: int = 0                 # порядковый номер текущего элемента,
+                                          # переданного плагинам
+    word_count: int = 0                   # число закоммиченных слов
 
     # --- сегменты ---
     segments: List[Segment] = field(default_factory=list)  # все собранные сегменты
@@ -61,14 +72,15 @@ class ParseState:
 
     # --- поток / протокол ---
     finish_reason: Optional[str] = None   # "stop" | "length" | "tool_calls" | None
+    error: Optional[str] = None           # кастомный текст при finish_reason == "error"
     done: bool = False                    # получен [DONE]
 ```
 
-**Финальная правка (раунд v3): `finish_reason` убран из `ParseStatus`.**
+**Финальная правка (раунд v3): `finish_reason` убран из `ResponseParser`.**
 Он есть у каждого `Segment` (как сегмент завершился) и остаётся в `ParseState` только как
 протокольное поле потока (почему остановилась генерация LLM). Дублировать его в статусе
 текущего элемента незачем — они могут не совпадать (поток закончился по "length",
-а открытый сегмент будет закрыт с "unclosed"). В `ParseStatus` остаются только
+а открытый сегмент будет закрыт с "unclosed"). В `ResponseParser` остаются только
 `PARTIAL` / `WORD` / `SPECIAL`.
 
 ## Что убрали по ходу обсуждения
@@ -81,17 +93,24 @@ class ParseState:
 - `source`, `open_tag`, `is_open_tag` — информация дублировала `kind`.
 - `truncated: bool` — заменён на `finish_reason` по аналогии с выводом LLM.
 - `children` -> `segments` (единая терминология: сегменты и подсегменты).
-- `finish_reason` из `ParseStatus` — дублировал `Segment.finish_reason` и протокольный `ParseState.finish_reason`.
+- `finish_reason` из `ResponseParser` — дублировал `Segment.finish_reason` и протокольный `ParseState.finish_reason`.
 
 ## Интерфейс плагина
 
 ```python
 class RuntimePlugin:
-    def on_upload(self, state: ParseState) -> Dict[str, Any]:
+    def on_upload(self, state: ParseState, context: dict) -> bool:
         """Вызывается когда элемент готов (WORD/SPECIAL).
-        Возврат: {"op": "continue" | "stop" | "error", ...}.
+        state и context передаются ПО ССЫЛКЕ — плагин редактирует state
+        на месте (счётчики, finish_reason, error), объект наружу не
+        возвращается. Возврат bool (финальное решение 2026-10-12):
+        True = всё хорошо, продолжать цикл; False = остановить поток.
+        При первом False агент смотрит state.finish_reason:
+        "stop" → чистый конец без ошибки; "error" или не задан →
+        RuntimeError (кастомный текст — в поле state.error).
+        op-словари и возврат ParseState сняты.
         Слово попадает в stack[-1].text, а special-элемент создаёт/закрывает сегмент
-        ТОЛЬКО если все плагины дали continue."""
+        ТОЛЬКО если все плагины вернули True."""
 ```
 
 ## Правила, зафиксированные в обсуждении
@@ -103,3 +122,73 @@ class RuntimePlugin:
 6. Опечатки в тегах: BKTree + Левенштейн по whitelist.
 7. Сегмент рождается и закрывается тем же голосованием плагинов, что и слово.
 8. На `[DONE]`/`finish_reason` все открытые сегменты закрываются с `finish_reason="unclosed"`, остаток `buffer` дописывается как слово.
+
+## Модель Word (v5, согласовано 2026-10-12 — РЕАЛИЗОВАНО 2026-10-13)
+
+Цель: превратить сегмент в редактируемую ленту слов — прямой доступ
+RuntimePlugin к словам (мутация, reorder, любые операции) для стрим-рендеринга
+конечному пользователю.
+
+```python
+@dataclass
+class Word:
+    text: str = ""              # текст слова ВМЕСТЕ с замыкающим delimiter
+                                # (решение C: не разделяем «слово» и «разделитель» —
+                                # word это совокупность токенов, delimiter часть текста)
+    segment: "Segment" = None   # прямая ссылка на свой сегмент (решение A: ссылки,
+                                # не индексы; о сериализации снапшотов пока не думаем)
+    idx: int = 0                # ГЛОБАЛЬНЫЙ порядковый номер слова от начала
+                                # генерации ответа (решение F), не внутри сегмента;
+                                # имя — просто idx (не birth_idx);
+                                # == позиция в глобальной ленте ParseState.words
+    is_hidden: bool = False     # наследуется от сегмента при коммите
+                                # (см. ниже Segment.kind); per-word override допустим
+
+@dataclass
+class Segment:
+    kind: SegmentKind
+    words: List["Word"] = field(default_factory=list)  # primary-представление
+    finish_reason: Optional[str] = None
+    segments: List["Segment"] = field(default_factory=list)
+    _text_cache: Optional[str] = None   # ленивый кэш derived text (решение B)
+
+    @property
+    def is_hidden(self) -> bool: ...    # THINK/TOOL_CALL → True (решение E)
+
+    @property
+    def text(self) -> str:
+        """Derived: ''.join(w.text for w in words). Ленивое кэширование,
+        инвалидация при любой мутации words (решение B). Есть back-compat
+        setter: запись текста заменяет слова одним Word."""
+
+    # helpers прямого управления (add_word/remove_word/move_word/reindex)
+```
+
+Реализация (2026-10-13): `ParseState.words` — глобальная лента всех
+закоммиченных Word (idx == позиция); `ResponseParser.commit()` создаёт Word
+при коммите (append-at-commit); шумовые теги тоже становятся Word
+(единственное представление контента). **Лидерское решение 2026-10-13:**
+никакого API сплошного текста для редактирования — управляем только словами
+и сегментами (прямой доступ + helpers).
+
+Зафиксированные решения:
+- **A. Владелец слов** — двусторонние ссылки (`word.segment`); циклические
+  ссылки допустимы, вопрос сериализации снапшотов отложен.
+- **B. Источник истины** — `words` первичен; `text` становится вычисляемым
+  property (лениво, если слов не касались). Обратная совместимость кода/плагинов
+  сохраняется через property.
+- **C. Delimiter** — хранится внутри `word.text` (слово замкнуто вместе с
+  пробелом/пунктуацией). Отдельного поля `tail` нет.
+- **D. Мутация** — разрешена после коммита слова (прохода всех RuntimePlugin):
+  append-at-commit, mutate-after. Обсуждается событийная система (подписка на
+  изменение слова/сегмента) для перерисовки уже отданного рендера — вне v0.1.
+- **E. Скрытие** — некоторые слова не отображаются пользователю вовсе; логика
+  привязана к `Segment.kind` (например, весь THINK-сегмент скрыт), слова
+  наследуют `is_hidden` от своего сегмента.
+- **F. Индексация** — доступны оба обращения: по объекту `Word` и по `idx`;
+  `idx` глобальный по всему ответу (монотонно растёт через сегменты,
+  совпадает по смыслу с счётчиком `word_count` парсера).
+
+Правило жизненного цикла: парсер создаёт `Word` в момент коммита элемента
+(статус WORD/SPECIAL прошёл голосование), добавляет в `stack[-1].words`;
+до коммита слово плагинам не видно (PARTIAL не доставляется — без изменений).

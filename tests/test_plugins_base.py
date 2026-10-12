@@ -113,33 +113,59 @@ class TestRuntimePlugin:
 
     def test_defaults_pass_through(self):
         p = self.Bare()
-        assert p.on_upload(None) == {"op": "continue"}
-        # should_stop is GONE — stop semantics live in on_upload ops.
+        assert p.on_upload(None, {}) is True     # default: keep the loop
+        # should_stop is GONE — stop semantics live in bool + finish_reason.
         assert not hasattr(RuntimePlugin, "should_stop")
         # on_stream_end is GONE — stream finalization is PostPlugin's job.
         assert not hasattr(RuntimePlugin, "on_stream_end")
         # on_token is GONE (2026-10-12) — plugins vote on parsed elements,
-        # raw tokens belong to the built-in StreamParser service.
+        # raw tokens belong to the built-in ResponseParser service.
         assert not hasattr(RuntimePlugin, "on_token")
 
-    def test_op_types_shape(self):
+    def test_bool_stop_contract(self):
+        """v5 API (2026-10-12): on_upload(state, context) returns bool —
+        True keeps the loop running, False stops it; state is edited IN
+        PLACE (passed by reference), never returned."""
         from cascagent.stream_parser import ParseState, ParseStatus
 
         class Stopper(self.Bare):
-            def on_upload(self, state):
+            def on_upload(self, state, context):
                 if state.word == "STOP":
-                    return {"op": "stop", "data": "tail"}
+                    state.finish_reason = "stop"
+                    return False
                 if state.word == "!!!":
-                    return {"op": "error", "data": "corrupted"}
-                return {"op": "continue"}
+                    state.finish_reason = "error"
+                    state.error = "corrupted output"
+                    return False
+                return True
 
         p = Stopper()
         mk = lambda w: ParseState(status=ParseStatus.WORD, word=w)
-        assert p.on_upload(mk("x")) == {"op": "continue"}
-        r = p.on_upload(mk("STOP"))
-        assert r["op"] == "stop" and r["data"] == "tail"
-        r = p.on_upload(mk("!!!"))
-        assert r["op"] == "error" and r["data"] == "corrupted"
+        s = mk("x")
+        assert p.on_upload(s, {}) is True
+        assert s.finish_reason is None           # keep generating
+        s = mk("STOP")
+        assert p.on_upload(s, {}) is False
+        assert s.finish_reason == "stop"         # edited in place
+        s = mk("!!!")
+        assert p.on_upload(s, {}) is False
+        assert s.finish_reason == "error"
+        assert s.error == "corrupted output"     # custom message field
+
+    def test_context_shared_by_reference(self):
+        """context is passed by reference — plugin mutations visible."""
+        from cascagent.stream_parser import ParseState, ParseStatus
+
+        class Note(self.Bare):
+            def on_upload(self, state, context):
+                context.setdefault("seen", []).append(state.word)
+                return True
+
+        ctx: dict = {}
+        p = Note()
+        p.on_upload(ParseState(status=ParseStatus.WORD, word="a"), ctx)
+        p.on_upload(ParseState(status=ParseStatus.WORD, word="b"), ctx)
+        assert ctx["seen"] == ["a", "b"]
 
 
 class TestPostPlugin:
@@ -166,16 +192,51 @@ class TestMemory:
         m.set("k", 1)
         assert m.get("k") == 1
 
-    def test_update_with_default(self):
+    def test_read_modify_write_via_set(self):
         m = Memory()
-        assert m.update("cnt", lambda x: x + 1, default=0) == 1
-        assert m.update("cnt", lambda x: x + 1, default=0) == 2
+        m.set("cnt", (m.get("cnt") or 0) + 1)
+        assert m.get("cnt") == 1
+        m.set("cnt", (m.get("cnt") or 0) + 1)
+        assert m.get("cnt") == 2
 
     def test_clear_empties_the_store(self):
         m = Memory()
         m.set("a", 1)
         m.clear()
         assert m.get("a") is None
+
+    def test_delete_removes_key_and_reports_count(self):
+        m = Memory()
+        m.set("a", 1)
+        assert m.delete("a") == 1              # glob matches exact key too
+        assert m.get("a") is None
+        assert m.delete("a") == 0              # already gone
+
+    def test_delete_glob_pattern(self):
+        """Deletion by glob: all matching keys removed, count returned."""
+        m = Memory()
+        m.set("tasks:1", {"id": 1})
+        m.set("tasks:2", {"id": 2})
+        m.set("other", 3)
+        assert m.delete("tasks:*") == 2
+        assert m.get("tasks:1") is None
+        assert m.get("tasks:2") is None
+        assert m.get("other") == 3
+
+    def test_delete_none_value_vs_absent(self):
+        """Stored None must be deletable as an existing key (count 1)."""
+        m = Memory()
+        m.set("a", None)
+        assert m.delete("a") == 1
+        assert m.delete("a") == 0
+
+    def test_delete_is_silent(self):
+        m = Memory()
+        seen = []
+        m.subscribe("*", lambda k, v: seen.append(k))
+        m.set("a", 1)
+        m.delete("*")
+        assert seen == ["a"]                   # only the set event
 
     def test_no_scope_bucket_all_apis(self):
         """Decision 2026-10-11: one Memory = one store. No scopes, no
@@ -203,7 +264,7 @@ class TestMemory:
         seen = []
         m.subscribe("*", lambda k, v: seen.append(k))
         m.set("a", 1)
-        m.update("b", lambda x: (x or 0) + 1, default=0)
+        m.set("b", (m.get("b") or 0) + 1)
         assert seen == ["a", "b"]
 
     def test_get_does_not_notify(self):
@@ -273,7 +334,7 @@ class TestHierarchy:
                 return messages
 
         ws, pr, ag = self._build()
-        ag.llm = lambda msgs: "ok"
+        ag.llm = iter(["ok"])
         ag.add_plugin(NoteTaker())
         ag.run([{"role": "user", "content": "q"}])
         assert ag.local_memory.get("touched") is True
@@ -283,10 +344,10 @@ class TestHierarchy:
 
     def test_global_memory_survives_iterations(self):
         class Counter(RuntimePlugin):
-            def on_upload(self, state):
+            def on_upload(self, state, context):
                 n = self.global_memory.get("units", 0)
                 self.global_memory.set("units", n + 1)
-                return {"op": "continue"}
+                return True
 
         ws, pr, ag = self._build()
         ag.llm = iter(["a ", "b "])
@@ -304,33 +365,171 @@ class TestHierarchy:
                         "metadata": {}, "action": "accept"}
 
         ws, pr, ag = self._build()
-        ag.llm = lambda msgs: "hello"
+        ag.llm = iter(["hello"])
         ag.add_plugin(Echo())
         res = ag.run([{"role": "user", "content": "q"}])
         assert res["response"] == "HELLO" and res["action"] == "accept"
 
     def test_runtime_stop_without_error(self):
+        """v5 API (2026-10-12): RuntimePlugin votes via
+        ``on_upload(state, context)`` returning bool; False stops the loop
+        and ``state.finish_reason`` (edited in place) says why. A stop vote
+        means the element is NOT committed to the segment tree
+        (docs/stream_parser_model.md §7 commit rule), so the stop-marker
+        word itself never reaches the response.
+
+        Chunk layout mirrors real SSE deltas: words close only on the
+        boundary chunk ('STOP' closes when ' junk' arrives). BEHAVIOR FIX
+        (2026-10-13): after a runtime stop the agent no longer flushes the
+        raw buffer tail into the segment tree — previously 'junk' leaked
+        into the response although the stream was cut short; now the
+        un-voted tail is discarded and the committed tree is the output."""
+        seen: list = []
+
         class Stopper(RuntimePlugin):
-            def on_token(self, token, accumulated):
-                if "STOP" in accumulated:
-                    return {"op": "stop", "data": ""}
-                return {"op": "continue"}
+            def on_upload(self, state, context):
+                seen.append(state.word)
+                if state.word == "STOP":
+                    state.finish_reason = "stop"
+                    return False
+                return True
 
         ws, pr, ag = self._build()
         ag.add_plugin(Stopper())
-        ag.llm = iter(["go", " ", "STOP", " junk"])
+        ag.llm = iter(["go ", "STOP", " junk"])
         res = ag.run([{"role": "user", "content": "q"}])
-        assert res["response"] == "go STOP"      # junk never appended
+        assert seen[-1] == "STOP"                # plugin saw the element
+        assert res["response"] == "go"           # STOP not committed,
+                                                 # un-voted tail dropped
+        assert res["finish_reason"] == "stop"    # stop WITHOUT error
 
     def test_runtime_error_raises(self):
+        """Guardian-style runtime veto: ``finish_reason = "error"``
+        surfaces as RuntimeError from ``Agent.run()`` (memory.py,
+        chunk-iterator path).
+        Votes happen per CLOSED element only — rule 1: punctuation is not a
+        unit type, it merely closes the current word and is DROPPED from the
+        payload (chunk 'oops!' yields WORD 'oops' — no trailing '!'), so a
+        guardian must veto on the bare corrupted word itself."""
         class Guardian(RuntimePlugin):
-            def on_token(self, token, accumulated):
-                if "!!!" in accumulated:
-                    return {"op": "error", "data": "corrupted output"}
-                return {"op": "continue"}
+            def on_upload(self, state, context):
+                if state.word == "corrupted":
+                    state.finish_reason = "error"
+                    state.error = "guardian: bad word"
+                    return False
+                return True
 
         ws, pr, ag = self._build()
         ag.add_plugin(Guardian())
-        ag.llm = iter(["a", "!!!", "b"])
-        with pytest.raises(RuntimeError, match="corrupted"):
+        ag.llm = iter(["ok ", "corrupted!", " b"])   # WORDs: 'ok', 'corrupted'
+        with pytest.raises(RuntimeError, match="guardian: bad word"):
             ag.run([{"role": "user", "content": "q"}])
+
+
+def test_bare_string_llm_is_rejected():
+    """Stream-only contract (decision 2026-10-13): the LLM must yield
+    chunks — a bare str is iterated character-by-character, which is NOT
+    a supported stream shape. Passing iter([str]) IS supported."""
+    from cascagent.memory import Agent
+    from cascagent.plugins.base import RuntimePlugin
+
+    seen = []
+
+    class Spy(RuntimePlugin):
+        def on_upload(self, state, context):
+            seen.append(state.word)
+            return True
+
+    # proper way: one-chunk iterator (caller wraps the string)
+    agent = Agent(name="a", llm=iter(["hello world"]))
+    agent.add_plugin(Spy())
+    res = agent.run([{"role": "user", "content": "hi"}])
+    assert res["response"] == "hello world"
+    assert len(seen) >= 2          # both words voted on
+
+
+def test_stop_via_vote_midstream():
+    from cascagent.memory import Agent
+    from cascagent.plugins.base import RuntimePlugin
+
+    class Stopper(RuntimePlugin):
+        def on_upload(self, state, context):
+            if state.word == "world":
+                state.finish_reason = "stop"
+                return False
+            return True
+
+    agent = Agent(name="a", llm=iter(["hello world stop-me"]))
+    agent.add_plugin(Stopper())
+    res = agent.run([{"role": "user", "content": "hi"}])
+    assert "stop-me" not in res["response"]
+    assert res["finish_reason"] == "stop"
+
+
+class TestWordModelV5:
+    """Word model v5 (docs/stream_parser_model.md) — implemented 2026-10-13.
+    Decisions A–F + lifecycle rule append-at-commit, mutate-after."""
+
+    @staticmethod
+    def _run(chunks):
+        from cascagent.stream_parser import ResponseParser
+        p = ResponseParser()
+        for c in chunks:
+            for ev in p.feed(c):
+                p.commit(ev)
+        p.finalize("stop")
+        return p
+
+    def test_words_primary_text_derived(self):
+        """B: words is primary; text is a derived lazy view."""
+        from cascagent.stream_parser import SegmentKind
+        p = self._run(["Hello ", "wor", "ld!"])
+        resp = p.state.segments[0]
+        assert [w.text for w in resp.words] == ["Hello ", "world "]
+        assert resp.text == "Hello world "           # derived property
+        assert resp._text_cache == "Hello world "     # cached after first read
+
+    def test_word_fields_and_global_idx(self):
+        """A/C/F: link back to segment, delimiter inside text,
+        idx global across segments == position on the tape."""
+        p = self._run(["a b ", "<think>", " c ", "</think>", " d"])
+        tape = p.state.words
+        assert [w.idx for w in tape] == list(range(len(tape)))
+        assert [w.text for w in tape] == ["a ", "b ", "c ", "d "]
+        kinds = [w.segment.kind.value for w in tape]
+        assert kinds == ["response", "response", "think", "response"]
+        # word_count counter == tape length
+        assert p.state.word_count == len(tape)
+
+    def test_is_hidden_inherited_from_kind(self):
+        """E: THINK/TOOL_CALL words hidden, RESPONSE visible."""
+        p = self._run(["out ", "<think>", " secret ", "</think>"])
+        by_kind = {w.segment.kind.value: w.is_hidden for w in p.state.words}
+        assert by_kind == {"response": False, "think": True}
+        # response_text() already skips think via segment kind
+        assert p.response_text() == "out"
+
+    def test_mutate_after_commit(self):
+        """D: edit/reorder/remove/add through direct access; reindex()
+        refreshes the derived text."""
+        p = self._run(["one two three"])
+        resp = p.state.segments[0]
+        resp.words[1].text = "TWO "       # mutate committed word
+        resp.reindex()
+        assert p.response_text() == "one TWO three"
+        last = resp.words[-1]
+        resp.move_word(last, 0)           # reorder
+        assert p.response_text() == "three one TWO"
+        assert resp.remove_word(last)     # remove
+        assert p.response_text() == "one TWO"
+        from cascagent.stream_parser import Word
+        resp.add_word(Word(text="x "))    # add (link fixed by helper)
+        assert resp.words[-1].segment is resp
+        assert p.response_text() == "one TWO x"
+
+    def test_noise_tag_is_a_word(self):
+        """Stray closers land in words too (single representation)."""
+        p = self._run(["a </nope> b"])
+        texts = [w.text for w in p.state.segments[0].words]
+        assert texts == ["a ", "</nope> ", "b "]
+        assert p.response_text() == "a </nope> b"

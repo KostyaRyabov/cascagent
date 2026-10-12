@@ -2,7 +2,7 @@
 
 > **Статус:** ✅ живой документ. Обновляется при закрытии/появлении пробелов.
 > Дата аудита: 2026-10-10.
-> Смежные документы: `docs/plugins.md` (плагинная архитектура, §5 SessionMemory),
+> Смежные документы: `docs/plugins.md` (плагинная архитектура, §5 память — иерархия Memory),
 > `docs/data.md` (модель данных), `docs/process.md` (процесс выполнения),
 > `docs/architecture.md` (обзор модулей), `AGENTS.md` (инструкция AI-разработчикам).
 
@@ -19,6 +19,7 @@
 7. [Итоговая карта новых сущностей](#7-итоговая-карта-новых-сущностей)
 8. [Чек-лист продакшн-MVP](#8-чек-лист-продакшн-mvp)
 9. [Открытые вопросы к обсуждению](#9-открытые-вопросы-к-обсуждению)
+10. [План работ: аудит код↔документация (2026-10-12)](#10-план-работ-аудит-коддокументация-2026-10-12)
 
 ---
 
@@ -114,8 +115,8 @@ embedding(brief) задачи → семантический поиск по в�
 
 | Плагин | Секция | Что ограничивает |
 |--------|--------|------------------|
-| `FirstTokenTimeout` | Trigger | максимум N сек до первого токена; иначе `action: stop` + ошибка таймаута |
-| `TotalResponseTimeout` | Trigger | максимум N сек на весь ответ (опционально) |
+| `FirstTokenTimeout` | Runtime | максимум N сек до первого токена; иначе `action: stop` + ошибка таймаута |
+| `TotalResponseTimeout` | Runtime | максимум N сек на весь ответ (опционально) |
 | `ExecutionTimeout` | Output (Executor) | максимум N сек на выполнение кода/команды атомарной задачи |
 
 ```toml
@@ -147,7 +148,7 @@ blocked — инструмент недоступен агентам вообщ�
 ### 3.2 #2 Prompt Injection через обогащение
 
 **Решение:** за санитизацию отвечает **встроенный системный плагин**
-`PromptInjectionGuard` (Input-секция; опционально Trigger-часть).
+`PromptInjectionGuard` (Pre-секция; опционально Runtime-часть).
 
 Что делает Input-часть (только над данными из внешних источников — RAG,
 semantic memory, research findings, siblings results; brief пользователя
@@ -187,31 +188,15 @@ mode = "sanitize"   # sanitize | warn | drop_block
 
 ### 3.3 #3 Восстановление после сбоев (Recovery)
 
-**Решение:** расширяем `SessionMemory` — помимо `global` и `local`
-добавляются **статистические данные** и **точки останова** для восстановления
-(см. `docs/plugins.md` §5, который нужно обновить заодно):
+**Решение (уточнено аудитом 2026-10-13):** SessionMemory не расширяем —
+её нет (плоская иерархия Memory, plugins.md §5). Вместо этого поверх KV
+нужны: `Memory.snapshot()` (ПЛАН, контракт §11.4.1), персистентный слой
+`PersistentStore` (ПЛАН, §6.5) и хранимые в project/global памяти ключи
+`stats:*` и `breakpoints:*`. API-надстройки из черновика
+(`set_stats/add_breakpoint/to_dump/from_dump`) переносятся как методы
+`BreakpointManager` (ПЛАН, §6.7), а не Memory.
 
-```python
-class SessionMemory:
-    _global: dict        # живёт всю сессию агента
-    _local: dict         # сбрасывается каждый run()
-    _stats: dict         # persist: счётчики, латентность, токены
-    _breakpoints: list   # persist: дампы state для resume
-```
-
-API-надстройки:
-
-```python
-def set_stats(self, key, value): ...          # то же, что global, но
-def get_stats(self, key, default=None): ...   # попадает в periodic dump
-def add_breakpoint(self, name: str, state: dict): ...
-def last_breakpoint(self) -> Breakpoint | None: ...
-def to_dump(self) -> dict: ...                # {global, stats, breakpoints}
-@classmethod
-def from_dump(cls, data: dict) -> "SessionMemory": ...
-```
-
-Персистентность: плагин `CheckpointSaver` (Output-секция) пишет
+Персистентность: плагин `CheckpointSaver` (Post-секция) пишет
 `to_dump()` в `sessions/{agent_name}/{session_id}.json` при ключевых
 событиях: успешный run, FAILED задачи, завершение поддерева. `reset_local()`
 НЕ трогает stats/breakpoints.
@@ -270,7 +255,7 @@ seed**, а не через гарантию идентичного вывода 
 
 - **Зависания (stuck/blocked generation):** покрываются timeout-плагинами
   (§3.1) + ожиданием: с изоляцией агентов и минимизацией контекста частота
-  мала. Дополнительно `StuckDetector` (Trigger): повторяющийся n-gram в
+  мала. Дополнительно `StuckDetector` (Runtime): повторяющийся n-gram в
   accumulated (окно 50 токенов, порог повтора 3) → `action: stop`, причина
   `stuck_repetition` → обычный путь FAILED→Reflect(retry).
 - **Галлюцинации:** детекция через **плагин** (решение владельца):
@@ -388,7 +373,7 @@ def put(new: MemoryEntry, threshold: float = 0.85):
     insert(new)
 ```
 
-Очистка — плагин `MemoryCleanup` (Init, периодический запуск):
+Очистка — плагин `MemoryCleanup` (вне секций — Init-плагина нет; периодический запуск через внешний вызов или Post):
 `cleanup(max_entries=10000, min_relevance=0.2, dry_run=False)` — удаляет
 (архивирует) наименее актуальные; всё настраивается в TOML `[memory]`.
 summary для длинных записей генерируется суммаризатором при remember()
@@ -505,10 +490,10 @@ class MCPTool:
 ```
 
 Инструменты, нужные только плагинам (git commit после задачи, нотификации),
-не попадают в промпт вообще — экономия токенов (ADR-005 в силе):
+не попадают в промпт вообще — экономия токенов (принцип минимального промпта, ADR-002):
 
 ```python
-class AutoGitCommit(OutputPlugin):
+class AutoGitCommit(PostPlugin):  # был OutputPlugin до переименования v3
     def __init__(self, git_tool: MCPTool): self.git = git_tool
     def on_output(self, response, context, session, memory):
         if context.get("task_success"):
@@ -601,24 +586,27 @@ Benchmark-регрессии — golden-набор в CI.
 
 ## 7. Итоговая карта новых сущностей (к реализации)
 
-**SessionMemory (plugins.md §5 — обновить!):** `_global`, `_local`,
-`_stats` (persist), `_breakpoints` (persist) + `to_dump()/from_dump()`.
+**Память (снято, аудит 2026-10-13):** SessionMemory с полями не будет —
+реализована плоская иерархия `Workspace/Project/Agent` + три flat-KV
+`Memory` (plugins.md §5). Для #3 Recovery поверх KV нужны: `snapshot()`
+(ПЛАН, контракт в plugins.md §11.4.1) и персистентный бэкенд
+`PersistentStore` (ПЛАН, §6.5; sqlite за тем же API Memory).
 
 **Новые плагины:**
 
 | Плагин | Секция | Пробел |
 |--------|--------|--------|
-| FirstTokenTimeout / TotalResponseTimeout | Trigger | #1 |
-| ExecutionTimeout | Output(Executor) | #1 |
-| PromptInjectionGuard | Input (+Trigger) | #2 |
+| FirstTokenTimeout / TotalResponseTimeout | Runtime | #1 |
+| ExecutionTimeout | Post (обёртка Executor) | #1 |
+| PromptInjectionGuard | Pre (+Runtime) | #2 |
 | CheckpointSaver / CheckpointLoader | Output / Init | #3 |
 | DebugTracer / StateSnapshotter | все / Output | #4 |
-| StuckDetector | Trigger | #5 |
+| StuckDetector | Runtime | #5 |
 | GroundingChecker | Output | #5 |
 | TraceExporter / MetricsWriter | Init+Output | #6 |
-| MemoryCleanup | Init (периодический) | #8 |
+| MemoryCleanup | вне секций (Init-плагина нет; периодический вызов) | #8 |
 | QualityScorer | Output | #15 |
-| HumanLoopPlugin | Output/Trigger | #19 |
+| HumanLoopPlugin | Post/Runtime | #19 |
 | AutoGitCommit (пример) | Output | #12 |
 
 **Новые режимы инструментов:** `exposed_to_llm` vs `callable_from_plugins`,
@@ -642,7 +630,7 @@ history|delete`.
 
 - [ ] #1 Timeout-плагины + модель разрешений tools (sandbox не делаем)
 - [ ] #2 PromptInjectionGuard (sanitize-режим по умолчанию)
-- [ ] #3 Recovery: stats+breakpoints в SessionMemory, CheckpointSaver,
+- [ ] #3 Recovery: snapshot()+PersistentStore (ПЛАН, plugins.md §6.5/§11.4.1), ключи stats:*/breakpoints:*, CheckpointSaver,
       `cascagent resume`
 - [ ] #4 Seed + полный слепок входа в истории + `replay`
 - [ ] #5 StuckDetector + refusal-детект (минимум; grounding — best effort)
@@ -661,21 +649,106 @@ port-этап (§1), full observability/dashboards.
 
 ## 9. Открытые вопросы к обсуждению
 
-1. **Детальный дизайн SessionMemory с 4 скоупами** — объём дампа, частота
-   checkpoint, ротация файлов sessions/ (предложение: gzip, хранить 20
-   последних на агента).
-2. **Протокол parent-child** — сигнатура вызова child-агента из плагина
+Закрытые (пересмотрены по факту кода, аудит 2026-10-12):
+- ~~SessionMemory с 4 скоупами~~ → **закрыт**: реализована плоская модель —
+  три независимых flat-KV `Memory` (workspace/project/agent, `memory.py`),
+  без дампов/ротации; checkpoint-дампы при необходимости строятся поверх KV.
+- ~~canonical_id vs lazy decomposition~~ → частично закрыт: дедупликация
+  живёт в `TaskParserPlugin` (static-методы `is_duplicate`/`is_parent_repeat`);
+  место semantic-dedup в конвейере уточнить при реализации `semantic.py`.
+
+Открытые:
+1. **Протокол parent-child** — сигнатура вызова child-агента из плагина
    (нужен ли event-loop или синхронный вложенный run достаточен?).
-3. **Условные задачи** — принять/отклонить мини-DSL валидатора из §4.6.2;
+2. **Условные задачи** — принять/отклонить мини-DSL валидатора из §4.6.2;
    как Decomposer легально предлагает условия, не нарушая ADR-003.
-4. **Финальный стек хранения** — SQLite остаётся (канвас, память, версии
+3. **Финальный стек хранения** — SQLite остаётся (канвас, память, версии
    промптов, метрики — всё в одной БД?) или отдельные файлы; Postgres не
-   рассматриваем (локальный однопоточный продукт без сервера).
-5. **canonical_id vs lazy decomposition** — где именно в конвейере делать
-   semantic-dedup подзадач (до detector-цикла или после; один проход или
-   фоновый job).
+   рассматриваем (локальный однопоточный продукт без сервера). От `Memory`
+   (in-memory dict) нужен переход к персистентному бэкенду — решение до
+   реализации Recovery-плагинов (#3).
+4. [x] **Соглашение об LLM-transport** (решение 2026-10-13): `Agent.run`
+   принимает ТОЛЬКО chunk-iterator (голый или `callable(messages)`);
+   строчный путь удалён, голосование `on_upload` едино для всех элементов;
+   зафиксировано в docs/plugins.md §4.2/§6.4. Enum статуса элемента
+   переименован `ParseStatus` → `ResponseParser`.
+
+## 10. План работ (аудит «код ↔ документация», 2026-10-12)
+
+### Фаза 0 — гигиена репозитория (без изменения поведения)
+- [x] Починить 2 падающих теста под текущий API: голосование Runtime-
+      плагинов идёт на parsed-элементах через `on_upload(state, context)`
+      (с 2026-10-12 возвращает ParseState со стоп-параметрами; op-словари
+      сняты), а не `on_token` (`tests/test_plugins_base.py::TestHierarchy::
+      test_runtime_stop_without_error`, `test_runtime_error_raises`).
+      — сделано (коммит 015073d, 2026-10-12).
+- [x] Унифицировать версию: `pyproject.toml` = 0.1.0 vs
+      `src/cascagent/__init__.py::__version__` = 0.2.0.
+      — сделано: приведено к 0.1.0 (ветка v0.1, работающего кода агента ещё нет).
+- [x] NOTICE (пустой файл) — заполнить attribution-текстом Apache-2.0.
+      — сделано: copyright + link to LICENSE + third-party notices.
+- [x] Entry point `cascagent = "cascagent.cli:main"` битый — модуля `cli.py`
+      нет; появляется в фазе 2 (либо временно убрать из pyproject).
+      — сделано: закомментирован в pyproject.toml с пометкой «включить в фазе 2».
+
+### Фаза 1 — рефакторинг документации (привести к фактическому состоянию кода)
+- [x] `AGENTS.md` §2.3/§6: дерево src приведено к факту (2026-10-13):
+      parser.py/detector.py убраны, добавлены memory.py, stream_parser.py,
+      plugins/base.py, plugins/task_parser.py.
+- [x] `AGENTS.md` §7 (2026-10-13): v3-слой признан реализованным досрочно;
+      этапы размечены ✅/⬜ по факту.
+- [x] `AGENTS.md` §10 (2026-10-13): «код ещё на v1» снят; реализовано =
+      models/memory/stream_parser/plugins/bk_tree; ближайшие шаги = фаза 2.
+- [x] `docs/plugins.md`: §4 переписан под фактические секции Pre
+      (`on_input(messages, context)`) / Runtime (`on_upload(state, context)`;
+      `on_token` удалён 2026-10-12; с 2026-10-12 контракт — возврат ParseState
+      со стоп-параметрами finish_reason) / Post (`on_output`); §5–§6 приведены
+      к фактической модели (flat-KV Memory ×4 уровня + подписки, delete по
+      glob; SessionMemory/AgentSession/MemoryStore/BreakpointManager помечены
+      ПЛАН); §7 каталог приведён к факту (реализован TaskParserPlugin;
+      Init/Input/Trigger/Output-каталоги — planned); §10 структура проекта
+      сверена с деревом; ссылки на
+      несуществующие `parser.py`/`detector.py`/`enricher.py` (строки ~299,
+      1543, 1564).
+- [x] `docs/architecture.md` §2 (2026-10-13): таблица модулей переписана под
+      фактическое дерево + статусы done/planned; строки parser.py/detector.py
+      заменены на plugins/task_parser.py; cache_manager помечен отложенным.
+- [x] `docs/protocol.md` §9 (2026-10-13): чеклист миграции закрыт (парсинг
+      живёт в plugins/task_parser.py, parser.py/detector.py удалены).
+- [x] `docs/algorithms.md` (2026-10-13): §6 DuplicateDetector помечен
+      «реализовано в plugins/task_parser.py»; §2/§5 сверены.
+- [x] `docs/prompts.md` §5 (2026-10-13): помечен целевым дизайном (draft до
+      Этапа 5 — модулей агентов в коде нет).
+- [x] `docs/stream_parser_model.md` (2026-10-13): статус = реализовано
+      (ResponseParser + Word v5); зафиксировано фактическое окно
+      max_buffer_chunks=256.
+- [x] Ссылки на несуществующие ADR исправлены (2026-10-13): plugins.md
+      ADR-007→ADR-003, roadmap.md ADR-005→ADR-002 (заводить новые ADR не нужно).
+- [x] README.md (2026-10-13): написан честный статус v0.1 вместо TODO.
+
+### Фаза 2 — терминальный агент (минимальный сквозной путь CLI → LLM → Kanban)
+Порядок зависимостей: client → history → kanban → orchestrator → cli → e2e.
+- [ ] `client.py`: `LlamaCppClient` — async-итератор чанков (OpenAI-совместимый
+      `/completion` llama.cpp server), параметры seed/max_tokens/stop, think-
+      режим; transport инъектируем (для MockLLM).
+- [ ] `history.py`: JSONL-история вызовов + debug.log (формат — docs/data.md §3).
+- [ ] `kanban.py`: SQLite-хранилище дерева задач (schema — docs/data.md).
+- [ ] Оркестратор `execute_task` (декомпозиция ленивая, ADR-004): поверх
+      `Agent.run()` + TaskParserPlugin; цикл brief→decompose→child…; здесь же
+      решается протокол parent-child (§9.1).
+- [ ] `cli.py` + фикс entry point: `--query`, `--max-depth`, рендер дерева,
+      режимы resume/replay (зависит от #3/#4 MVP-чеклиста).
+- [ ] `MockLLM` (roadmap #7) + e2e-тест «CLI → mock → дерево задач» — без сети.
+- [ ] `cache_manager.py` — ОТЛОЖЕН (зависит от slot-API llama.cpp; не блокирует MVP).
+
+### Фаза 3 — закрытие MVP-чеклиста (§8) после фазы 2
+Порядок: #5 StuckDetector → #2 PromptInjectionGuard → #1 timeout/tools →
+#3 Recovery (упирается в §9.3 — выбор персистентного бэкенда Memory) →
+#4 seed/replay → #6 observability.
 
 ---
 
 *Документ закрывает аудит 2026-10-10. Решения колонок «Решение» окончательны
-и не пересматриваются без нового ADR; пункты с 💡 требуют обсуждения (§9).*
+и не пересматриваются без нового ADR; пункты с 💡 требуют обсуждения (§9).
+План работ по синхронизации документации с кодом и путь к терминальному
+агенту — §10 (аудит 2026-10-12).*

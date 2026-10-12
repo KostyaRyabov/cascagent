@@ -9,7 +9,7 @@ former ``InitPlugin`` section is removed — its role is covered by
 plugins/task_parser.py). The former standalone module ``cascagent.parser``
 and ``detector.py`` are deleted. Think/response splitting is NOT a plugin
 anymore: ``OutputSplitterPlugin`` was removed (2026-10-12) — stream
-structure is now the job of the built-in agent service ``StreamParser``
+structure is now the job of the built-in agent service ``ResponseParser``
 (cascagent.stream_parser, spec: docs/stream_parser_model.md).
 """
 
