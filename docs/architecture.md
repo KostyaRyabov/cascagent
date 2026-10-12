@@ -1,6 +1,9 @@
 # cascagent — Архитектура
 
-> Обновлено под **архитектуру v2** (ультра-простая декомпозиция).
+> Обновлено под **архитектуру v2** (ультра-простая декомпозиция) и
+> **ролевую модель v6** (ADR 005: Orchestrator = уровень декомпозиции,
+> привязка агента после PrePlugin). Источник истины по ролям агентов и
+> жизненному циклу — `docs/product.md` §4; здесь — модульный разрез.
 > Полная спецификация протокола — `docs/protocol.md`.
 > Продуктовое видение и системные агенты — `docs/product.md`.
 > Реестр CPU-алгоритмов (что делает CPU, чтобы не нагружать GPU) — `docs/cpu-offload.md`.
@@ -14,17 +17,23 @@ cascagent рекурсивно декомпозирует задачу поль�
 декомпозиции с **минимальным промптом (~480 символов)**; модель не знает про
 категории, RAG, память и формат — вся обвязка детерминированные CPU-алгоритмы.
 
-```
-                ┌────────────── ОРКЕСТРАТОР (CPU) ──────────────┐
-CLI (--query)──► DecomposerSession ──► LlamaCppClient ──► llama.cpp server
-      │               ▲   │                                      │
-      │        Enricher│   ▼ raw text                            ▼
-      │      (RAG+seman)│  parser.parse_decomposition ──► Task[] │
-      │               │   ▼                                     │
-      │        DuplicateDetector → Kanban (SQLite) ◄── Executor ┘
-      │               ▼
-      └── tree/statistics   History (JSONL + debug.log)
-                              ReflectAgent / ResearchAgent (при сбоях)
+Диспетчером очередей остаётся детерминированный CPU-конвейер (A10/A11);
+LLM-агенты исполняют задачи внутри своих ролей (product.md §4, v6):
+атомы — Executor, неатомы — Orchestrator своего уровня (бывш. ConflictResolver,
+ADR 005), decomposition вызывается как PrePlugin (agent-as-tool).
+
+```mermaid
+flowchart LR
+    CLI[cli.py] --> DISP[CPU-конвейер<br/>A10/A11 диспетчер]
+    DISP -->|PENDING атом| EX[executor.py<br/>ExecutorAgent]
+    DISP -->|PENDING неатом| ORC[orchestrator.py<br/>Orchestrator уровня N]
+    ORC -->|PrePlugin decompose| DEC[plugins/task_parser.py<br/>+decomposer.py]
+    ORC -->|дети| KB[(kanban.py<br/>SQLite)]
+    EX -->|research tool| RES[researcher.py<br/>ResearchAgent]
+    EX -->|result| KB
+    ORC -->|сводка детей, confirm/redecompose/ask| KB
+    KB -->|FAILED после retry| REF[reflector.py<br/>ReflectAgent]
+    DISP --> HIST[(history.py<br/>JSONL + SQL-зеркало)]
 ```
 
 Формат вывода модели: `Название` (без отступа) + `    Описание` (с отступом);
@@ -42,17 +51,62 @@ Details: docs/protocol.md §2–3.
 | `plugins/task_parser.py` | SYSTEM_PROMPT + парсинг декомпозиции v2, дедуп (0.75), атомарность (поглотил parser.py+detector.py, удалены 2026-10-12) | ✅ v0.1 реализовано |
 | `bk_tree.py` | BK-tree fuzzy поиск инструментов, fix_typo | ✅ Этап 4 (метрики + stats + rebalance) |
 | `history.py` | JSONL история LLM-вызовов + debug.log (THINK / FINAL RESPONSE); опциональный Kanban-конструктор: зеркало в llm_calls + semantic_memory (RAG-переиспользование, recall_similar) | ✅ Этап 1 реализовано (+SQL-зеркало, тесты tests/test_history.py) |
-| `client.py` | OpenAI-совместимый клиент llama.cpp, think параметр, chunk-iterator | ⬜ Этап 2 |
+| `client.py` | OpenAI-совместимый клиент llama.cpp, think параметр, chunk-iterator | ✅ v0.1 реализовано |
 | `cache_manager.py` | save/restore KV-кэша через /slots API | ⬜ отложен (slot API нет) |
 | `decomposer.py` | DecomposerSession: одна задача = один изолированный вызов | ⬜ Этап 3 |
-| `kanban.py` | SQLite хранилище состояний задач | ⬜ Этап 3 |
+| `kanban.py` | SQLite хранилище состояний задач | ✅ v0.1 реализовано |
 | `cli.py` | argparse интерфейс, рендер дерева и статистики | ⬜ Этап 3 |
 | `enricher.py` | ContextEnricher: RAG + semantic recall + siblings + сжатие | ⬜ Этап 4+ |
-| `executor.py` | TaskExecutor (выполнение атомарной задачи) | ⬜ Этап 4+ |
+| `executor.py` | ExecutorAgent: выполнение ТОЛЬКО атомарных задач; MCP tools, Researcher как tool (product §4 v6) | ⬜ Этап 4+ |
+| `orchestrator.py` | OrchestratorAgent (бывш. ConflictResolver, ADR 005): неатомные задачи как оркестратор своего уровня + аварийный режим тупиков | ⬜ план |
 | `reflector.py` | ReflectAgent: анализ провалов, обратная связь | ⬜ Этап 4+ |
-| `researcher.py` | ResearchAgent: изолированный сбор информации | ⬜ Этап 4+ |
+| `researcher.py` | ResearchAgent: изолированный сбор информации (единственный, кто ищет) | ⬜ Этап 4+ |
+| `summarizer.py` | SummarizerAgent: краткая сводка артефактов по запросу агента (опциональный) | ⬜ план |
+| `validator.py` | ValidatorAgent: проверка результата через PostPlugin (механика передачи контекста — открытый вопрос, см. product §4) | ⬜ план |
 | `semantic.py` | SemanticMemory (эмбеддинги + cosine, remember/recall) | ⬜ Этап 4 |
 | `rag.py` | BM25 + vector search по документации | ⬜ Этап 4 |
+
+## 2.1 Ролевая модель v6 в модульном разрезе (ADR 005)
+
+Источник истины по ролям и жизненному циклу — `docs/product.md` §4; здесь —
+как роли раскладываются на модули и кто что вызывает.
+
+**Ключевые правила:**
+- **Привязка агента — после PrePlugin.** ENRICHMENT = сначала PrePlugin-секция
+  (DecomposeTool agent-as-tool, Enricher, recall/RAG), затем CPU-диспетчер по
+  собранным фактам выбирает исполнителя: `is_atom=True` → `executor.py`;
+  `is_atom=False`, есть дети → `orchestrator.py`; тупик → `orchestrator.py`
+  (аварийный режим). Вывод Decomposer — ФАКТ для диспетчера, а не приказ:
+  «сбой» (неатом оказался атомом) — штатный путь, пересмены роли внутри
+  исполнения нет, Kanban-задача едина (ADR 004 — повторной декомпозиции нет).
+- **Двухконтурное исполнение.** Контур атомов (дешёвый): Executor → PostPlugin
+  → DONE, без LLM-оркестрирования. Контур неатомов (дорогой, рекурсивный):
+  Orchestrator уровня N: decompose → дети в Kanban → дождаться детей → сводка
+  результатов детей как контекст → подтвердить DONE / редекомпозировать / ask
+  пользователю. Каждый уровень — свой экземпляр Orchestrator со своим контекстом.
+- **Agent-as-tool.** Подача подагента вызывающему — как MCP tool: Executor
+  зовёт `research(question)` (`researcher.py`); Orchestrator зовёт
+  `decompose(task)` (PrePlugin-секция `plugins/task_parser.py` + `decomposer.py`)
+  и опционально `summarize(artifact)` (`summarizer.py`). Пользователь может
+  добавлять своих агентов и выбирать, кто их может вызывать.
+- **Изоляция контекста.** Поиск выполняет только Researcher — остальные агенты
+  получают уже готовую сводку (≤ K токенов), чтобы не раздувать чат.
+
+```mermaid
+flowchart TD
+    subgraph PRE[Этап ENRICHMENT: PrePlugin до привязки агента]
+        P1[DecomposeTool<br/>agent-as-tool] --> P2{Факты:<br/>is_atom? дети?}
+        P3[Enricher / recall / RAG] --> P2
+    end
+    P2 -- "is_atom=True<br/>(штатный 'сбой' Decomposer)" --> EXM[executor.py<br/>ExecutorAgent]
+    P2 -- "is_atom=False" --> ORM[orchestrator.py<br/>Orchestrator уровня N]
+    EXM -- tool research --> RESM[researcher.py]
+    ORM -- PrePlugin decompose --> DEC[decomposer.py]
+    ORM -- ждёт детей --> KB[(kanban.py)]
+    ORM -. опц. summarize .-> SUM[summarizer.py]
+    style EXM fill:#e8f5e9,stroke:#2a7
+    style ORM fill:#eef,stroke:#66c
+```
 
 Полный реестр CPU-алгоритмов (что делает CPU, чтобы не нагружать GPU/LLM) —
 `docs/cpu-offload.md`; продуктовые сценарии и таблица системных агентов —
@@ -101,7 +155,7 @@ stack.md §5. Архитектурное следствие для всех мо
 |---|---|
 | `docs/principles.md` | философия и архитектурные принципы, название, лицензия |
 | `docs/protocol.md` | протокол общения с моделью v2 (формат вывода, Task-контракт) |
-| `docs/product.md` | продукт: миссия, сценарии, системные агенты, state machine |
+| `docs/product.md` | продукт: миссия, сценарии, системные агенты, ролевая модель v6, state machine, mermaid (жизненный цикл) |
 | `docs/cpu-offload.md` | реестр CPU-алгоритмов P1–P9 / A1–A13 vs LLM-вызовы |
 | `docs/algorithms.md` | эталонные реализации CPU-алгоритмов (BK-tree, fuzzy, memory, RAG, YAML) |
 | `docs/bk_tree_diagrams.md` | Mermaid-схемы BK-tree: архитектура, add/query, ребалансировка, интеграция |
@@ -115,7 +169,7 @@ stack.md §5. Архитектурное следствие для всех мо
 | `docs/operations.md` | эксплуатация: железо, установка, мониторинг, troubleshooting (Глава XI) |
 | `docs/plugins.md` | плагинная архитектура агентов v3: секции Pre/Runtime/Post, иерархия Memory (Workspace/Project/Agent), план TOML-конфигов (Этап 5+) |
 | `docs/roadmap.md` | аудит пробелов (20) + решения: timeout/guard/recovery, чек-лист продакшн-MVP |
-| `docs/decisions/` | ADR 001–004 (движок, минимальный промпт, без категорий, ленивая декомпозиция) |
+| `docs/decisions/` | ADR 001–005 (движок, минимальный промпт, без категорий, ленивая декомпозиция, Orchestrator + привязка после PrePlugin) |
 
 Решения «CPU-offload», «изоляция агентов» (principles.md §2.1) и
 «атомарность только `<atom>`» (principles.md §3, AGENTS.md §8.1) приняты и
@@ -127,3 +181,6 @@ stack.md §5. Архитектурное следствие для всех мо
 - После Этапа 2: разделы «Клиент и think-режим», «KV-кэш префиксов».
 - После Этапа 3: «Алгоритм DecomposerSession», «Формат вывода CLI» (end-to-end).
 - После Этапа 4: «BK-tree», «SemanticMemory», «RAG», «ContextEnricher».
+- При старте ролевой модели v6 (ADR 005): разделы «ExecutorAgent» (MCP tools,
+  research-as-tool) и «OrchestratorAgent» (цикл уровня: decompose → wait →
+  сводка → confirm/redecompose/ask; аварийный режим тупиков).
