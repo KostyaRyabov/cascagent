@@ -159,7 +159,7 @@ class Agent:
 
     def __init__(self, name: str, project: Optional["Project"] = None,
                  llm: Any = None, pre_plugins=(), runtime_plugins=(),
-                 post_plugins=()) -> None:
+                 post_plugins=(), parser_config: Optional[Dict[str, Any]] = None) -> None:
         self.name = name
         self.llm = llm
         self.project = project
@@ -174,6 +174,23 @@ class Agent:
         self.post_plugins: List[Any] = []
         for plugin in (*pre_plugins, *runtime_plugins, *post_plugins):
             self.add_plugin(plugin)   # add_plugin routes by section type
+
+        #: Built-in stream-structuring service (NOT a plugin, decision
+        #: 2026-10-12; spec docs/stream_parser_model.md). Fresh instance
+        #: per run(); config comes from the [parser] section (config.md).
+        self.parser_config: Dict[str, Any] = dict(parser_config or {})
+
+    def _make_parser(self):
+        """Instantiate StreamParser from ``parser_config`` (agent-owned)."""
+        from cascagent.stream_parser import StreamParser
+        cfg = self.parser_config
+        kwargs: Dict[str, Any] = {}
+        if "whitelist" in cfg:
+            kwargs["whitelist"] = tuple(cfg["whitelist"])
+        for key in ("max_depth", "fuzzy_max_distance", "max_buffer_chunks"):
+            if key in cfg:
+                kwargs[key] = cfg[key]
+        return StreamParser(**kwargs)
 
     # -- plugin wiring --------------------------------------------------
     def add_plugin(self, plugin: Any) -> Any:
@@ -212,36 +229,68 @@ class Agent:
     # -- one full iteration ----------------------------------------------
     def run(self, messages: List[Dict[str, str]],
             context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """PRE → LLM → RUNTIME(stream) → POST. First act: wipe local scope."""
+        """PRE → LLM → RUNTIME(stream via built-in StreamParser) → POST.
+
+        First act: wipe local scope. The agent owns the StreamParser
+        service (docs/stream_parser_model.md): raw chunks become WORD /
+        SPECIAL elements; every element is delivered to ALL runtime
+        plugins (on_upload) and applied to the segment tree ONLY if all
+        of them vote continue.
+        """
         self.local_memory.clear()
         context = dict(context or {})
 
         for plugin in self.pre_plugins:
             messages = plugin.on_input(messages, context)
 
+        parser = self._make_parser()
+        #: Expose the live state to post-plugins / debugging via local memory.
+        self.local_memory.set("parse_state", parser.state)
         response = ""
         if self.llm is not None:
-            # LLM seam: callable(messages) -> str | token iterator, or a
-            # bare token iterator (tests/fakes).
+            # LLM seam: callable(messages) -> str | chunk iterator, or a
+            # bare chunk iterator (tests/fakes). Chunks are raw SSE
+            # delta.content pieces — the parser assembles words from them.
             gen = self.llm(messages) if callable(self.llm) else self.llm
+            stop: Optional[Dict[str, Any]] = None
             if isinstance(gen, str):          # fake/test LLM: whole text
-                response = gen
-            else:                              # real LLM: token iterator
-                stop: Optional[Dict[str, Any]] = None
-                for token in gen:
-                    response += token
-                    for rt in self.runtime_plugins:
-                        res = rt.on_token(token, response)
-                        op = res.get("op", "continue")
-                        if op != "continue":
-                            stop = {"op": op, **res}
+                for ev in parser.feed(gen):
+                    parser.commit(ev)         # no runtime vote on a string LLM
+                parser.finalize("stop")
+            else:                             # real LLM: chunk iterator
+                for chunk in gen:
+                    if chunk == "[DONE]":
+                        break
+                    response += chunk
+                    for ev in parser.feed(chunk):
+                        status, payload = ev
+                        parser.state.status = status
+                        parser.state.word = payload
+                        voted = None
+                        for rt in self.runtime_plugins:
+                            res = rt.on_upload(parser.state)
+                            op = res.get("op", "continue")
+                            if op != "continue":
+                                voted = {"op": op, **res}
+                                break
+                        if voted is not None:
+                            stop = voted   # element NOT committed (vote rule)
                             break
+                        parser.commit(ev)
                     if stop is not None:
                         break
+                parser.finalize(stop["op"] if stop else "stop")
                 if stop is not None and stop["op"] == "error":
                     raise RuntimeError(f"runtime stopped with error: {stop}")
+            response = parser.response_text() or response
 
-        result: Dict[str, Any] = {"response": response, "context": context}
+        context.setdefault("response", response)
+        context.setdefault("think", "".join(
+            s.text for s in parser.state.segments
+            if s.kind.name == "THINK").strip())
+        result: Dict[str, Any] = {"response": response, "context": context,
+                                  "segments": parser.state.segments,
+                                  "finish_reason": parser.state.finish_reason}
         for plugin in self.post_plugins:
             r = plugin.on_output(response, context)
             response = r.get("response", response)
