@@ -9,8 +9,10 @@ of tags»).
 Responsibility: consume raw streamed chunks (llama.cpp SSE ``delta.content``
 or plain token strings), split them into words / service tags and maintain
 the single live ``ParseState``. Runtime plugins vote on each ready element
-via ``RuntimePlugin.on_upload(state)``; an element is applied to the
-segment tree ONLY when every plugin returned ``{"op": "continue"}``.
+via ``RuntimePlugin.on_upload(state, context)`` (decision 2026-10-12: the
+hook receives the shared run context and returns the ParseState — stop is
+requested by editing ``state.finish_reason``); an element is applied to the
+segment tree ONLY when every plugin left ``finish_reason`` empty.
 
 Fixed rules (docs/stream_parser_model.md §«Правила»):
 1. Punctuation is not a unit type — it only closes the current word.
