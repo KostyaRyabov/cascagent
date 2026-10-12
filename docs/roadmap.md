@@ -490,10 +490,10 @@ class MCPTool:
 ```
 
 Инструменты, нужные только плагинам (git commit после задачи, нотификации),
-не попадают в промпт вообще — экономия токенов (ADR-005 в силе):
+не попадают в промпт вообще — экономия токенов (принцип минимального промпта, ADR-002):
 
 ```python
-class AutoGitCommit(OutputPlugin):
+class AutoGitCommit(PostPlugin):  # был OutputPlugin до переименования v3
     def __init__(self, git_tool: MCPTool): self.git = git_tool
     def on_output(self, response, context, session, memory):
         if context.get("task_success"):
@@ -728,9 +728,8 @@ port-этап (§1), full observability/dashboards.
 - [ ] `docs/stream_parser_model.md`: снять неявную метку «не реализовано» —
       `ResponseParser` реализован и протестирован; добавить ссылку на
       реализацию и зафиксировать фактическое окно (window_size).
-- [ ] Ссылки на несуществующие ADR: `docs/plugins.md:1729` (ADR-007),
-      `docs/roadmap.md:508` (ADR-005) — либо завести ADR-005/007, либо
-      переписать ссылки на существующие ADR-001..004 / решения этого файла.
+- [x] Ссылки на несуществующие ADR исправлены (2026-10-13): plugins.md
+      ADR-007→ADR-003, roadmap.md ADR-005→ADR-002 (заводить новые ADR не нужно).
 - [ ] README.md — сверить раздел «статус» с новым AGENTS.md §10.
 
 ### Фаза 2 — терминальный агент (минимальный сквозной путь CLI → LLM → Kanban)

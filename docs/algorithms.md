@@ -215,10 +215,11 @@ def search(self, query: str, top_k: int = 3):
 Fallback без extras: чистый FTS5-индекс SQLite (BM25 встроен в SQLite) — тогда
 vector-ступень отсутствует, качество ниже, но режим работает.
 
-## 5. RobustYAMLParser — толерантный разбор «почти YAML» (кандидат в `parser.py`)
+## 5. RobustYAMLParser — толерантный разбор «почти YAML» (кандидат)
 
 Статус: **зарегистрирован, не реализован** (вывод декомпозиции парсится
-отступами, не YAML — prompts §4). Нужен для внешних форматов: манифесты
+отступами, не YAML — prompts §4; отдельного `parser.py` больше нет —
+парсинг v2 живёт в `plugins/task_parser.py`). Нужен для внешних форматов: манифесты
 MCP-инструментов, настройки config.toml-редакторов, ответы сторонних агентов.
 Порог реализации — первый этап, где появляется импорт чужих YAML'ов. Стратегии применяются по нарастанию
 агрессивности, первая успешная выигрывает:
@@ -234,24 +235,25 @@ MCP-инструментов, настройки config.toml-редакторо�
 ретрай с подсказкой формата (cpu-offload §2.3), молчаливый partial-parse
 запрещён (лучше явно упасть, чем взять половину манифеста).
 
-## 6. DuplicateDetector — защита от зацикливания (`detector.py`)
+## 6. DuplicateDetector — защита от зацикливания (реализовано в `plugins/task_parser.py`)
 
-Эталон API — `src/cascagent/detector.py::DuplicateDetector` (реализован;
-порог `similarity_threshold` из config, дефолт 0.75). Контракт методов:
+Реализация — статические методы `TaskParserPlugin` (`similarity`,
+`is_parent_repeat`, `is_duplicate`; порог `similarity_threshold`, дефолт
+0.75; отдельный класс `DuplicateDetector` и модуль `detector.py` удалены
+2026-10-12 при поглощении parser/detector плагином). Контракт:
 
 ```python
-class DuplicateDetector:
-    def __init__(self, threshold: float = 0.75):
-        self.threshold = threshold
-
-    def similarity(self, a: str, b: str) -> float:      # normalize + SequenceMatcher
-        a, b = self._norm(a), self._norm(b)
-        return 1.0 if a == b else SequenceMatcher(None, a, b).ratio()
-
-    def is_duplicate(self, new: str, existing: list[str]) -> bool: ...
-    def is_parent_repeat(self, task: str, parent: str) -> bool: ...
-    def detect_cycle(self, task: str, ancestors: list[str]) -> bool: ...
-    def find_duplicates(self, tasks: list[str]) -> list[tuple[int, int, float]]: ...
+class TaskParserPlugin(PostPlugin):
+    @staticmethod
+    def similarity(a: str, b: str) -> float: ...   # normalize + SequenceMatcher
+    @staticmethod
+    def is_parent_repeat(child_brief: str, parent_brief: str,
+                         threshold: float = 0.75) -> bool: ...
+    @staticmethod
+    def is_duplicate(new_brief: str, existing: List[str],
+                     threshold: float = 0.75) -> bool: ...
+    # detect_cycle / find_duplicates — ПЛАН (не реализованы):
+    # антицикл по предкам (A7) и пакетный поиск пар повторов (для history)
 ```
 
 ### 6.1. normalize() — общий канон сравнения

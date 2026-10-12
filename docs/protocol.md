@@ -243,15 +243,12 @@ prompt минимален (~110 токенов), поля `title/acceptance/bloc
 ## 9. Миграция кодовой базы (чеклист)
 
 - [x] Документация v2 принята (этот файл, AGENTS.md §2.3–7/§10, architecture.md)
-- [ ] `models.py`: `TaskStatus`, новый `Task(brief, description, ...)`,
-      удалить `TaskCategory`/`SYMBOL_TO_CATEGORY`; `DecompositionCall` под v2
-- [ ] `parser.py`: `SYSTEM_PROMPT`, `ATOM_MARKER`, `is_atomic()`,
-      `parse_decomposition()`, `build_user_prompt()`;
-      удалить `detect_category`, `parse_response`, старую сборку prompt;
-      `split_think_and_response`, `sanitize_line` — без изменений
-- [ ] `detector.py`: API на `task.brief` вместо `task.title` (логика та же)
-- [ ] Тесты parser/detector переписать под v2-формат (+тест на §3.7)
+- [x] `models.py`: `TaskStatus`, новый `Task(brief, description, ...)`, snowflake-ID,
+      `embed()`; `TaskCategory`/`SYMBOL_TO_CATEGORY` удалены (миграция завершена)
+- [x] Парсинг v2 (`SYSTEM_PROMPT`, `ATOM_MARKER`, атомарность, дедуп 0.75) живёт в
+      `plugins/task_parser.py`; `parser.py`/`detector.py` удалены 2026-10-12
+      (поглощены TaskParserPlugin); тесты переписаны под v2-формат (+§3.7)
 - [ ] history.py — по спецификации v2 (JSONL + debug.log, THINK/FINAL RESPONSE)
-- [ ] Этапы 2–6 (client, cache_manager, decomposer/kanban/cli, bk_tree,
-      semantic, rag, enricher/executor/reflector/researcher)
+- [ ] Этапы 2–6 (client, cache_manager, decomposer/kanban/cli, bk_tree*,
+      semantic, rag, enricher/executor/reflector/researcher) (*bk_tree уже реализован)
       — по AGENTS.md §6–7

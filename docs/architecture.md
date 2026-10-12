@@ -35,12 +35,15 @@ Details: docs/protocol.md §2–3.
 
 | Модуль | Назначение | Статус |
 |--------|-----------|--------|
-| `models.py` | Task(brief, description, status), TaskStatus, DecompositionCall | 🚧 миграция v1→v2 |
-| `parser.py` | SYSTEM_PROMPT, split_think_and_response, sanitize_line, parse_decomposition, is_atomic, build_user_prompt | 🚧 миграция v1→v2 |
-| `detector.py` | DuplicateDetector (SequenceMatcher, порог 0.75, по brief) | 🚧 адаптация API |
+| `models.py` | Task(brief, description, status), TaskStatus, snowflake-ID, embed() | ✅ v2 принят (миграция завершена) |
+| `memory.py` | Memory (flat-KV + glob-подписки), Workspace/Project/Agent (оркестратор run()) | ✅ v0.1 реализовано |
+| `stream_parser.py` | ResponseParser (бывш. StreamParser): feed/commit/finalize/close_on_stop, Segment/Word (v5), ParseState | ✅ v0.1 реализовано (docs/stream_parser_model.md) |
+| `plugins/base.py` | Plugin/PrePlugin/RuntimePlugin/PostPlugin (on_input/on_upload→bool/on_output) | ✅ v0.1 реализовано |
+| `plugins/task_parser.py` | SYSTEM_PROMPT + парсинг декомпозиции v2, дедуп (0.75), атомарность (поглотил parser.py+detector.py, удалены 2026-10-12) | ✅ v0.1 реализовано |
+| `bk_tree.py` | BK-tree fuzzy поиск инструментов, fix_typo | ✅ Этап 4 (метрики + stats + rebalance) |
 | `history.py` | JSONL история LLM-вызовов + debug.log (THINK / FINAL RESPONSE) | ⬜ Этап 1 |
-| `client.py` | OpenAI-совместимый клиент llama.cpp, think параметр | ⬜ Этап 2 |
-| `cache_manager.py` | save/restore KV-кэша через /slots API | ⬜ Этап 2 |
+| `client.py` | OpenAI-совместимый клиент llama.cpp, think параметр, chunk-iterator | ⬜ Этап 2 |
+| `cache_manager.py` | save/restore KV-кэша через /slots API | ⬜ отложен (slot API нет) |
 | `decomposer.py` | DecomposerSession: одна задача = один изолированный вызов | ⬜ Этап 3 |
 | `kanban.py` | SQLite хранилище состояний задач | ⬜ Этап 3 |
 | `cli.py` | argparse интерфейс, рендер дерева и статистики | ⬜ Этап 3 |
@@ -48,7 +51,6 @@ Details: docs/protocol.md §2–3.
 | `executor.py` | TaskExecutor (выполнение атомарной задачи) | ⬜ Этап 4+ |
 | `reflector.py` | ReflectAgent: анализ провалов, обратная связь | ⬜ Этап 4+ |
 | `researcher.py` | ResearchAgent: изолированный сбор информации | ⬜ Этап 4+ |
-| `bk_tree.py` | BK-tree fuzzy поиск инструментов, fix_typo | ✅ Этап 4 (метрики + stats + rebalance) |
 | `semantic.py` | SemanticMemory (эмбеддинги + cosine, remember/recall) | ⬜ Этап 4 |
 | `rag.py` | BM25 + vector search по документации | ⬜ Этап 4 |
 
@@ -111,7 +113,7 @@ stack.md §5. Архитектурное следствие для всех мо
 | `docs/process.md` | процесс: ленивая декомпозиция, enrichment, Reflect/Research (Глава IX) |
 | `docs/examples.md` | референсные сквозные логи + anti-примеры (Глава XII); основа e2e |
 | `docs/operations.md` | эксплуатация: железо, установка, мониторинг, troubleshooting (Глава XI) |
-| `docs/plugins.md` | плагинная архитектура агентов v3: секции, SessionMemory, TOML-конфиги (Этап 5+) |
+| `docs/plugins.md` | плагинная архитектура агентов v3: секции Pre/Runtime/Post, иерархия Memory (Workspace/Project/Agent), план TOML-конфигов (Этап 5+) |
 | `docs/roadmap.md` | аудит пробелов (20) + решения: timeout/guard/recovery, чек-лист продакшн-MVP |
 | `docs/decisions/` | ADR 001–004 (движок, минимальный промпт, без категорий, ленивая декомпозиция) |
 

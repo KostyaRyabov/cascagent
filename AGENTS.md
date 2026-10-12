@@ -43,8 +43,8 @@
 | Поиск в документации | RAG (BM25 + vectors) | `rag.py` |
 | Обогащение контекста | CPU RAG по embedding(brief), не через LLM (process.md §2) | `enricher.py` |
 | Состояние задач | SQLite Kanban | `kanban.py` |
-| Дубли подзадач | SequenceMatcher | `detector.py` |
-| Разбор формата ответа | отступы → brief/description | `parser.py` |
+| Дубли подзадач | SequenceMatcher | `plugins/task_parser.py` |
+| Разбор формата ответа | отступы → brief/description | `plugins/task_parser.py` |
 | Анализ провалов | ReflectAgent | `reflector.py` |
 
 ### 2.4 Минимальный формат для LLM
@@ -146,9 +146,12 @@ USER-промпт вызова декомпозиции (см. docs/protocol.md 
 ```
 cascagent/
 ├── src/cascagent/
-│   ├── models.py         # Task(brief,description,status), TaskStatus  [миграция v2]
-│   ├── parser.py         # SYSTEM_PROMPT, parse_decomposition, is_atomic [миграция v2]
-│   ├── detector.py       # DuplicateDetector (по task.brief)            [готово*]
+│   ├── models.py         # Task(brief,description,status), TaskStatus, snowflake-ID [v2 готово]
+│   ├── memory.py         # Memory (flat-KV + glob-подписки), Workspace/Project/Agent [v0.1 готово]
+│   ├── stream_parser.py  # ResponseParser: feed/commit/finalize, Segment/Word (v5)   [v0.1 готово]
+│   ├── plugins/
+│   │   ├── base.py       # Plugin/PrePlugin/RuntimePlugin/PostPlugin                  [v0.1 готово]
+│   │   └── task_parser.py# SYSTEM_PROMPT, parse_decomposition, дедуп (вместо parser.py+detector.py)
 │   ├── history.py        # History (JSONL + debug.log)                   [Этап 1]
 │   ├── client.py         # LlamaCppClient                                [Этап 2]
 │   ├── cache_manager.py  # save/restore KV через /slots                  [Этап 2]
@@ -177,7 +180,7 @@ cascagent/
 ├── docs/process.md       # процесс: ленивая декомпозиция, enrichment, Reflect/Research (Глава IX)
 ├── docs/examples.md      # референсные сквозные логи + anti-примеры (Глава XII)
 ├── docs/operations.md    # эксплуатация: железо, установка, мониторинг, troubleshooting (Глава XI)
-├── docs/plugins.md       # плагинная архитектура агентов v3: секции, SessionMemory, конфиги (Этап 5+)
+├── docs/plugins.md       # плагинная архитектура агентов v3: секции Pre/Runtime/Post, иерархия Memory, конфиги (Этап 5+)
 ├── docs/roadmap.md       # АУДИТ ПРОБЕЛОВ + решения: Python для MVP (порт после), timeout/guard/recovery, MVP-чеклист
 ├── docs/decisions/       # ADR-001..004 (движок, минимальный промпт, без категорий, ленивая декомпозиция)
 ├── AGENTS.md             # этот файл
@@ -187,27 +190,29 @@ cascagent/
 └── .gitignore
 ```
 
-\* логика готова, API адаптируется под `task.brief` при миграции v2.
+\* примечание устарело: логика parser/detector перенесена в `plugins/task_parser.py`, модули `parser.py`/`detector.py` удалены (2026-10-12).
 
 Модели максимально простые, вся сложность — в CPU-слое вокруг LLM.
 
 ## 7. Этапы реализации (v2)
 
-- **Этап 1 (Фундамент):** миграция models/parser/detector на протокол v2
-  (+тесты), history.py (+тесты; формат записи — docs/data.md §3). pyproject — готов.
-- **Этап 2 (LLM-инфраструктура):** client, cache_manager
+- **Этап 1 (Фундамент):** ✅ models на протоколе v2; парсинг/дедуп в
+  `plugins/task_parser.py`; history.py (+тесты; формат записи — docs/data.md §3) — ⬜. pyproject — готов.
+- **Этап 2 (LLM-инфраструктура):** client, cache_manager (отложен: slot API нет)
 - **Этап 3 (Ядро):** decomposer (DecomposerSession + execute_with_decomposition),
   kanban, cli
-- **Этап 4 (CPU-алгоритмы):** bk_tree, semantic, rag
+- **Этап 4 (CPU-алгоритмы):** ✅ bk_tree; semantic, rag — ⬜
 - **Этап 5 (Обвязка агентов):** enricher, executor, reflector, researcher
+  (базовый плагинный слой v3 реализован досрочно: memory.py, stream_parser.py, plugins/)
 - **Этап 6 (Интеграция):** оставшиеся тесты, README, docs
 
 Процесс выполнения системы (ленивая декомпозиция, enrichment pipeline,
 Research/Reflect, суммаризация) специфицирован в `docs/process.md`;
 референсные сквозные логи — `docs/examples.md`; эксплуатация —
-`docs/operations.md`. Плагинная архитектура агентов (секции init/input/
-trigger/output, SessionMemory, конфигурации через TOML) спроектирована в
-`docs/plugins.md` и реализуется на Этапе 5. Аудит непроектированных областей
+`docs/operations.md`. Плагинная архитектура агентов (секции Pre/Runtime/Post,
+иерархия памяти Workspace/Project/Agent, конфигурации через TOML — план)
+специфицирована в `docs/plugins.md`; базовый слой реализован в v0.1,
+расширения (каталог плагинов, TOML, breakpoints) — Этап 5+. Аудит непроектированных областей
 (20 пробелов) и принятые по ним решения — `docs/roadmap.md`; перед реализацией
 новых компонентов сверяйтесь с его чек-листом продакшн-MVP (§8) и открытыми
 вопросами (§9).
@@ -242,14 +247,18 @@ trigger/output, SessionMemory, конфигурации через TOML) спр�
 **Архитектура: v2 (ультра-простая)** — принята, документация зафиксирована:
 `docs/protocol.md` (источник истины по формату), AGENTS.md §4–6, architecture.md.
 
-Реализовано (код ещё на протоколе v1, миграция — следующий шаг):
-`models.py`, `parser.py`, `detector.py` (+тесты).
+Реализовано (v0.1, 113 тестов): `models.py` (v2), `memory.py`
+(Workspace/Project/Agent + Memory flat-KV), `stream_parser.py`
+(ResponseParser, Segment/Word v5), `plugins/base.py` +
+`plugins/task_parser.py` (поглотил parser.py/detector.py, удалены),
+`bk_tree.py`.
 
-Ближайшие шаги (порядок):
-1. Миграция `models.py` + `parser.py` + `detector.py` на v2 (+переписать тесты);
-2. `history.py` (JSONL + debug.log) + тесты;
-3. Этап 2: `client.py`, `cache_manager.py`;
-4. Далее по AGENTS.md §7 с новыми модулями v2 (enricher/executor/reflector/researcher).
+Ближайшие шаги (порядок — см. docs/roadmap.md, Фаза 2):
+1. `history.py` (JSONL + debug.log) + тесты;
+2. `client.py` (стриминг, think-параметр, chunk-iterator контракт);
+3. `kanban.py` + оркестратор execute_task поверх Agent.run();
+4. `cli.py` (--query, рендер дерева) → e2e на MockLLM;
+5. Далее по AGENTS.md §7 (enricher/executor/reflector/researcher).
 
 Конвенции кода:
 - `from __future__ import annotations` везде; type hints обязательны.

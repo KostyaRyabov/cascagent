@@ -1684,7 +1684,7 @@ my_limiter = "mypackage.plugins:TokenBudgetLimiter"
    global → project → workspace; запись в project/workspace из pre/runtime
    запрещена (только post и ленивая подготовка в pre по флагу).
 7. **Без эвристик атомарности** — `is_atom` решает модель (`<atom>`),
-   QualityValidator проверяет лишь формат (ADR-007). Единственные
+   QualityValidator проверяет лишь формат (ADR-003). Единственные
    детерминированные CPU-исключения — правила F1–F3 плагина TaskParserPlugin
    (process §1.3: degenerate-repeat родителя и brief==description);
    они не «угадывают» атомарность текста, а реализуют правило protocol §3.7.
