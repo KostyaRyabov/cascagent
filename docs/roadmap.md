@@ -2,7 +2,7 @@
 
 > **Статус:** ✅ живой документ. Обновляется при закрытии/появлении пробелов.
 > Дата аудита: 2026-10-10.
-> Смежные документы: `docs/plugins.md` (плагинная архитектура, §5 SessionMemory),
+> Смежные документы: `docs/plugins.md` (плагинная архитектура, §5 память — иерархия Memory),
 > `docs/data.md` (модель данных), `docs/process.md` (процесс выполнения),
 > `docs/architecture.md` (обзор модулей), `AGENTS.md` (инструкция AI-разработчикам).
 
@@ -115,8 +115,8 @@ embedding(brief) задачи → семантический поиск по в�
 
 | Плагин | Секция | Что ограничивает |
 |--------|--------|------------------|
-| `FirstTokenTimeout` | Trigger | максимум N сек до первого токена; иначе `action: stop` + ошибка таймаута |
-| `TotalResponseTimeout` | Trigger | максимум N сек на весь ответ (опционально) |
+| `FirstTokenTimeout` | Runtime | максимум N сек до первого токена; иначе `action: stop` + ошибка таймаута |
+| `TotalResponseTimeout` | Runtime | максимум N сек на весь ответ (опционально) |
 | `ExecutionTimeout` | Output (Executor) | максимум N сек на выполнение кода/команды атомарной задачи |
 
 ```toml
@@ -148,7 +148,7 @@ blocked — инструмент недоступен агентам вообщ�
 ### 3.2 #2 Prompt Injection через обогащение
 
 **Решение:** за санитизацию отвечает **встроенный системный плагин**
-`PromptInjectionGuard` (Input-секция; опционально Trigger-часть).
+`PromptInjectionGuard` (Pre-секция; опционально Runtime-часть).
 
 Что делает Input-часть (только над данными из внешних источников — RAG,
 semantic memory, research findings, siblings results; brief пользователя
@@ -188,31 +188,15 @@ mode = "sanitize"   # sanitize | warn | drop_block
 
 ### 3.3 #3 Восстановление после сбоев (Recovery)
 
-**Решение:** расширяем `SessionMemory` — помимо `global` и `local`
-добавляются **статистические данные** и **точки останова** для восстановления
-(см. `docs/plugins.md` §5, который нужно обновить заодно):
+**Решение (уточнено аудитом 2026-10-13):** SessionMemory не расширяем —
+её нет (плоская иерархия Memory, plugins.md §5). Вместо этого поверх KV
+нужны: `Memory.snapshot()` (ПЛАН, контракт §11.4.1), персистентный слой
+`PersistentStore` (ПЛАН, §6.5) и хранимые в project/global памяти ключи
+`stats:*` и `breakpoints:*`. API-надстройки из черновика
+(`set_stats/add_breakpoint/to_dump/from_dump`) переносятся как методы
+`BreakpointManager` (ПЛАН, §6.7), а не Memory.
 
-```python
-class SessionMemory:
-    _global: dict        # живёт всю сессию агента
-    _local: dict         # сбрасывается каждый run()
-    _stats: dict         # persist: счётчики, латентность, токены
-    _breakpoints: list   # persist: дампы state для resume
-```
-
-API-надстройки:
-
-```python
-def set_stats(self, key, value): ...          # то же, что global, но
-def get_stats(self, key, default=None): ...   # попадает в periodic dump
-def add_breakpoint(self, name: str, state: dict): ...
-def last_breakpoint(self) -> Breakpoint | None: ...
-def to_dump(self) -> dict: ...                # {global, stats, breakpoints}
-@classmethod
-def from_dump(cls, data: dict) -> "SessionMemory": ...
-```
-
-Персистентность: плагин `CheckpointSaver` (Output-секция) пишет
+Персистентность: плагин `CheckpointSaver` (Post-секция) пишет
 `to_dump()` в `sessions/{agent_name}/{session_id}.json` при ключевых
 событиях: успешный run, FAILED задачи, завершение поддерева. `reset_local()`
 НЕ трогает stats/breakpoints.
@@ -271,7 +255,7 @@ seed**, а не через гарантию идентичного вывода 
 
 - **Зависания (stuck/blocked generation):** покрываются timeout-плагинами
   (§3.1) + ожиданием: с изоляцией агентов и минимизацией контекста частота
-  мала. Дополнительно `StuckDetector` (Trigger): повторяющийся n-gram в
+  мала. Дополнительно `StuckDetector` (Runtime): повторяющийся n-gram в
   accumulated (окно 50 токенов, порог повтора 3) → `action: stop`, причина
   `stuck_repetition` → обычный путь FAILED→Reflect(retry).
 - **Галлюцинации:** детекция через **плагин** (решение владельца):
@@ -389,7 +373,7 @@ def put(new: MemoryEntry, threshold: float = 0.85):
     insert(new)
 ```
 
-Очистка — плагин `MemoryCleanup` (Init, периодический запуск):
+Очистка — плагин `MemoryCleanup` (вне секций — Init-плагина нет; периодический запуск через внешний вызов или Post):
 `cleanup(max_entries=10000, min_relevance=0.2, dry_run=False)` — удаляет
 (архивирует) наименее актуальные; всё настраивается в TOML `[memory]`.
 summary для длинных записей генерируется суммаризатором при remember()
@@ -602,24 +586,27 @@ Benchmark-регрессии — golden-набор в CI.
 
 ## 7. Итоговая карта новых сущностей (к реализации)
 
-**SessionMemory (plugins.md §5 — обновить!):** `_global`, `_local`,
-`_stats` (persist), `_breakpoints` (persist) + `to_dump()/from_dump()`.
+**Память (снято, аудит 2026-10-13):** SessionMemory с полями не будет —
+реализована плоская иерархия `Workspace/Project/Agent` + три flat-KV
+`Memory` (plugins.md §5). Для #3 Recovery поверх KV нужны: `snapshot()`
+(ПЛАН, контракт в plugins.md §11.4.1) и персистентный бэкенд
+`PersistentStore` (ПЛАН, §6.5; sqlite за тем же API Memory).
 
 **Новые плагины:**
 
 | Плагин | Секция | Пробел |
 |--------|--------|--------|
-| FirstTokenTimeout / TotalResponseTimeout | Trigger | #1 |
-| ExecutionTimeout | Output(Executor) | #1 |
-| PromptInjectionGuard | Input (+Trigger) | #2 |
+| FirstTokenTimeout / TotalResponseTimeout | Runtime | #1 |
+| ExecutionTimeout | Post (обёртка Executor) | #1 |
+| PromptInjectionGuard | Pre (+Runtime) | #2 |
 | CheckpointSaver / CheckpointLoader | Output / Init | #3 |
 | DebugTracer / StateSnapshotter | все / Output | #4 |
-| StuckDetector | Trigger | #5 |
+| StuckDetector | Runtime | #5 |
 | GroundingChecker | Output | #5 |
 | TraceExporter / MetricsWriter | Init+Output | #6 |
-| MemoryCleanup | Init (периодический) | #8 |
+| MemoryCleanup | вне секций (Init-плагина нет; периодический вызов) | #8 |
 | QualityScorer | Output | #15 |
-| HumanLoopPlugin | Output/Trigger | #19 |
+| HumanLoopPlugin | Post/Runtime | #19 |
 | AutoGitCommit (пример) | Output | #12 |
 
 **Новые режимы инструментов:** `exposed_to_llm` vs `callable_from_plugins`,
@@ -643,7 +630,7 @@ history|delete`.
 
 - [ ] #1 Timeout-плагины + модель разрешений tools (sandbox не делаем)
 - [ ] #2 PromptInjectionGuard (sanitize-режим по умолчанию)
-- [ ] #3 Recovery: stats+breakpoints в SessionMemory, CheckpointSaver,
+- [ ] #3 Recovery: snapshot()+PersistentStore (ПЛАН, plugins.md §6.5/§11.4.1), ключи stats:*/breakpoints:*, CheckpointSaver,
       `cascagent resume`
 - [ ] #4 Seed + полный слепок входа в истории + `replay`
 - [ ] #5 StuckDetector + refusal-детект (минимум; grounding — best effort)
