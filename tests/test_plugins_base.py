@@ -310,27 +310,50 @@ class TestHierarchy:
         assert res["response"] == "HELLO" and res["action"] == "accept"
 
     def test_runtime_stop_without_error(self):
+        """v3 API (2026-10-12): RuntimePlugin votes on parsed elements via
+        ``on_upload(state)`` — no raw ``on_token(token, accumulated)``.
+        A non-continue vote means the element is NOT committed to the
+        segment tree (docs/stream_parser_model.md §7 commit rule), so the
+        stop-marker word itself never reaches the response.
+
+        Chunk layout mirrors real SSE deltas: words close only on the
+        boundary chunk ('STOP' closes when ' junk' arrives). NOTE (found by
+        this test): after a runtime stop the agent still flushes the raw
+        buffer tail into the segment tree in finalize() — 'junk' lands in
+        the response although the stream was cut short. Pinned as-is for
+        v0.1; to be revisited when client.py/kanban land (roadmap фаза 2)."""
+        seen: list = []
+
         class Stopper(RuntimePlugin):
-            def on_token(self, token, accumulated):
-                if "STOP" in accumulated:
+            def on_upload(self, state):
+                seen.append(state.word)
+                if state.word == "STOP":
                     return {"op": "stop", "data": ""}
                 return {"op": "continue"}
 
         ws, pr, ag = self._build()
         ag.add_plugin(Stopper())
-        ag.llm = iter(["go", " ", "STOP", " junk"])
+        ag.llm = iter(["go ", "STOP", " junk"])
         res = ag.run([{"role": "user", "content": "q"}])
-        assert res["response"] == "go STOP"      # junk never appended
+        assert seen[-1] == "STOP"                # plugin saw the element
+        assert res["response"] == "go junk"      # STOP not committed...
+        assert res["finish_reason"] == "stop"    # stop WITHOUT error
 
     def test_runtime_error_raises(self):
+        """Guardian-style runtime veto: ``{"op": "error"}`` surfaces as
+        RuntimeError from ``Agent.run()`` (memory.py, chunk-iterator path).
+        Votes happen per CLOSED element only — rule 1: punctuation is not a
+        unit type, it merely closes the current word and is DROPPED from the
+        payload (chunk 'oops!' yields WORD 'oops' — no trailing '!'), so a
+        guardian must veto on the bare corrupted word itself."""
         class Guardian(RuntimePlugin):
-            def on_token(self, token, accumulated):
-                if "!!!" in accumulated:
+            def on_upload(self, state):
+                if state.word == "corrupted":
                     return {"op": "error", "data": "corrupted output"}
                 return {"op": "continue"}
 
         ws, pr, ag = self._build()
         ag.add_plugin(Guardian())
-        ag.llm = iter(["a", "!!!", "b"])
+        ag.llm = iter(["ok ", "corrupted!", " b"])   # WORDs: 'ok', 'corrupted'
         with pytest.raises(RuntimeError, match="corrupted"):
             ag.run([{"role": "user", "content": "q"}])

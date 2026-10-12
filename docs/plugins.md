@@ -807,7 +807,9 @@ from abc import ABC, abstractmethod
 > TriggerPlugin → RuntimePlugin, OutputPlugin → PostPlugin. Из API убраны
 > `reset()` (очистка — ответственность агента: `run()` стирает local-скоуп
 > памяти), `should_stop` и `on_stream_end` (семантика останова живёт в op-типах
-> `on_token`; финализация потока — работа PostPlugin). Память биндится в плагин
+> `on_upload(state)`; с 2026-10-12 хук `on_token` удалён — плагины голосуют по
+> разобранным элементам встроенного StreamParser; финализация потока — работа
+> PostPlugin). Память биндится в плагин
 > ОДИН РАЗ (`bind()`), а не прокидывается аргументом в каждый хук — хот-путь
 > на токен не тащит лишние параметры. Хуки работают с двумя скоупами:
 > `self.global_memory` (переживает итерации) и `self.local_memory`
@@ -828,8 +830,10 @@ class PrePlugin(Plugin):               # секция PRE (был InputPlugin)
 class RuntimePlugin(Plugin):           # секция RUNTIME (был TriggerPlugin)
     name = "base_runtime"
 
-    def on_token(self, token: str, accumulated: str) -> dict:
-        """{"op": "continue"} | {"op": "stop", "data": ...}
+    def on_upload(self, state) -> dict:
+        """Голосование по готовому элементу потока (WORD/SPECIAL) от
+        встроенного StreamParser; state — живой ParseState.
+        {"op": "continue"} | {"op": "stop", "data": ...}
         (останов без ошибки) | {"op": "error", "data": "..."}
         (останов с ошибкой). Дефолт: pass-through."""
         return {"op": "continue"}
