@@ -243,60 +243,36 @@ class Task:
 `(parent_id, order)`; `depth` согласован с длиной цепочки parent (проверка —
 CPU-валидация, cpu-offload A13).
 
-## 3. История вызовов
+## 3. Опыт выполненных задач (не история вызовов)
 
-### 3.1 DecompositionCall
+**Решение 2026-10-13: отдельной истории LLM-вызовов НЕТ (history.py удалён).**
+Каждый запрос в LLM уже обёрнут в задачу: пользовательский запрос — это
+корневая Task (`description` = сырой запрос, `brief` = однострочное название,
+`summary` = краткое содержание, создаётся ТОЛЬКО для корня — см. §1);
+остальные задачи рождаются декомпозицией как обычно. Промежуточные ответы
+модели — производный шум, их логирование в JSONL/debug.log себя не оправдало.
 
-Запись одного LLM-вызова (`history.py`). Два параллельных формата:
-JSONL — машиночитаемый анализ/метрики/будущий файн-тюн; debug.log —
-человекочитаемая отладка. Дублирование данных ~30% overhead — принято
-осознанно; ротация debug.log по размеру.
+Единственный персистентный артефакт — **результат корректно завершённой
+задачи**: при переходе в DONE оркестратор вызывает `kanban.remember_done(id)`
+(Kanban, algorithms.md §3), которое пишет в `semantic_memory` (§4.2) пару
+`(ключевой текст, result)` и вектор `embed(ключевой текст)`:
 
-```python
-@dataclass
-class DecompositionCall:
-    timestamp: str
-    task_id: int                    # snowflake (data.md §2)
-    parent_task_id: Optional[int]
-    task_brief: str                 # v2: brief вместо title
-    prompt: str                     # полный SYSTEM+USER как отправлен
-    think: Optional[str]            # извлечённый THINK (None если no_think)
-    final_response: str             # FINAL RESPONSE после sanitize
-    parsed: list[dict]              # [{"brief":..., "description":...|None, "is_atom":bool}] — v2
-    error: Optional[str]            # тип/текст сбоя, если был
-    duration_ms: int
-    prompt_tokens: int              # из usage API (approx_tokens — fallback)
-    completion_tokens: int
-    think_enabled: bool
-    duplicates_removed: int         # CPU-фильтр (detector)
-    atomic: bool                    # свойство: is_atomic или degenerate-rule
+- ключевой текст: `summary` для корневой задачи (brief ~50 токенов слишком
+  coarse для целого запроса), `brief` для подзадач;
+- фильтрация: только DONE с непустым `result`; FAILED/промежуточные — ничего
+  не пишут (данные о статусе и так в таблице `tasks`);
+- 1:1 с задачей (`source_task_id`, UNIQUE) — повторный remember обновляет row.
 
-    @property
-    def is_atomic(self) -> bool: ...
-```
+Переиспользование (RAG): перед обогащением новой задачи enricher вызывает
+`kanban.recall(query=brief, top_k=3, min_similarity=0.7)` — косинус по
+эмбеддингам прошлых результатов; найденные пары идут в
+`EnrichedContext.semantic_memories` (§6). GC от разрастания —
+`forget_old(days=30, max_keep=1000)` (algorithms.md §3).
 
-Формат JSONL совместим между v1/v2: поле `category` убрано, `title` →
-`task_brief`, добавлены `prompt_tokens/completion_tokens`. Строка записи:
-
-```json
-{"timestamp":"2026-10-09T14:23:41.123456","task_id":7,"parent_task_id":6,
- "task_brief":"Создать модель User","prompt":"SYSTEM:\n...\n\nUSER:\n...",
- "think":"Нужно создать модель...","final_response":"Определить поля...\n    ...",
- "parsed":[{"brief":"Определить поля","description":"id (UUID), email..."}],
- "error":null,"duration_ms":12450,"prompt_tokens":410,"completion_tokens":850,
- "think_enabled":true,"duplicates_removed":2,"atomic":false}
-```
-
-debug.log — блоки с разделителями `--- THINK --- / --- FINAL RESPONSE --- /
---- PARSED (N tasks, atom=False) ---`, grep-able по task_id. Правила
-разделения THINK/FINAL и degenerate-repeat — protocol §3, cpu-offload A1/A5.
-
-### 3.2 Таблица llm_calls (SQL-зеркало)
-
-Для агрегатных запросов (средняя длительность по глубине, доля атомов,
-расход токенов) поверх JSONL — зеркало в SQLite. Запись идемпотентна
-(`INSERT OR IGNORE` по AUTOINCREMENT id не гарантирует — пишем один раз
-в транзакции сохранения вызова; JSONL остаётся primary, таблица — индекс).
+Метрики вызовов (токены/длительности) собираются StatisticsCollector в
+сессионную статистику на лету (plugins.md §7.4, performance.md §5) — без
+per-call журнала на диске. Таблица `llm_calls` (§4.2) остаётся в схеме только
+для совместимости со старыми БД; кодом не пишется.
 
 ## 4. Хранилища
 
