@@ -295,25 +295,11 @@ class Agent:
                     vote(tail)
                 parser.finalize("stop")
             else:
-                # Plugin stopped the loop: close the tree WITHOUT touching
-                # the raw buffer — a rejected element must never be flushed
-                # into the committed output (rule 8 applies to clean ends).
+                # Plugin stopped the loop: close the tree WITHOUT flushing
+                # the un-voted raw tail into the committed output (rule 8
+                # applies to clean ends only). Parser owns this logic.
                 parser.state.finish_reason = None    # close sets the truth
-                st = parser.state
-                st.buffer = ""
-                parser._chunks_in_buffer = 0
-                st.status = parser.state.status      # keep last delivered status
-                st.word = None
-                while len(st.stack) > 1:      # keep RESPONSE at the bottom
-                    top = st.stack.pop()
-                    if top.finish_reason is None:
-                        top.finish_reason = "unclosed"
-                st.finish_reason = stop
-                st.done = True
-                if st.stack and st.stack[0].kind.name == "RESPONSE":
-                    resp = st.stack.pop(0)
-                    if resp.finish_reason is None:
-                        resp.finish_reason = stop
+                parser.close_on_stop(stop)
             #: Authoritative output is the COMMITTED segment tree, not the
             #: raw transport echo: a stopped element never reaches response.
             response = parser.response_text()

@@ -322,6 +322,36 @@ class StreamParser:
                     resp.finish_reason = reason
         return st
 
+    def close_on_stop(self, reason: str) -> ParseState:
+        """Close the segment tree after a runtime-plugin stop.
+
+        Unlike finalize(), this NEVER touches the raw buffer: an element
+        rejected by a voter must not leak into the committed output
+        (rule 8 applies to clean ends only). Every still-open segment
+        closes with finish_reason="unclosed"; the implicit RESPONSE
+        segment and the state itself take the protocol ``reason``.
+        """
+        st = self.state
+        if st.done:
+            return st
+        # Discard the un-voted tail without advancing token_offset —
+        # those chunks were never delivered as elements.
+        st.buffer = ""
+        self._chunks_in_buffer = 0
+        st.status = ResponseParser.WORD
+        st.word = None
+        while len(st.stack) > 1:          # keep RESPONSE at the bottom
+            top = st.stack.pop()
+            if top.finish_reason is None:
+                top.finish_reason = "unclosed"
+        st.finish_reason = reason
+        st.done = True
+        if st.stack and st.stack[0].kind is SegmentKind.RESPONSE:
+            resp = st.stack.pop(0)
+            if resp.finish_reason is None:
+                resp.finish_reason = reason
+        return st
+
     def response_text(self) -> str:
         """Think-free final text: concatenation of top-level RESPONSE
         segments (what PostPlugins receive as the clean response)."""
