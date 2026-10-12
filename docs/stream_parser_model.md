@@ -54,6 +54,11 @@ class ParseState:
     buffer: str = ""                      # просто строка недособранных токенов;
                                           # слово готово -> word = buffer; buffer = ""
 
+    # --- позиция в потоке (решение 2026-10-12) ---
+    token_offset: int = 0                 # порядковый номер текущего элемента,
+                                          # переданного плагинам
+    word_count: int = 0                   # число закоммиченных слов
+
     # --- сегменты ---
     segments: List[Segment] = field(default_factory=list)  # все собранные сегменты
     stack: List[Segment] = field(default_factory=list)     # стек ОТКРЫТЫХ сегментов;
@@ -87,11 +92,14 @@ class ParseState:
 
 ```python
 class RuntimePlugin:
-    def on_upload(self, state: ParseState) -> Dict[str, Any]:
+    def on_upload(self, state: ParseState, context: dict) -> ParseState | None:
         """Вызывается когда элемент готов (WORD/SPECIAL).
-        Возврат: {"op": "continue" | "stop" | "error", ...}.
+        Возврат: тот же ParseState с отредактированными стоп-параметрами
+        (finish_reason: None → продолжить, "stop" → стоп без ошибки,
+        "error" → стоп с ошибкой); None = «без изменений» (решение 2026-10-12,
+        op-словари сняты).
         Слово попадает в stack[-1].text, а special-элемент создаёт/закрывает сегмент
-        ТОЛЬКО если все плагины дали continue."""
+        ТОЛЬКО если все плагины оставили finish_reason пустым."""
 ```
 
 ## Правила, зафиксированные в обсуждении

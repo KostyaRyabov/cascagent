@@ -157,8 +157,12 @@ bind(): состояние агента между вызовами живёт �
 InputPlugin → **PrePlugin**, TriggerPlugin → **RuntimePlugin**,
 OutputPlugin → **PostPlugin**. Хук `on_token` удалён 2026-10-12: Runtime
 плагины голосуют по разобранным элементам встроенного StreamParser через
-`on_upload(state)`; `should_stop` и `on_stream_end` убраны (семантика
-останова — op-типы `on_upload`, финализация потока — работа PostPlugin).
+`on_upload(state, context)`; `should_stop` и `on_stream_end` убраны. С
+2026-10-12 семантика останова живёт НА САМОМ ParseState: плагин возвращает
+state (обычно тот же объект) с отредактированным `finish_reason`
+(None → продолжить, `"stop"` → стоп без ошибки, `"error"` → стоп с
+ошибкой); op-словари `{"op": ...}` сняты. Финализация потока — работа
+парсера/агента.
 
 | Секция | Когда | Частота | Назначение |
 |--------|-------|---------|-----------|
@@ -237,21 +241,28 @@ class ContextEnricher(PrePlugin):        # ПЛАН — не реализова�
 class StopOnDone(RuntimePlugin):         # ПЛАН — не реализован
     """Останавливает генерацию, когда встречен маркер конца ответа."""
 
-    def on_upload(self, state):
+    def on_upload(self, state, context):
         if state.status == ParseStatus.SPECIAL and state.word == "</done>":
-            return {"op": "stop", "data": ""}
-        return {"op": "continue"}
+            state.finish_reason = "stop"
+        return state
 ```
 
-**API результата Runtime-плагина (`on_upload(state)`):**
+**Контракт Runtime-плагина (`on_upload(state, context)`), решён 2026-10-12:**
 
 ```python
-{"op": "continue"}                     # продолжать генерацию (дефолт базы)
-{"op": "stop",  "data": ...}           # стоп БЕЗ ошибки (EOS, бюджет достигнут);
-                                       # data может нести замену хвосту ответа
-{"op": "error", "data": "..."}         # стоп С ошибкой (битый вывод, guard) —
-                                       # агент поднимает её наружу
+return state                            # дефолт базы: continue (finish_reason None)
+state.finish_reason = "stop"            # стоп БЕЗ ошибки (EOS, бюджет достигнут)
+state.finish_reason = "error"           # стоп С ошибкой (битый вывод, guard) —
+                                        # агент поднимает RuntimeError наружу
+return None                             # «без изменений» (то же, что вернуть state)
 ```
+
+`context` — общий словарь прогона, передаётся ВСЕМ хукам всех секций
+по ссылке (Pre/Runtime/Post видят один и тот же объект; обмен данными
+между плагинами — через него). Останов-параметры редактируются прямо на
+ParseState; счётчики позиции для budget-гардов: `state.token_offset`
+(порядковый номер текущего элемента) и `state.word_count` (число
+закоммиченных слов).
 
 Правила секции:
 
@@ -260,10 +271,10 @@ class StopOnDone(RuntimePlugin):         # ПЛАН — не реализова�
   `self.local_memory` (агент трёт её каждым `run()`, reset() плагинам не нужен);
 - **правило коммита**: элемент применяется к дереву сегментов (слово →
   `stack[-1].text`, special → открытие/закрытие Segment) только если ВСЕ
-  Runtime-плагины вернули continue; первый не-continue прерывает голосование
-  и останавливает поток (docs/stream_parser_model.md §7);
+  Runtime-плагины оставили `finish_reason` пустым; непустой `finish_reason`
+  прерывает голосование и останавливает поток (docs/stream_parser_model.md §7);
 - порядок runtime-плагинов значим: голосование идёт списком, побеждает
-  первое не-continue.
+  первый непустой `finish_reason`.
 
 Известное расхождение поведения (открытый вопрос, фаза 2): str-LLM
 (тестовый фейк) коммитит элементы без голосования, chunk-iterator —
@@ -720,9 +731,14 @@ class Memory:
     def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default)      # read callbacks НЕ вызывает
 
-    def delete(self, key: str) -> bool:
-        """Удаление по ключу: True если существовал. Silent — без событий."""
-        return self._data.pop(key, _MISSING) is not _MISSING
+    def delete(self, pattern: str) -> int:
+        """Удаление по fnmatch-glob: возвращает число удалённых ключей
+        (точный ключ тоже работает — он совпадает сам с собой).
+        Silent — без событий подписчикам."""
+        doomed = [k for k in self._data if fnmatch.fnmatch(k, pattern)]
+        for k in doomed:
+            del self._data[k]
+        return len(doomed)
 
     def clear(self) -> None:
         """Bulk wipe без per-key событий (вызывает Agent.run() на local)."""
@@ -799,8 +815,9 @@ domain-плагинов (например `indices`, `precompiled_prompt`) — �
 > (его роль — ленивая тяжёлая подготовка в PrePlugin), InputPlugin → PrePlugin,
 > TriggerPlugin → RuntimePlugin, OutputPlugin → PostPlugin. Из API убраны
 > `reset()` (очистка — ответственность агента: `run()` стирает local-скоуп
-> памяти), `should_stop` и `on_stream_end` (семантика останова живёт в op-типах
-> `on_upload(state)`; с 2026-10-12 хук `on_token` удалён — плагины голосуют по
+> памяти), `should_stop` и `on_stream_end` (семантика останова живёт в
+> `finish_reason` возвращаемого ParseState — см. §4.2; с 2026-10-12 хук
+> `on_token` удалён — плагины голосуют по
 > разобранным элементам встроенного StreamParser; финализация потока — работа
 > парсера/агента). Память биндится в плагин
 > ОДИН РАЗ (`bind()`), а не прокидывается аргументом в каждый хук — хот-путь
@@ -830,14 +847,15 @@ class PrePlugin(Plugin):               # секция PRE (был InputPlugin)
 class RuntimePlugin(Plugin):           # секция RUNTIME (был TriggerPlugin)
     name = "base_runtime"
 
-    def on_upload(self, state) -> dict:
+    def on_upload(self, state, context):        # -> ParseState | None
         """Голосование по готовому элементу потока (WORD/SPECIAL) от
         встроенного StreamParser; state — живой ParseState
-        (state.status, state.word).
-        {"op": "continue"} | {"op": "stop", "data": ...}
-        (останов без ошибки) | {"op": "error", "data": "..."}
-        (останов с ошибкой). Дефолт: pass-through."""
-        return {"op": "continue"}
+        (state.status, state.word, state.token_offset, state.word_count).
+        Возвращает тот же ParseState с отредактированными стоп-параметрами
+        (finish_reason: None → продолжить, "stop" → стоп без ошибки,
+        "error" → стоп с ошибкой); None = «без изменений».
+        context — общий словарь прогона (по ссылке). Дефолт: pass-through."""
+        return state
 
 class PostPlugin(Plugin):              # секция POST (был OutputPlugin)
     name = "base_post"
@@ -864,15 +882,18 @@ class Agent:
         # 2. PRE:    messages = p.on_input(messages, context)   # цепочкой
         # 3. LLM+RUNTIME:
         #    parser = self._make_parser()            # свежий StreamParser
-        #    context["parse_state"] = parser.state   # не память, §5.6
         #    for chunk in gen:                       # стрим или str-файк
         #        for ev in parser.feed(chunk):       # WORD/SPECIAL элементы
-        #            голосуют ВСЕ runtime-плагины on_upload(state);
-        #            continue у всех -> parser.commit(ev),
-        #            иначе stop-голос {op, **res} -> элемент НЕ коммитится
+        #            st.token_offset += 1            # позиция элемента
+        #            голосуют ВСЕ runtime-плагины on_upload(state, context);
+        #            finish_reason пуст у всех -> parser.commit(ev)
+        #              (commit инкрементит word_count),
+        #            иначе стоп -> элемент НЕ коммитится
+        #    parser.state.finish_reason = None       # finalize ставит истину
         #    parser.finalize("stop"|"error")         # хвост буфера флашится
-        #    op == "error" -> RuntimeError
+        #    finish_reason == "error" -> RuntimeError
         # 4. context["response"], context["think"]   # think из THINK-сегментов
+        #    context["parse_state"] = parser.state   # живой state для POST (§5.6)
         # 5. POST:   r = p.on_output(response, context)  # цепочкой
         #    result = {"response", "context", "segments", "finish_reason",
         #              "parsed", "metadata", "action"}
@@ -1346,10 +1367,12 @@ run(messages, context)
   |     читают project/global/workspace, пишут local (промежуточное)
   +-- GENERATION + RUNTIME (стрим chunk'ами через встроенный StreamParser)
   |     для каждого ГОТОВОГО элемента (WORD/SPECIAL):
-  |       голосуют все runtime-плагины on_upload(state)
-  |       continue у всех -> parser.commit(ev); иначе {op,...} -> элемент не коммитится
+  |       st.token_offset += 1
+  |       голосуют все runtime-плагины on_upload(state, context)
+  |       finish_reason пуст у всех -> parser.commit(ev) (+word_count);
+  |                                  иначе -> элемент не коммитится
   |     конец стрима: parser.finalize("stop"|"error") -> флаш хвоста буфера
-  |     op == "error" -> RuntimeError(data)
+  |     finish_reason == "error" -> RuntimeError
   +-- context["response"], context["think"]   # think = THINK-сегменты дерева
   +-- POST plugins  (парсинг TaskParserPlugin -> ...)
   |     читают local/context; пишут parsed/metadata/action в результат;
@@ -1653,11 +1676,11 @@ my_limiter = "mypackage.plugins:TokenBudgetLimiter"
 
 | API | Гарантируется стабильным? | Примечание |
 |-----|---------------------------|------------|
-| Memory get/set/clear + subscribe/unsubscribe (glob) | да (semver minor) | ключи — domain плагинов; уровни задаются экземпляром, суффиксов не вводим; скоуп подписки строго per-level (вариант А, §5.4) — без обёрток и propagation |
+| Memory get/set/delete(glob)/clear + subscribe/unsubscribe (glob) | да (semver minor) | ключи — domain плагинов; delete по fnmatch-glob, silent (без событий); уровни задаются экземпляром, суффиксов не вводим; скоуп подписки строго per-level (вариант А, §5.4) — без обёрток и propagation |
 | Иерархия Workspace/Project/Agent (add_*, *_memory свойства) | да (semver minor) | project/workspace могут быть None у невстроенного агента |
-| Сигнатуры on_input/on_upload/on_output | да (semver major на ломку) | новые optional-параметры — minor |
+| Сигнатуры on_input/on_upload(state, context)/on_output | да (semver major на ломку) | context — общий словарь прогона, передаётся всем хукам по ссылке (решение 2026-10-12); новые optional-параметры — minor |
 | bind(workspace/project/global/local_memory) | да (semver major на ломку) | порядок/наборы keyword-аргументов фиксированы |
-| Результат runtime `{"op": ...}` | да | новые op добавляются расширением enum |
+| Контракт runtime: возврат ParseState, стоп через finish_reason (None/"stop"/"error") | нет до 1.0.0 | op-словари сняты (2026-10-12); новые значения finish_reason добавляются расширением enum |
 | Результат run() (dict: response/context/segments/parsed/metadata/action) | нет до 1.0.0 | поля добавляются; удаление — major |
 | PersistentStore API (set/get/all/clear) | да (semver minor) — ПЛАН | схема таблицы `memory(namespace,key,value,updated_at)` |
 | BreakpointManager JSONL-формат | нет до 1.0.0 — ПЛАН | при смене формата — версионирование записи `v` |

@@ -113,8 +113,8 @@ class TestRuntimePlugin:
 
     def test_defaults_pass_through(self):
         p = self.Bare()
-        assert p.on_upload(None) == {"op": "continue"}
-        # should_stop is GONE — stop semantics live in on_upload ops.
+        assert p.on_upload(None, {}) is None     # state returned untouched
+        # should_stop is GONE — stop semantics live in finish_reason edits.
         assert not hasattr(RuntimePlugin, "should_stop")
         # on_stream_end is GONE — stream finalization is PostPlugin's job.
         assert not hasattr(RuntimePlugin, "on_stream_end")
@@ -122,24 +122,43 @@ class TestRuntimePlugin:
         # raw tokens belong to the built-in StreamParser service.
         assert not hasattr(RuntimePlugin, "on_token")
 
-    def test_op_types_shape(self):
+    def test_finish_reason_edit_contract(self):
+        """v4 API (2026-10-12): on_upload(state, context) returns the
+        ParseState with stop params edited in place — no op-dicts."""
         from cascagent.stream_parser import ParseState, ParseStatus
 
         class Stopper(self.Bare):
-            def on_upload(self, state):
+            def on_upload(self, state, context):
                 if state.word == "STOP":
-                    return {"op": "stop", "data": "tail"}
+                    state.finish_reason = "stop"
                 if state.word == "!!!":
-                    return {"op": "error", "data": "corrupted"}
-                return {"op": "continue"}
+                    state.finish_reason = "error"
+                return state
 
         p = Stopper()
         mk = lambda w: ParseState(status=ParseStatus.WORD, word=w)
-        assert p.on_upload(mk("x")) == {"op": "continue"}
-        r = p.on_upload(mk("STOP"))
-        assert r["op"] == "stop" and r["data"] == "tail"
-        r = p.on_upload(mk("!!!"))
-        assert r["op"] == "error" and r["data"] == "corrupted"
+        s = mk("x")
+        assert p.on_upload(s, {}) is s
+        assert s.finish_reason is None           # keep generating
+        s = mk("STOP")
+        assert p.on_upload(s, {}).finish_reason == "stop"
+        s = mk("!!!")
+        assert p.on_upload(s, {}).finish_reason == "error"
+
+    def test_context_shared_by_reference(self):
+        """context is passed by reference — plugin mutations visible."""
+        from cascagent.stream_parser import ParseState, ParseStatus
+
+        class Note(self.Bare):
+            def on_upload(self, state, context):
+                context.setdefault("seen", []).append(state.word)
+                return state
+
+        ctx: dict = {}
+        p = Note()
+        p.on_upload(ParseState(status=ParseStatus.WORD, word="a"), ctx)
+        p.on_upload(ParseState(status=ParseStatus.WORD, word="b"), ctx)
+        assert ctx["seen"] == ["a", "b"]
 
 
 class TestPostPlugin:
@@ -179,26 +198,37 @@ class TestMemory:
         m.clear()
         assert m.get("a") is None
 
-    def test_delete_removes_key_and_reports(self):
+    def test_delete_removes_key_and_reports_count(self):
         m = Memory()
         m.set("a", 1)
-        assert m.delete("a") is True
+        assert m.delete("a") == 1              # glob matches exact key too
         assert m.get("a") is None
-        assert m.delete("a") is False          # already gone
+        assert m.delete("a") == 0              # already gone
+
+    def test_delete_glob_pattern(self):
+        """Deletion by glob: all matching keys removed, count returned."""
+        m = Memory()
+        m.set("tasks:1", {"id": 1})
+        m.set("tasks:2", {"id": 2})
+        m.set("other", 3)
+        assert m.delete("tasks:*") == 2
+        assert m.get("tasks:1") is None
+        assert m.get("tasks:2") is None
+        assert m.get("other") == 3
 
     def test_delete_none_value_vs_absent(self):
-        """Sentinel: stored None must be deletable as an existing key."""
+        """Stored None must be deletable as an existing key (count 1)."""
         m = Memory()
         m.set("a", None)
-        assert m.delete("a") is True
-        assert m.delete("a") is False
+        assert m.delete("a") == 1
+        assert m.delete("a") == 0
 
     def test_delete_is_silent(self):
         m = Memory()
         seen = []
         m.subscribe("*", lambda k, v: seen.append(k))
         m.set("a", 1)
-        m.delete("a")
+        m.delete("*")
         assert seen == ["a"]                   # only the set event
 
     def test_no_scope_bucket_all_apis(self):
@@ -307,10 +337,10 @@ class TestHierarchy:
 
     def test_global_memory_survives_iterations(self):
         class Counter(RuntimePlugin):
-            def on_upload(self, state):
+            def on_upload(self, state, context):
                 n = self.global_memory.get("units", 0)
                 self.global_memory.set("units", n + 1)
-                return {"op": "continue"}
+                return state
 
         ws, pr, ag = self._build()
         ag.llm = iter(["a ", "b "])
@@ -334,11 +364,12 @@ class TestHierarchy:
         assert res["response"] == "HELLO" and res["action"] == "accept"
 
     def test_runtime_stop_without_error(self):
-        """v3 API (2026-10-12): RuntimePlugin votes on parsed elements via
-        ``on_upload(state)`` — no raw ``on_token(token, accumulated)``.
-        A non-continue vote means the element is NOT committed to the
-        segment tree (docs/stream_parser_model.md §7 commit rule), so the
-        stop-marker word itself never reaches the response.
+        """v4 API (2026-10-12): RuntimePlugin votes via
+        ``on_upload(state, context)`` and returns the ParseState with
+        ``finish_reason`` edited in place — no op-dicts. A stop vote means
+        the element is NOT committed to the segment tree
+        (docs/stream_parser_model.md §7 commit rule), so the stop-marker
+        word itself never reaches the response.
 
         Chunk layout mirrors real SSE deltas: words close only on the
         boundary chunk ('STOP' closes when ' junk' arrives). NOTE (found by
@@ -349,11 +380,11 @@ class TestHierarchy:
         seen: list = []
 
         class Stopper(RuntimePlugin):
-            def on_upload(self, state):
+            def on_upload(self, state, context):
                 seen.append(state.word)
                 if state.word == "STOP":
-                    return {"op": "stop", "data": ""}
-                return {"op": "continue"}
+                    state.finish_reason = "stop"
+                return state
 
         ws, pr, ag = self._build()
         ag.add_plugin(Stopper())
@@ -364,20 +395,21 @@ class TestHierarchy:
         assert res["finish_reason"] == "stop"    # stop WITHOUT error
 
     def test_runtime_error_raises(self):
-        """Guardian-style runtime veto: ``{"op": "error"}`` surfaces as
-        RuntimeError from ``Agent.run()`` (memory.py, chunk-iterator path).
+        """Guardian-style runtime veto: ``finish_reason = "error"``
+        surfaces as RuntimeError from ``Agent.run()`` (memory.py,
+        chunk-iterator path).
         Votes happen per CLOSED element only — rule 1: punctuation is not a
         unit type, it merely closes the current word and is DROPPED from the
         payload (chunk 'oops!' yields WORD 'oops' — no trailing '!'), so a
         guardian must veto on the bare corrupted word itself."""
         class Guardian(RuntimePlugin):
-            def on_upload(self, state):
+            def on_upload(self, state, context):
                 if state.word == "corrupted":
-                    return {"op": "error", "data": "corrupted output"}
-                return {"op": "continue"}
+                    state.finish_reason = "error"
+                return state
 
         ws, pr, ag = self._build()
         ag.add_plugin(Guardian())
         ag.llm = iter(["ok ", "corrupted!", " b"])   # WORDs: 'ok', 'corrupted'
-        with pytest.raises(RuntimeError, match="corrupted"):
+        with pytest.raises(RuntimeError, match="error"):
             ag.run([{"role": "user", "content": "q"}])

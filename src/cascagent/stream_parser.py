@@ -85,6 +85,11 @@ class ParseState:
     # --- word reconstruction ---
     buffer: str = ""                      # raw un-assembled tail
 
+    # --- stream position (decision 2026-10-12) ---
+    token_offset: int = 0                 # ordinal number of the current
+                                          # element delivered to plugins
+    word_count: int = 0                   # committed WORDs so far
+
     # --- segments ---
     segments: List[Segment] = field(default_factory=list)  # all collected
     stack: List[Segment] = field(default_factory=list)     # OPEN ones; [-1] = current
@@ -229,10 +234,13 @@ class StreamParser:
             ev = self._next_event()
             if ev is None:
                 break
+            # ordinal position of the element being delivered to plugins
+            st.token_offset += 1
             events.append(ev)
         # rule 9: buffer overflow → flush the remainder as one WORD
         if (self._chunks_in_buffer >= self.max_buffer_chunks
                 and st.buffer.strip()):
+            st.token_offset += 1
             events.append(self._flush_buffer_as_word())
         return events
 
@@ -247,6 +255,7 @@ class StreamParser:
             assert payload is not None
             target = st.current or self._ensure_response_segment()
             target.text += payload + " "
+            st.word_count += 1             # committed words counter
         elif status is ParseStatus.SPECIAL:
             assert payload is not None
             self._apply_special(payload)
@@ -268,6 +277,7 @@ class StreamParser:
                 self._chunks_in_buffer = 0
                 target = st.current or self._ensure_response_segment()
                 target.text += leftover + " "
+                st.word_count += 1          # finalize flush is a word too
             st.status = ParseStatus.WORD
             st.word = None
             while len(st.stack) > 1:          # keep RESPONSE at the bottom

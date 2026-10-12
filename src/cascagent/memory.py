@@ -60,14 +60,17 @@ class Memory:
         return self._data.get(key, default)
 
 
-    def delete(self, key: str) -> bool:
-        """Remove ``key``; return True if it existed, False otherwise.
+    def delete(self, pattern: str) -> int:
+        """Remove ALL keys matching an fnmatch glob; return their count.
 
-        Silent removal: no subscriber notification (there is no new value
-        to deliver). Pair with get(key, default) semantics — after delete
-        the key reads back as absent.
+        Exact key works too (a key matches itself). Silent removal: no
+        subscriber notification (there is no new value to deliver).
+        After delete the keys read back as absent.
         """
-        return self._data.pop(key, _MISSING) is not _MISSING
+        doomed = [k for k in self._data if fnmatch.fnmatch(k, pattern)]
+        for k in doomed:
+            del self._data[k]
+        return len(doomed)
 
     def clear(self) -> None:
         """Drop ALL keys silently (no per-key events — a bulk wipe is not
@@ -268,12 +271,19 @@ class Agent:
                         status, payload = ev
                         parser.state.status = status
                         parser.state.word = payload
+                        # v4 API (2026-10-12): hooks receive (state, context)
+                        # and return the ParseState — possibly with stop
+                        # params edited in place (finish_reason). Returning
+                        # None means "no changes". The element is committed
+                        # ONLY if every voter left finish_reason falsy.
                         voted = None
                         for rt in self.runtime_plugins:
-                            res = rt.on_upload(parser.state)
-                            op = res.get("op", "continue")
-                            if op != "continue":
-                                voted = {"op": op, **res}
+                            res = rt.on_upload(parser.state, context)
+                            if res is not None:
+                                parser.state = res   # keep edits for parsing
+                            fr = getattr(parser.state, "finish_reason", None)
+                            if fr:
+                                voted = {"op": fr}
                                 break
                         if voted is not None:
                             stop = voted   # element NOT committed (vote rule)
@@ -281,6 +291,7 @@ class Agent:
                         parser.commit(ev)
                     if stop is not None:
                         break
+                parser.state.finish_reason = None    # finalize sets the truth
                 parser.finalize(stop["op"] if stop else "stop")
                 if stop is not None and stop["op"] == "error":
                     raise RuntimeError(f"runtime stopped with error: {stop}")

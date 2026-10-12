@@ -689,8 +689,9 @@ port-этап (§1), full observability/dashboards.
 
 ### Фаза 0 — гигиена репозитория (без изменения поведения)
 - [x] Починить 2 падающих теста под текущий API: голосование Runtime-
-      плагинов идёт на parsed-элементах через `on_upload(state)`, а не
-      `on_token` (`tests/test_plugins_base.py::TestHierarchy::
+      плагинов идёт на parsed-элементах через `on_upload(state, context)`
+      (с 2026-10-12 возвращает ParseState со стоп-параметрами; op-словари
+      сняты), а не `on_token` (`tests/test_plugins_base.py::TestHierarchy::
       test_runtime_stop_without_error`, `test_runtime_error_raises`).
       — сделано (коммит 015073d, 2026-10-12).
 - [x] Унифицировать версию: `pyproject.toml` = 0.1.0 vs
@@ -712,13 +713,15 @@ port-этап (§1), full observability/dashboards.
       kanban/cli/orchestrator (см. фазу 2).
 - [ ] `AGENTS.md` §10: снять «код ещё на v1, миграция не начата» — миграция
       фактически выполнена (models v2, snowflake id, статусы, TaskParserPlugin).
-- [ ] `docs/plugins.md`: §4 переписать под фактические секции Pre
-      (`on_input`) / Runtime (`on_upload(state)`; `on_token` удалён
-      2026-10-12) / Post (`on_output`); §5–§6 заменить 4-уровневую
-      SessionMemory/AgentSession/MemoryStore/BreakpointManager на фактическую
-      модель (flat-KV Memory ×3 уровня + подписки); §7 каталог привести к
-      факту (реализован TaskParserPlugin; Init/Input/Trigger/Output-каталоги —
-      planned); §10 структуру проекта сверить с деревом; убрать ссылки на
+- [x] `docs/plugins.md`: §4 переписан под фактические секции Pre
+      (`on_input(messages, context)`) / Runtime (`on_upload(state, context)`;
+      `on_token` удалён 2026-10-12; с 2026-10-12 контракт — возврат ParseState
+      со стоп-параметрами finish_reason) / Post (`on_output`); §5–§6 приведены
+      к фактической модели (flat-KV Memory ×4 уровня + подписки, delete по
+      glob; SessionMemory/AgentSession/MemoryStore/BreakpointManager помечены
+      ПЛАН); §7 каталог приведён к факту (реализован TaskParserPlugin;
+      Init/Input/Trigger/Output-каталоги — planned); §10 структура проекта
+      сверена с деревом; ссылки на
       несуществующие `parser.py`/`detector.py`/`enricher.py` (строки ~299,
       1543, 1564).
 - [ ] `docs/architecture.md` §2: таблица модулей — убрать строки

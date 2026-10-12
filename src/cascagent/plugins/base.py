@@ -138,7 +138,8 @@ class RuntimePlugin(Plugin):
 
     name = "base_runtime"
 
-    def on_upload(self, state: "Any") -> Dict[str, Any]:
+    def on_upload(self, state: "Any",
+                  context: Dict[str, Any]) -> "Any":
         """Vote on one ready element (WORD / SPECIAL) of the stream.
 
         ``state`` is the live ``cascagent.stream_parser.ParseState``:
@@ -146,24 +147,37 @@ class RuntimePlugin(Plugin):
         (``WORD`` — closed word in ``state.word``; ``SPECIAL`` — a
         service tag from the whitelist, also in ``state.word``; PARTIAL
         elements are NOT delivered — plugins never see half-words).
+        ``context`` is the run's shared context dict — passed BY
+        REFERENCE (decision 2026-10-12): all section hooks receive the
+        same object; plugin-to-plugin data exchange goes through it.
 
-        Operation types (semantics unchanged since 2026-10-11):
-        - ``{"op": "continue"}``               — keep generating;
-        - ``{"op": "stop",    "data": ...}``   — stop WITHOUT error
-          (natural end: EOS marker seen, budget met); data may carry a
-          replacement tail for the response;
-        - ``{"op": "error",   "data": "..."}`` — stop WITH error
-          (corrupted output, guard tripped); the agent surfaces it.
+        Return contract (decision 2026-10-12): return the SAME
+        ``ParseState`` object — possibly with stop parameters edited
+        in place (``finish_reason``, counters like ``word_count`` /
+        ``token_offset``). The agent continues parsing with the
+        returned value. Returning None means "no changes".
+
+        Stop semantics now live ON THE STATE (the old operation-type
+        dicts {"op": continue|stop|error} were replaced by direct
+        finish_reason editing):
+        - leave ``state.finish_reason`` as None → keep generating;
+        - set ``state.finish_reason = "stop"``  → natural end without
+          error (EOS seen, budget met);
+        - set ``state.finish_reason = "error"`` → corrupted output /
+          guard tripped; the agent surfaces it.
 
         Commit rule (docs/stream_parser_model.md, §7): the element is
         applied to the segment tree (word appended to ``stack[-1].text``;
         special opens/closes a Segment) ONLY if EVERY RuntimePlugin
-        returned continue. A bare ``Plugin`` subclass carries no stream
-        opinion at all → pass-through default. Transient buffers must
-        live in ``self.local_memory`` — the agent wipes it next run(),
-        so nothing here needs manual cleanup.
+        left the stream running (finish_reason falsy). A bare ``Plugin``
+        subclass carries no stream opinion at all → pass-through
+        default. Position info for budget guards: ``state.token_offset``
+        (ordinal number of the current element) and ``state.word_count``
+        (committed words so far). Transient buffers must live in
+        ``self.local_memory`` — the agent wipes it next run(), so
+        nothing here needs manual cleanup.
         """
-        return {"op": "continue"}
+        return state
 
 
 class PostPlugin(Plugin):
