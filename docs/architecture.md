@@ -41,7 +41,7 @@ Details: docs/protocol.md §2–3.
 | `plugins/base.py` | Plugin/PrePlugin/RuntimePlugin/PostPlugin (on_input/on_upload→bool/on_output) | ✅ v0.1 реализовано |
 | `plugins/task_parser.py` | SYSTEM_PROMPT + парсинг декомпозиции v2, дедуп (0.75), атомарность (поглотил parser.py+detector.py, удалены 2026-10-12) | ✅ v0.1 реализовано |
 | `bk_tree.py` | BK-tree fuzzy поиск инструментов, fix_typo | ✅ Этап 4 (метрики + stats + rebalance) |
-| `history.py` | JSONL история LLM-вызовов + debug.log (THINK / FINAL RESPONSE) | ⬜ Этап 1 |
+| `history.py` | JSONL история LLM-вызовов + debug.log (THINK / FINAL RESPONSE); опциональный Kanban-конструктор: зеркало в llm_calls + semantic_memory (RAG-переиспользование, recall_similar) | ✅ Этап 1 реализовано (+SQL-зеркало, тесты tests/test_history.py) |
 | `client.py` | OpenAI-совместимый клиент llama.cpp, think параметр, chunk-iterator | ⬜ Этап 2 |
 | `cache_manager.py` | save/restore KV-кэша через /slots API | ⬜ отложен (slot API нет) |
 | `decomposer.py` | DecomposerSession: одна задача = один изолированный вызов | ⬜ Этап 3 |

@@ -139,11 +139,18 @@ class Task:
         is_atom: bool = False,
         parent: Optional["Task"] = None,
         canonical: Optional["Task"] = None,
+        summary: Optional[str] = None,
     ):
         self.created_at = datetime.now(timezone.utc)
         self.id: int = snowflake_ids.next_id(self.created_at)
         self.brief = brief                      # one-line title (~50 tokens)
         self.description = description          # what to do (for the LLM)
+        #: Root-only field (data.md §1): the root task wraps the raw user
+        #: request in ``description``; ``summary`` holds its short digest,
+        #: produced ONLY for the root (None everywhere else). The RAG key
+        #: of a completed root task is this summary (brief ~50 tokens is
+        #: too coarse for whole requests).
+        self.summary = summary
         self.is_atom = is_atom                  # CPU flag: never decomposed
         self.embedding = embed(brief)           # one pass per task (A4.1)
         self.canonical = canonical              # future dedup graph (None in v1)
