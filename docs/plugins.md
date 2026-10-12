@@ -902,7 +902,7 @@ class Agent:
         #    gen = llm(messages)                     # ТОЛЬКО chunk-iterator
         #    for chunk in gen:                       # (str не поддерживается)
         #        for ev in parser.feed(chunk):       # WORD/SPECIAL элементы
-        #            process(ev):                    #   (в коде — замыкание vote)
+        #            process(ev):
         #            голосуют ВСЕ runtime-плагины on_upload(state, context)
         #            -> bool до первого False; все True -> parser.commit(ev)
         #              (commit создаёт Word и инкрементит word_count);

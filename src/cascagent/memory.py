@@ -242,7 +242,7 @@ class Agent:
         service (docs/stream_parser_model.md): raw chunks become WORD /
         SPECIAL elements; every element is delivered to ALL runtime
         plugins (on_upload) and applied to the segment tree ONLY if all
-        of them vote continue.
+        of them return True (continue).
         """
         self.local_memory.clear()
         context = dict(context or {})
@@ -261,10 +261,10 @@ class Agent:
             gen = self.llm(messages) if callable(self.llm) else self.llm
             stop: Optional[str] = None      # finish_reason of a plugin stop
 
-            def vote(ev):
+            def process(ev):
                 """Deliver one ready element to ALL runtime plugins; commit
                 ONLY on unanimous True (v5 contract, 2026-10-12). Returns
-                False when a voter stopped the loop."""
+                False when a plugin stopped the loop."""
                 nonlocal stop
                 status, payload = ev
                 parser.state.status = status
@@ -283,20 +283,20 @@ class Agent:
                 if chunk == "[DONE]":
                     break
                 for ev in parser.feed(chunk):
-                    if not vote(ev):
+                    if not process(ev):
                         break               # plugin stop mid-chunk
                 if stop is not None:
                     break
             if stop is None:
-                # Tail flush goes through the SAME vote path: the last
+                # Tail flush goes through the SAME delivery path: the last
                 # word of the stream must be votable too (rule 8).
                 tail = parser.drain_buffer()
                 if tail is not None:
-                    vote(tail)
+                    process(tail)
                 parser.finalize("stop")
             else:
                 # Plugin stopped the loop: close the tree WITHOUT flushing
-                # the un-voted raw tail into the committed output (rule 8
+                # the un-processed raw tail into the committed output (rule 8
                 # applies to clean ends only). Parser owns this logic.
                 parser.state.finish_reason = None    # close sets the truth
                 parser.close_on_stop(stop)
