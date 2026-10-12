@@ -19,6 +19,7 @@
 7. [Итоговая карта новых сущностей](#7-итоговая-карта-новых-сущностей)
 8. [Чек-лист продакшн-MVP](#8-чек-лист-продакшн-mvp)
 9. [Открытые вопросы к обсуждению](#9-открытые-вопросы-к-обсуждению)
+10. [План работ: аудит код↔документация (2026-10-12)](#10-план-работ-аудит-коддокументация-2026-10-12)
 
 ---
 
@@ -661,21 +662,105 @@ port-этап (§1), full observability/dashboards.
 
 ## 9. Открытые вопросы к обсуждению
 
-1. **Детальный дизайн SessionMemory с 4 скоупами** — объём дампа, частота
-   checkpoint, ротация файлов sessions/ (предложение: gzip, хранить 20
-   последних на агента).
-2. **Протокол parent-child** — сигнатура вызова child-агента из плагина
+Закрытые (пересмотрены по факту кода, аудит 2026-10-12):
+- ~~SessionMemory с 4 скоупами~~ → **закрыт**: реализована плоская модель —
+  три независимых flat-KV `Memory` (workspace/project/agent, `memory.py`),
+  без дампов/ротации; checkpoint-дампы при необходимости строятся поверх KV.
+- ~~canonical_id vs lazy decomposition~~ → частично закрыт: дедупликация
+  живёт в `TaskParserPlugin` (static-методы `is_duplicate`/`is_parent_repeat`);
+  место semantic-dedup в конвейере уточнить при реализации `semantic.py`.
+
+Открытые:
+1. **Протокол parent-child** — сигнатура вызова child-агента из плагина
    (нужен ли event-loop или синхронный вложенный run достаточен?).
-3. **Условные задачи** — принять/отклонить мини-DSL валидатора из §4.6.2;
+2. **Условные задачи** — принять/отклонить мини-DSL валидатора из §4.6.2;
    как Decomposer легально предлагает условия, не нарушая ADR-003.
-4. **Финальный стек хранения** — SQLite остаётся (канвас, память, версии
+3. **Финальный стек хранения** — SQLite остаётся (канвас, память, версии
    промптов, метрики — всё в одной БД?) или отдельные файлы; Postgres не
-   рассматриваем (локальный однопоточный продукт без сервера).
-5. **canonical_id vs lazy decomposition** — где именно в конвейере делать
-   semantic-dedup подзадач (до detector-цикла или после; один проход или
-   фоновый job).
+   рассматриваем (локальный однопоточный продукт без сервера). От `Memory`
+   (in-memory dict) нужен переход к персистентному бэкенду — решение до
+   реализации Recovery-плагинов (#3).
+4. **Соглашение об LLM-transport**: код (`Agent.run`) поддерживает и
+   sync-callable (str), и async/sync chunk-iterator; поведение Runtime-
+   плагинов (голосование `on_upload`) при str-LLM отличается (один проход
+   на полном тексте) — зафиксировать в docs/protocol.md / plugins.md.
+
+## 10. План работ (аудит «код ↔ документация», 2026-10-12)
+
+### Фаза 0 — гигиена репозитория (без изменения поведения)
+- [ ] Починить 2 падающих теста под текущий API: голосование Runtime-
+      плагинов идёт на parsed-элементах через `on_upload(state)`, а не
+      `on_token` (`tests/test_plugins_base.py::TestHierarchy::
+      test_runtime_stop_without_error`, `test_runtime_error_raises`).
+- [ ] Унифицировать версию: `pyproject.toml` = 0.1.0 vs
+      `src/cascagent/__init__.py::__version__` = 0.2.0.
+- [ ] NOTICE (пустой файл) — заполнить attribution-текстом Apache-2.0.
+- [ ] Entry point `cascagent = "cascagent.cli:main"` битый — модуля `cli.py`
+      нет; появляется в фазе 2 (либо временно убрать из pyproject).
+
+### Фаза 1 — рефакторинг документации (привести к фактическому состоянию кода)
+- [ ] `AGENTS.md` §6: дерево src не соответствует факту — `parser.py`/
+      `detector.py` удалены (поглощены `plugins/task_parser.py`); добавить
+      `memory.py`, `stream_parser.py`, `plugins/base.py`, `plugins/task_parser.py`.
+- [ ] `AGENTS.md` §7: признать, что v3-слой (Memory/Workspace/Project/Agent,
+      Pre/Runtime/Post, StreamParser, TaskParserPlugin) реализован ДОСРОЧНО
+      (был Этап 5+); переставить этапы: оставшийся путь — client/history/
+      kanban/cli/orchestrator (см. фазу 2).
+- [ ] `AGENTS.md` §10: снять «код ещё на v1, миграция не начата» — миграция
+      фактически выполнена (models v2, snowflake id, статусы, TaskParserPlugin).
+- [ ] `docs/plugins.md`: §4 переписать под фактические секции Pre
+      (`on_input`) / Runtime (`on_upload(state)`; `on_token` удалён
+      2026-10-12) / Post (`on_output`); §5–§6 заменить 4-уровневую
+      SessionMemory/AgentSession/MemoryStore/BreakpointManager на фактическую
+      модель (flat-KV Memory ×3 уровня + подписки); §7 каталог привести к
+      факту (реализован TaskParserPlugin; Init/Input/Trigger/Output-каталоги —
+      planned); §10 структуру проекта сверить с деревом; убрать ссылки на
+      несуществующие `parser.py`/`detector.py`/`enricher.py` (строки ~299,
+      1543, 1564).
+- [ ] `docs/architecture.md` §2: таблица модулей — убрать строки
+      `parser.py`/`detector.py` («миграция v1→v2» больше не актуальна),
+      добавить реальные модули и колонку статуса (done/planned: client,
+      history, kanban, cli, decomposer-orchestrator, semantic, rag,
+      enricher/executor/reflector/researcher, cache_manager).
+- [ ] `docs/protocol.md` §9: чеклист миграции `parser.py`/`detector.py`
+      (строки ~248–252) закрыть/переписать под `plugins/task_parser.py`;
+      §4/§5 сверить с полем `Task` v2 (snowflake, parent/children, depth).
+- [ ] `docs/algorithms.md`: §2/§5/§6 — эталонные алгоритмы живут в
+      `bk_tree.py` (done), `stream_parser.py` (done), `plugins/task_parser.py`
+      (duplicate-логика done); §3 semantic, §4 rag — пометить planned.
+- [ ] `docs/prompts.md` §5 (промпты enricher/executor/reflector/researcher) —
+      пометить как целевой дизайн: этих агентов в коде нет.
+- [ ] `docs/stream_parser_model.md`: снять неявную метку «не реализовано» —
+      `StreamParser` реализован и протестирован; добавить ссылку на
+      реализацию и зафиксировать фактическое окно (window_size).
+- [ ] Ссылки на несуществующие ADR: `docs/plugins.md:1729` (ADR-007),
+      `docs/roadmap.md:508` (ADR-005) — либо завести ADR-005/007, либо
+      переписать ссылки на существующие ADR-001..004 / решения этого файла.
+- [ ] README.md — сверить раздел «статус» с новым AGENTS.md §10.
+
+### Фаза 2 — терминальный агент (минимальный сквозной путь CLI → LLM → Kanban)
+Порядок зависимостей: client → history → kanban → orchestrator → cli → e2e.
+- [ ] `client.py`: `LlamaCppClient` — async-итератор чанков (OpenAI-совместимый
+      `/completion` llama.cpp server), параметры seed/max_tokens/stop, think-
+      режим; transport инъектируем (для MockLLM).
+- [ ] `history.py`: JSONL-история вызовов + debug.log (формат — docs/data.md §3).
+- [ ] `kanban.py`: SQLite-хранилище дерева задач (schema — docs/data.md).
+- [ ] Оркестратор `execute_task` (декомпозиция ленивая, ADR-004): поверх
+      `Agent.run()` + TaskParserPlugin; цикл brief→decompose→child…; здесь же
+      решается протокол parent-child (§9.1).
+- [ ] `cli.py` + фикс entry point: `--query`, `--max-depth`, рендер дерева,
+      режимы resume/replay (зависит от #3/#4 MVP-чеклиста).
+- [ ] `MockLLM` (roadmap #7) + e2e-тест «CLI → mock → дерево задач» — без сети.
+- [ ] `cache_manager.py` — ОТЛОЖЕН (зависит от slot-API llama.cpp; не блокирует MVP).
+
+### Фаза 3 — закрытие MVP-чеклиста (§8) после фазы 2
+Порядок: #5 StuckDetector → #2 PromptInjectionGuard → #1 timeout/tools →
+#3 Recovery (упирается в §9.3 — выбор персистентного бэкенда Memory) →
+#4 seed/replay → #6 observability.
 
 ---
 
 *Документ закрывает аудит 2026-10-10. Решения колонок «Решение» окончательны
-и не пересматриваются без нового ADR; пункты с 💡 требуют обсуждения (§9).*
+и не пересматриваются без нового ADR; пункты с 💡 требуют обсуждения (§9).
+План работ по синхронизации документации с кодом и путь к терминальному
+агенту — §10 (аудит 2026-10-12).*
