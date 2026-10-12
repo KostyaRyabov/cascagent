@@ -370,7 +370,7 @@ Workspace → Project → Agent. Методы `set_*`/`get_*` c суффикса
 |                    LOCAL                                   |
 |      Приватная для ОДНОГО вызова run()                     |
 |      Сбрасывается в начале каждого run() (делает агент)    |
-|      Примеры: parse_state, parse_errors, промежуточные     |
+|      Примеры: parse_error, промежуточные флаги,           |
 +-----------------------------------------------------------+
 ```
 
@@ -514,9 +514,10 @@ self.local_memory.set("think_content", state.word)
 think = self.local_memory.get("think_content", "")
 ```
 
-На практике этот канал сейчас использует сам агент: перед POST-фазой он
-кладёт в local `parse_state` (живое состояние StreamParser), а в
-`context` — собранный `think` из THINK-сегментов дерева.
+На практике `context` — единственный канал для внутреннего состояния
+конвейера: перед POST-фазой агент кладёт в него живой `parse_state`
+(состояние StreamParser) и собранный из THINK-сегментов `think`. В local-
+память внутреннее состояние парсинга НЕ пишется — там только данные плагинов.
 
 **Producer-Consumer между агентами (Researcher → Executor):**
 
@@ -584,7 +585,7 @@ if self.local_memory.get("needs_research"):
 
 | Префикс/ключ | Уровень | Пример | Кто пишет |
 |---------------|---------|--------|-----------|
-| `parse_state` | local | живое состояние StreamParser | агент (перед POST) |
+| `parse_state` | context | живое состояние StreamParser (не память!) | агент (перед POST) |
 | `think_*` | local | `think_content`, `think_length` | Runtime |
 | `enrichment_*` | local | `enrichment_0.2.1` | Pre |
 | `parsed`, `parse_error` | local | результат парсинга | Post |
@@ -856,7 +857,7 @@ class Agent:
         # 2. PRE:    messages = p.on_input(messages, context)   # цепочкой
         # 3. LLM+RUNTIME:
         #    parser = self._make_parser()            # свежий StreamParser
-        #    local_memory["parse_state"] = parser.state
+        #    context["parse_state"] = parser.state   # не память, §5.6
         #    for chunk in gen:                       # стрим или str-файк
         #        for ev in parser.feed(chunk):       # WORD/SPECIAL элементы
         #            голосуют ВСЕ runtime-плагины on_upload(state);
@@ -1460,7 +1461,7 @@ Think и состояние потока — в результате и local п
 ```python
 think = result["context"]["think"]              # THINK-сегменты дерева
 segments = result["segments"]                   # всё дерево сегментов
-state = agent.local_memory.get("parse_state")   # живой ParseState (до след. run)
+state = result["context"]["parse_state"]         # живой ParseState этого run
 ```
 
 ### 11.2 Свой pre-плагин: подстановка имени проекта

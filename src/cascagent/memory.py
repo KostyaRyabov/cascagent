@@ -236,8 +236,6 @@ class Agent:
             messages = plugin.on_input(messages, context)
 
         parser = self._make_parser()
-        #: Expose the live state to post-plugins / debugging via local memory.
-        self.local_memory.set("parse_state", parser.state)
         response = ""
         if self.llm is not None:
             # LLM seam: callable(messages) -> str | chunk iterator, or a
@@ -276,6 +274,9 @@ class Agent:
                     raise RuntimeError(f"runtime stopped with error: {stop}")
             response = parser.response_text() or response
 
+        #: Live parser state is passed to plugins directly via context —
+        #: it is an internal mechanism, not memory data (docs/plugins.md §2.4).
+        context["parse_state"] = parser.state
         context.setdefault("response", response)
         context.setdefault("think", "".join(
             s.text for s in parser.state.segments
