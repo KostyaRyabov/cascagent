@@ -9,7 +9,9 @@
 > `TaskParserPlugin` (`plugins/task_parser.py`). НЕ реализованы (план):
 > персистентность памяти (§5.2/§6.5 PersistentStore/MemoryFactory),
 > BreakpointManager (§5.8/§6.7), каталог плагинов §7, клиент LLM, канбан,
-> CLI-оркестратор. Остальное ниже — спецификация целевого состояния.
+> CLI-диспетчер и агенты ролевой модели v6 (`executor.py`, `orchestrator.py`,
+> `researcher.py`, `summarizer.py`, `validator.py` — ADR 005, product §4).
+> Остальное ниже — спецификация целевого состояния.
 > Смежные документы: `docs/architecture.md` (обзор модулей),
 > `docs/protocol.md` (протокол декомпозиции), `docs/process.md` (конвейер
 > обогащения контекста), `docs/prompts.md` (тексты промптов),
@@ -79,6 +81,29 @@
 а не «что делать агенту». Порядок плагинов внутри секции значим и
 фиксируется конфигурацией; плагины не вызывают друг друга напрямую —
 только через разделяемую память (§5).
+
+### 2.5 Принцип «agent-as-tool» (ADR 005, ролевая модель v6)
+
+Вызов подагента оформляется как инструмент в секции Pre/Post — например,
+`DecomposeTool` (PrePlugin оркестратора уровня) вызывает DecomposerAgent и
+кладёт результат (дерево детей в project-ключ `tasks`, `is_atom`) в память.
+При этом:
+
+- плагин-обёртка — только транспорт: он НЕ решает, кто будет исполнять
+  задачу;
+- вывод подагента — **факт для CPU-диспетчера**, который привязывает роль
+  исполнителя (Executor / Orchestrator) ПОСЛЕ завершения Pre-секции,
+  перед переходом задачи в RUNNING (process §1.1, ADR 005);
+- «сбой» Decomposer (задача оказалась атомарной — `<atom>` или
+  degenerate-ребёнок) — штатный путь: диспетчер увидит `is_atom=True`
+  и назначит Executor, без пересоздания задачи и смены роли в процессе.
+
+```mermaid
+flowchart LR
+    PRE[Pre-секция<br/>DecomposeTool → Decomposer] --> FACTS{Факты в памяти:<br/>is_atom, дети}
+    FACTS -- is_atom=True --> EX[RUNNING: Executor]
+    FACTS -- "is_atom=False, есть дети" --> OR[RUNNING: Orchestrator уровня N]
+```
 
 ---
 
@@ -183,6 +208,10 @@ OutputPlugin → **PostPlugin**. Хук `on_token` удалён 2026-10-12: Runt
 
 - обогащение контекста (RAG + semantic + siblings) — конвейер подробно
   описан в docs/process.md §2;
+- **вызов подагента как инструмента (agent-as-tool, §2.5)** — например,
+  `DecomposeTool` у Orchestrator/диспетчера: вызывает DecomposerAgent,
+  пишет детей в project-ключ `tasks`, кладёт факт `is_atom`; роль
+  исполнителя после этого выбирает CPU-диспетчер (ADR 005);
 - фильтрация PII во входе;
 - обрезка длинной истории (для multi-turn агентов);
 - подстановка переменных;
@@ -308,6 +337,9 @@ mutate-after); до коммита слово плагинам не видно.
 - парсинг ответа в структуру (TaskParserPlugin — ЕДИНСТВЕННЫЙ реализованный
   плагин: protocol v2 блоки «Название / Описание», двухуровневый `<atom>`,
   F1–F3, дедупликация, запись дерева в project-ключ `tasks`);
+- **вызов ValidatorAgent как инструмента (§2.5)** — PostPlugin проверяющего
+  контура Executor; механика передачи контекста — открытый вопрос
+  (product §4, заметка-TODO);
 - удаление дубликатов (входит в TaskParserPlugin, порог 0.75);
 - проверка качества (например, вырожденный повтор родителя = атом);
 - логирование в историю (JSONL + debug.log — ОБА блока, см. §2.4);
@@ -595,7 +627,7 @@ if not cached:
     self.local_memory.set(f"enrichment_{task.id}", cached)
 ```
 
-**Флаги координации (local, читает оркестратор после run — §11.3):**
+**Флаги координации (local, читает CPU-диспетчер после run — §11.3, §2.5):**
 
 ```python
 # Плагин A
@@ -619,8 +651,9 @@ if self.local_memory.get("needs_research"):
 | `needs_*`, флаги | local | `needs_research` | любой |
 | `*_stats`, `calls_count` | global | `think_stats`, `conversation_history` | StatisticsCollector |
 | `rate_limit_calls` | global | счётчики лимитов агента | Pre/Post |
-| `research_*`, `task_*_result` | project | findings, результаты задач | Post/оркестратор |
-| `tasks` | project | иерархия задач `{id: Task}` после декомпозиции (process §1.3, data.md §1) | Post (TaskParserPlugin) |
+| `research_*`, `task_*_result` | project | findings, результаты задач | Post/CPU-диспетчер |
+| `tasks` | project | иерархия задач `{id: Task}` после декомпозиции (process §1.3, data.md §1) | Post (TaskParserPlugin) / Pre (DecomposeTool, §2.5) |
+| `is_atom` | project (в записи Task) | факт атомарности после DecomposeTool — вход для привязки роли (ADR 005) | Pre (DecomposeTool) |
 | `global_stats`, `system_version` | workspace | сквозная статистика | MetricsWriter |
 
 Ключи без префикса — локальные переменные одного плагина, другим секциям
@@ -887,7 +920,12 @@ class PostPlugin(Plugin):              # секция POST (был OutputPlugin)
 (`plugins/task_parser.py`, PostPlugin); реестра `PLUGIN_REGISTRY` и
 загрузчика entry points пока нет (§12.1 — план).
 
-### 6.4 Agent (оркестратор, реализовано)
+### 6.4 Agent (внутренний цикл run(), реализовано)
+
+> Термин: здесь «оркестратор» — историческое имя цикла `Agent.run()`
+> (клей Pre→генерация→Runtime→Post). Ролевый **OrchestratorAgent** уровня
+> декомпозиции — отдельная сущность (§8.5, ADR 005); во избежание путаницы
+> раздел назван «внутренний цикл».
 
 Фактический цикл `run()` (memory.py) — без `AgentResult`/`bind(memory)` из
 черновика: результат это dict, память принадлежит самому агенту.
@@ -1225,6 +1263,12 @@ TOML-загрузчика и реестра в коде нет. Агенты v0.
 будет — его роль у ленивой подготовки в Pre, §4.2). Порядок плагинов в
 списке = порядок исполнения.
 
+Набор агентов — ролевая модель v6 (product §4, ADR 005): Decomposer,
+Executor, Researcher, Reflector, Orchestrator (бывш. ConflictResolver),
+Summarizer (опциональный), Validator (опциональный). Диспетчер выбирает
+исполнителя по фактам Pre-секции (§2.5), поэтому DecomposeTool стоит у
+диспетчера/Orchestrator, а не «внутри» исполнителя.
+
 ### 8.1 Decomposer (декомпозиция задач)
 
 Минимальная конфигурация: static prefix + обогащение + честный парсинг.
@@ -1260,13 +1304,17 @@ max_retries = 2
 мусор. Дерево задач живёт в project-ключе `tasks` (§5.7); плагин
 подставляет готовое поддерево к родителю, не перезаписывая ключ.
 
-### 8.2 Executor (выполнение атомарных задач)
+### 8.2 Executor (выполнение ТОЛЬКО атомарных задач, v6)
+
+Назначается CPU-диспетчером когда после Pre-секции `is_atom=True`
+(в т.ч. «сбой» Decomposer — §2.5, ADR 005). Неатомные задачи к нему
+не попадают: их ведёт Orchestrator (§8.5).
 
 ```toml
 [agent.executor]
 name = "executor"
 prompt_file = "prompts/execute.txt"
-tools = ["bash", "file_write", "file_read"]    # MCP-инструменты
+tools = ["bash", "file_write", "file_read", "research"]  # MCP + Researcher как tool (§2.5)
 
 init = [
   { plugin = "IndexLoader", source = "mcp" },  # BK-tree инструментов
@@ -1283,6 +1331,7 @@ trigger = [
 output = [
   { plugin = "HistoryLogger" },
   { plugin = "SemanticStore" },                 # remember(brief, result, task_id)
+  # { plugin = "ValidateTool" },               # опц. вызов ValidatorAgent (§4.3, TODO product §4)
 ]
 max_retries = 1
 ```
@@ -1312,7 +1361,7 @@ output = [
 max_iterations = 5                               # защита от зацикливания
 ```
 
-Результат кладётся в `research_cache` (CPU-слой оркестратора, не плагин).
+Результат кладётся в `research_cache` (CPU-слой диспетчера, не плагин).
 
 ### 8.4 Reflector (обратная связь после провала)
 
@@ -1337,20 +1386,83 @@ max_retries = 1
 ```
 
 Контракт решения v2 (`retry | reframe | give_up`) — docs/process.md §4;
-плагины лишь парсят и валидируют JSON-ответ, применение решает оркестратор.
+плагины лишь парсят и валидируют JSON-ответ, применение решает CPU-диспетчер.
 
-### 8.5 Таблица сравнения агентов
+### 8.5 Orchestrator (неатомные задачи, уровень N; бывш. ConflictResolver)
 
-| | Decomposer | Executor | Researcher | Reflector |
-|---|---|---|---|---|
-| Инструменты | нет | bash/file | web/docs/db/file/AST | нет |
-| Enrichment | да (500 ток) | да (топ-5) | нет (свой скоуп) | да (+siblings) |
-| Think-извлечение | да | да | да | да |
-| Retry | 2 | 1 | — | 1 |
-| SemanticStore | нет | да | нет | нет |
-| Изоляция вызова | local.clear() в run() | то же | то же | то же |
+Оркестратор своего уровня декомпозиции (v6, ADR 005): штатно ведёт
+неатомные задачи (`is_atom=False`, есть дети), аварийно — тупики
+(FAILED после retry/reflect, зацикливание). Свой экземпляр на уровень.
+Decomposer вызывается как PrePlugin-инструмент (§2.5); ожидание детей и
+сводка результатов — CPU-логика между run()-циклами, не плагин.
 
-### 8.6 Конфигурация памяти (ПЛАН)
+```toml
+[agent.orchestrator]
+name = "orchestrator"
+prompt_file = "prompts/orchestrate.txt"
+tools = ["ask_user", "replan"]                 # диалог с пользователем, корректировка плана
+
+input = [
+  { plugin = "DecomposeTool" },                # agent-as-tool: Decomposer → tasks + is_atom (§2.5)
+  { plugin = "ChildrenSummaryCompiler" },      # CPU-сводка DONE-результатов детей в user-контекст
+  { plugin = "ContextEnricher", include_siblings = true },
+]
+trigger = [
+  { plugin = "ThinkBlockExtractor" },
+  { plugin = "LoopGuard" },                    # детектор зацикливания уровня
+]
+output = [
+  { plugin = "TaskParser", threshold = 0.75 }, # редекомпозиция → новое поддерево в tasks
+  { plugin = "HistoryLogger" },
+]
+max_retries = 1
+automation = "ask"                              # ask | auto — разрешение тупиков (product §4)
+```
+
+### 8.6 Summarizer (опциональный, по запросу агента)
+
+Вызывается только явно включённым агентом-родителем через инструмент;
+триггер «текст длинный» считает CPU (бюджет), LLM не решает что суммировать
+(principles §2.1). Содержимое, выведенное самим агентом, суммирует он сам —
+Summarizer нужен для чужих/пользовательских артефактов (product §4, v4 п.5).
+
+```toml
+[agent.summarizer]
+name = "summarizer"
+prompt_file = "prompts/summarize.txt"
+tools = []
+input = []
+output = [ { plugin = "HistoryLogger" } ]
+```
+
+### 8.7 Validator (опциональный, PostPlugin Executor'а)
+
+⚠️ Открытый вопрос (заметка product §4): механика передачи в проверяющего
+последней реплики вызывающего агента + MCP-результатов + сведений
+Researcher + семантического контекста. Решать после базового цикла
+Executor→PostPlugin. Конфиг ниже — черновой placeholder.
+
+```toml
+[agent.validator]
+name = "validator"
+prompt_file = "prompts/validate.txt"
+tools = []
+output = [ { plugin = "VerdictParser" } ]       # pass | fail + причина → диспетчер (retry/give_up)
+```
+
+### 8.8 Таблица сравнения агентов
+
+| | Decomposer | Executor | Researcher | Reflector | Orchestrator | Summarizer | Validator |
+|---|---|---|---|---|---|---|---|
+| Инструменты | нет | bash/file/research | web/docs/db/file/AST | нет | ask_user/replan | нет | нет |
+| Enrichment | да (500 ток) | да (топ-5) | нет (свой скоуп) | да (+siblings) | да (+siblings, сводка детей) | нет | семантический контекст (TODO) |
+| Think-извлечение | да | да | да | да | да | нет | нет |
+| Retry | 2 | 1 | — | 1 | 1 | — | — |
+| SemanticStore | нет | да | нет | нет | нет | нет | нет |
+| Вызывается | Pre-секция диспетчера (DecomposeTool) | CPU-диспетчер (is_atom=True) | Executor как tool | CPU-диспетчер (FAILED) | CPU-диспетчер (неатом/тупик) | агент как tool (опц.) | PostPlugin Executor (опц.) |
+| Изоляция вызова | local.clear() в run() | то же | то же | то же | то же (экземпляр на уровень) | то же | то же |
+
+### 8.9 Конфигурация памяти (ПЛАН)
 
 Общая для всех агентов проекта (в `config.toml`, см. `docs/config.md`;
 к v0.1 ничего не читается — память полностью in-process, §5.2):
@@ -1380,6 +1492,19 @@ max_session_age_days = 30
 ## 9. Жизненный цикл
 
 ### 9.1 Последовательность фаз одного run() (реализовано)
+
+```mermaid
+flowchart LR
+    A[run messages context] --> B[PRE: on_input<br/>обогащение, DecomposeTool §2.5]
+    B --> C[Генерация: LLM чанк-итератор]
+    C --> D[ResponseParser: WORD/SPECIAL/PARTIAL]
+    D --> E[RUNTIME: on_upload голосование bool]
+    E -- True --> D
+    E -- False stop --> F[finalize]
+    E -- False error --> G[RuntimeError state.error]
+    F --> H[POST: on_output accept/retry/reject]
+    H --> I[dict-результат]
+```
 
 ```
 run(messages, context)
@@ -1434,7 +1559,7 @@ SQLite-запись (<1 мс на ключ) появится с персисте
 | Runtime-плагин вернул error | finalize("error") + RuntimeError(data) |
 | Runtime-плагин упал | **факт v0.1: исключение летит из run()**; «отключается на текущий стрим» — план |
 | Post-плагин вернул retry/reject | **факт v0.1: только выход из цепочки post**; повтор run()/AgentRejectedError — план |
-| LLM недоступна | клиент ретраит с backoff; после лимита — TaskFailedError в оркестратор (план) |
+| LLM недоступна | клиент ретраит с backoff; после лимита — TaskFailedError в CPU-диспетчер (план) |
 
 Принцип (целевой): отказ вспомогательного плагина НЕ должен срывать основной
 вызов LLM; отказ критического (TaskParserPlugin) — обязан быть виден, а не
@@ -1548,7 +1673,7 @@ class ResearchNeededDetector(PostPlugin):
             self.local_memory.set("research_query", context["task"].brief)
         return {"response": response, "action": "accept"}
 
-# Оркестратор ПОСЛЕ run() читает флаги (не агенты между собой!):
+# CPU-диспетчер ПОСЛЕ run() читает флаги (не агенты между собой!):
 result = decomposer.run(messages, context={"task": task})
 if decomposer.local_memory.get("needs_research"):
     finding = researcher.run([...])       # local переживает run до следующего запуска
@@ -1678,8 +1803,8 @@ my_limiter = "mypackage.plugins:TokenBudgetLimiter"
 4. **Post-плагины идемпотентны** — повторный прогон на том же ответе даёт
    тот же результат (retry полагается на это; сам retry-цикл — план §9.3).
 5. **Никаких обращений к другим агентам напрямую** — координация только через
-   оркестратор и флаги local-памяти (§11.3) или project-уровень
-   (Producer-Consumer, §5.6).
+   CPU-диспетчер и флаги local-памяти (§11.3), project-уровень
+   (Producer-Consumer, §5.6) или явный agent-as-tool из Pre/Post-секции (§2.5).
 6. **Данные кладутся на самый приватный подходящий уровень** (§5.7): local →
    global → project → workspace; запись в project/workspace из pre/runtime
    запрещена (только post и ленивая подготовка в pre по флагу).
