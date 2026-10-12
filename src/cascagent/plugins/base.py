@@ -37,7 +37,7 @@ Two structural decisions of 2026-10-11 shape the API below:
 4. Naming convention: every concrete plugin class ends with the suffix
    ``Plugin`` (TaskParserPlugin, ...). Think/response splitting is NOT a
    plugin — OutputSplitterPlugin was removed (2026-10-12); stream
-   structure is produced by the built-in agent service ``StreamParser``
+   structure is produced by the built-in agent service ``ResponseParser``
    (cascagent.stream_parser, spec docs/stream_parser_model.md).
 
 Contract notes:
@@ -127,7 +127,7 @@ class PrePlugin(Plugin):
 
 class RuntimePlugin(Plugin):
     """Section RUNTIME — hot path, called on every parsed stream unit
-    (WORD / SPECIAL) produced by the agent's built-in StreamParser
+    (WORD / SPECIAL) produced by the agent's built-in ResponseParser
     (was TriggerPlugin). Budget: microseconds, NO I/O (§12.2 п.3).
 
     ``should_stop`` was removed: deciding when to cut the stream short

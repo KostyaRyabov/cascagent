@@ -4,7 +4,7 @@
 > базовые классы секций (§6.3, факт: `plugins/base.py` — Pre/Runtime/Post,
 > Init убран), плоская KV-память `Memory` + иерархия Workspace/Project/Agent
 > и оркестратор `Agent.run()` (§6.4 в фактическом виде, `memory.py`),
-> встроенный сервис `StreamParser` (`stream_parser.py`, спека
+> встроенный сервис `ResponseParser` (`stream_parser.py`, спека
 > `docs/stream_parser_model.md`) и единственный конкретный плагин
 > `TaskParserPlugin` (`plugins/task_parser.py`). НЕ реализованы (план):
 > персистентность памяти (§5.2/§6.5 PersistentStore/MemoryFactory),
@@ -100,7 +100,7 @@
 
 Исключение из правила «вся логика в плагинах» (решение 2026-10-12):
 структурирование потока — не плагин, а **встроенный сервис агента**
-`StreamParser` (`stream_parser.py`, спека `docs/stream_parser_model.md`).
+`ResponseParser` (`stream_parser.py`, спека `docs/stream_parser_model.md`).
 Он не расширяем конфигом и отсутствует в реестре плагинов.
 
 ### 3.2 Структура агента
@@ -110,7 +110,7 @@
 |                     AGENT (memory.Agent)            |
 |                                                     |
 |  llm: callable(messages) -> str | chunk iterator    |
-|  parser_config: dict  -> StreamParser per run()     |
+|  parser_config: dict  -> ResponseParser per run()     |
 |                                                     |
 |  [PRE plugins]      [RUNTIME plugins]   [POST]      |
 |                                                     |
@@ -156,7 +156,7 @@ bind(): состояние агента между вызовами живёт �
 ленивая тяжёлая подготовка в PrePlugin под флагом в global-памяти),
 InputPlugin → **PrePlugin**, TriggerPlugin → **RuntimePlugin**,
 OutputPlugin → **PostPlugin**. Хук `on_token` удалён 2026-10-12: Runtime
-плагины голосуют по разобранным элементам встроенного StreamParser через
+плагины голосуют по разобранным элементам встроенного ResponseParser через
 `on_upload(state, context)`; `should_stop` и `on_stream_end` убраны.
 Контракт уточнён 2026-10-12 (финальный): `state` и `context` передаются
 **по ссылке**, плагин редактирует state на месте и возвращает **bool** —
@@ -225,7 +225,7 @@ class ContextEnricher(PrePlugin):        # ПЛАН — не реализова�
 ### 4.2 Runtime-плагины
 
 Работают на каждом **разобранном элементе потока** (WORD или SPECIAL из
-встроенного StreamParser) во время стриминговой генерации. PARTIAL-элементы
+встроенного ResponseParser) во время стриминговой генерации. PARTIAL-элементы
 плагинам не доставляются. Самые мощные и опасные: исполняются в горячем
 цикле, стоимость одного плагина умножается на количество элементов (бюджет —
 §9.2, запрет I/O — §12.2 п.3).
@@ -299,7 +299,7 @@ mutate-after); до коммита слово плагинам не видно.
 ### 4.3 Post-плагины
 
 Выполняются после завершения генерации. Постобработка финального ответа.
-Финализация потока (`StreamParser.finalize`) к этому моменту уже выполнена
+Финализация потока (`ResponseParser.finalize`) к этому моменту уже выполнена
 агентом: think/final разделены, ответ чистый — отдельного сплиттера нет
 (OutputSplitterPlugin удалён 2026-10-12).
 
@@ -543,7 +543,7 @@ think = self.local_memory.get("think_content", "")
 
 На практике `context` — единственный канал для внутреннего состояния
 конвейера: перед POST-фазой агент кладёт в него живой `parse_state`
-(состояние StreamParser) и собранный из THINK-сегментов `think`. В local-
+(состояние ResponseParser) и собранный из THINK-сегментов `think`. В local-
 память внутреннее состояние парсинга НЕ пишется — там только данные плагинов.
 
 **Producer-Consumer между агентами (Researcher → Executor):**
@@ -612,7 +612,7 @@ if self.local_memory.get("needs_research"):
 
 | Префикс/ключ | Уровень | Пример | Кто пишет |
 |---------------|---------|--------|-----------|
-| `parse_state` | context | живое состояние StreamParser (не память!) | агент (перед POST) |
+| `parse_state` | context | живое состояние ResponseParser (не память!) | агент (перед POST) |
 | `think_*` | local | `think_content`, `think_length` | Runtime |
 | `enrichment_*` | local | `enrichment_0.2.1` | Pre |
 | `parsed`, `parse_error` | local | результат парсинга | Post |
@@ -834,7 +834,7 @@ domain-плагинов (например `indices`, `precompiled_prompt`) — �
 > памяти), `should_stop` и `on_stream_end` (семантика останова живёт в
 > bool-возврате `on_upload` + `state.finish_reason` — см. §4.2; с 2026-10-12 хук
 > `on_token` удалён — плагины голосуют по
-> разобранным элементам встроенного StreamParser; финализация потока — работа
+> разобранным элементам встроенного ResponseParser; финализация потока — работа
 > парсера/агента). Память биндится в плагин
 > ОДИН РАЗ (`bind()`), а не прокидывается аргументом в каждый хук — хот-путь
 > на элемент потока не тащит лишние параметры. Плагин видит ВСЕ четыре уровня:
@@ -865,7 +865,7 @@ class RuntimePlugin(Plugin):           # секция RUNTIME (был TriggerPlu
 
     def on_upload(self, state, context) -> bool:
         """Голосование по готовому элементу потока (WORD/SPECIAL) от
-        встроенного StreamParser; state — живой ParseState ПО ССЫЛКЕ
+        встроенного ResponseParser; state — живой ParseState ПО ССЫЛКЕ
         (state.status, state.word, state.token_offset, state.word_count,
         state.finish_reason, state.error) — редактируется на месте.
         Возврат bool: True = всё хорошо, продолжать цикл; False = стоп
@@ -898,7 +898,7 @@ class Agent:
         # 1. local_memory.clear()                    # изоляция прогона (§5.6)
         # 2. PRE:    messages = p.on_input(messages, context)   # цепочкой
         # 3. LLM+RUNTIME:
-        #    parser = self._make_parser()            # свежий StreamParser
+        #    parser = self._make_parser()            # свежий ResponseParser
         #    for chunk in gen:                       # стрим или str-файк
         #        for ev in parser.feed(chunk):       # WORD/SPECIAL элементы
         #            st.token_offset += 1            # позиция элемента
@@ -1384,7 +1384,7 @@ run(messages, context)
   +-- local_memory.clear()            # local чист; global/project/workspace живут
   +-- PRE plugins   (цепочкой: messages = p.on_input(messages, context))
   |     читают project/global/workspace, пишут local (промежуточное)
-  +-- GENERATION + RUNTIME (стрим chunk'ами через встроенный StreamParser)
+  +-- GENERATION + RUNTIME (стрим chunk'ами через встроенный ResponseParser)
   |     для каждого ГОТОВОГО элемента (WORD/SPECIAL):
   |       st.token_offset += 1
   |       голосуют все runtime-плагины on_upload(state, context) -> bool
@@ -1466,7 +1466,7 @@ tests/
 
 План (в дереве отсутствует, см. §6.5–6.7, §7): `breakpoints.py`, подкаталоги
 `plugins/init|input|trigger|output/` со списанными плагинами,
-`test_stream_parser.py`/`test_memory.py` (Memory и StreamParser пока
+`test_stream_parser.py`/`test_memory.py` (Memory и ResponseParser пока
 покрываются тестами базовых классов и task_parser), `test_plugins_*.py` по
 файлу на секцию. Модули-предшественники `parser.py` и `detector.py` **удалены**
 — их логика поглощена `TaskParserPlugin`; `enricher.py` в текущем дереве
@@ -1709,7 +1709,7 @@ my_limiter = "mypackage.plugins:TokenBudgetLimiter"
 
 | Версия | Что добавляется |
 |--------|-----------------|
-| 0.1.x (сейчас) | done: base-классы (Pre/Runtime/Post) + 4-уровневая память + StreamParser + Agent.run + TaskParserPlugin |
+| 0.1.x (сейчас) | done: base-классы (Pre/Runtime/Post) + 4-уровневая память + ResponseParser + Agent.run + TaskParserPlugin |
 | 0.2.x | retry/reject-цикл в Agent (max_retries, AgentRejectedError); изоляция падений плагинов (§9.3); snapshot()/breakpoints (#3) |
 | 0.3.x | Персистентность: sqlite-бэкенд за тем же API `Memory` + namespace'ы (§6.5–6.6); SessionCleanup |
 | 0.4.x | Каталог §7 по одному (HistoryLogger, StatisticsCollector, EarlyStopper…); PLUGIN_REGISTRY + TOML-конфигурации (§8, §12.1); entry points |

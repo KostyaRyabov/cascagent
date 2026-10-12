@@ -4,7 +4,7 @@ ALL parsing / duplicate-detection logic lives in this class as static
 methods (leader decisions 2026-10-11): the former module ``cascagent.parser``
 and ``detector.py`` are deleted — duplicate / parent-echo detection is
 TaskParserPlugin's job now (rules F2/§3.7, process.md §1.3). Think/response
-splitting moved OUT to the built-in agent service ``StreamParser``
+splitting moved OUT to the built-in agent service ``ResponseParser``
 (cascagent.stream_parser, spec docs/stream_parser_model.md) — a generic
 stream-format concern, NOT a plugin (OutputSplitterPlugin was removed
 2026-10-12); by the time this plugin runs, the response is already clean.
@@ -274,7 +274,7 @@ class TaskParserPlugin(PostPlugin):
         ``context`` contract (set by the orchestrator before the run):
         - ``task`` (Task, REQUIRED) — the node being decomposed; its brief
           drives the parent-echo rule (F2/§3.7);
-        - ``response`` (str, optional) — set by the agent's StreamParser
+        - ``response`` (str, optional) — set by the agent's ResponseParser
           finalization to the think-free text; takes precedence over the
           raw argument.
         - ``think`` (str, optional) — think block, only logged downstream.

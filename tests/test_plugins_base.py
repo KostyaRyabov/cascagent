@@ -119,14 +119,14 @@ class TestRuntimePlugin:
         # on_stream_end is GONE — stream finalization is PostPlugin's job.
         assert not hasattr(RuntimePlugin, "on_stream_end")
         # on_token is GONE (2026-10-12) — plugins vote on parsed elements,
-        # raw tokens belong to the built-in StreamParser service.
+        # raw tokens belong to the built-in ResponseParser service.
         assert not hasattr(RuntimePlugin, "on_token")
 
     def test_bool_stop_contract(self):
         """v5 API (2026-10-12): on_upload(state, context) returns bool —
         True keeps the loop running, False stops it; state is edited IN
         PLACE (passed by reference), never returned."""
-        from cascagent.stream_parser import ParseState, ResponseParser
+        from cascagent.stream_parser import ParseState, ParseStatus
 
         class Stopper(self.Bare):
             def on_upload(self, state, context):
@@ -140,7 +140,7 @@ class TestRuntimePlugin:
                 return True
 
         p = Stopper()
-        mk = lambda w: ParseState(status=ResponseParser.WORD, word=w)
+        mk = lambda w: ParseState(status=ParseStatus.WORD, word=w)
         s = mk("x")
         assert p.on_upload(s, {}) is True
         assert s.finish_reason is None           # keep generating
@@ -154,7 +154,7 @@ class TestRuntimePlugin:
 
     def test_context_shared_by_reference(self):
         """context is passed by reference — plugin mutations visible."""
-        from cascagent.stream_parser import ParseState, ResponseParser
+        from cascagent.stream_parser import ParseState, ParseStatus
 
         class Note(self.Bare):
             def on_upload(self, state, context):
@@ -163,8 +163,8 @@ class TestRuntimePlugin:
 
         ctx: dict = {}
         p = Note()
-        p.on_upload(ParseState(status=ResponseParser.WORD, word="a"), ctx)
-        p.on_upload(ParseState(status=ResponseParser.WORD, word="b"), ctx)
+        p.on_upload(ParseState(status=ParseStatus.WORD, word="a"), ctx)
+        p.on_upload(ParseState(status=ParseStatus.WORD, word="b"), ctx)
         assert ctx["seen"] == ["a", "b"]
 
 

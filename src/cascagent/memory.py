@@ -188,8 +188,8 @@ class Agent:
         self.parser_config: Dict[str, Any] = dict(parser_config or {})
 
     def _make_parser(self):
-        """Instantiate StreamParser from ``parser_config`` (agent-owned)."""
-        from cascagent.stream_parser import StreamParser
+        """Instantiate ResponseParser from ``parser_config`` (agent-owned)."""
+        from cascagent.stream_parser import ResponseParser
         cfg = self.parser_config
         kwargs: Dict[str, Any] = {}
         if "whitelist" in cfg:
@@ -197,7 +197,7 @@ class Agent:
         for key in ("max_depth", "fuzzy_max_distance", "max_buffer_chunks"):
             if key in cfg:
                 kwargs[key] = cfg[key]
-        return StreamParser(**kwargs)
+        return ResponseParser(**kwargs)
 
     # -- plugin wiring --------------------------------------------------
     def add_plugin(self, plugin: Any) -> Any:
@@ -236,9 +236,9 @@ class Agent:
     # -- one full iteration ----------------------------------------------
     def run(self, messages: List[Dict[str, str]],
             context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """PRE → LLM → RUNTIME(stream via built-in StreamParser) → POST.
+        """PRE → LLM → RUNTIME(stream via built-in ResponseParser) → POST.
 
-        First act: wipe local scope. The agent owns the StreamParser
+        First act: wipe local scope. The agent owns the ResponseParser
         service (docs/stream_parser_model.md): raw chunks become WORD /
         SPECIAL elements; every element is delivered to ALL runtime
         plugins (on_upload) and applied to the segment tree ONLY if all

@@ -1,6 +1,8 @@
-"""StreamParser — built-in agent service that structures an LLM stream.
+"""ResponseParser — built-in agent service that structures an LLM stream.
 
-NOT a plugin (leader decision 2026-10-12; OutputSplitterPlugin was removed
+Renamed from ``StreamParser`` (leader decision 2026-10-13: there is only ONE
+parser in the project and it is called ResponseParser). NOT a plugin
+(leader decision 2026-10-12; OutputSplitterPlugin was removed
 in favour of this service). Specification: docs/stream_parser_model.md
 (final model v3 — flat ``segments`` list + open ``stack``, no ``Unit``,
 no tree ``root``; every Segment has an explicit kind, RESPONSE == «outside
@@ -52,12 +54,12 @@ TAG_RE = re.compile(r"<\s*(/?)\s*([a-zA-Z_][\w\-]*)((?:[^<>]|\"[^\"]*\")*)>")
 _SELF_CLOSING_RE = re.compile(r"/\s*$")
 
 
-class ResponseParser(str, Enum):
+class ParseStatus(str, Enum):
     """How far the tokens of the current iteration formed an element.
 
-    Renamed from ``ResponseParser`` (leader decision 2026-10-13). NOTE: this
-    is the ELEMENT-STATUS enum; the live parser state object stays
-    ``ParseState`` (renaming it is a separate, not-yet-scheduled step).
+    Element-status enum. The parser service itself is ``ResponseParser``
+    (renamed from StreamParser, leader decision 2026-10-13); the live
+    mutable state object passed to RuntimePlugins stays ``ParseState``.
     """
 
     PARTIAL = "partial"  # element unfinished — wait for more chunks
@@ -88,7 +90,7 @@ class ParseState:
     """The single CURRENT state of the parser (model v3)."""
 
     # --- status of the current element ---
-    status: ResponseParser = ResponseParser.PARTIAL
+    status: ParseStatus = ParseStatus.PARTIAL
     word: Optional[str] = None            # filled only for WORD / SPECIAL
 
     # --- word reconstruction ---
@@ -173,12 +175,12 @@ class BKTree:
         return out
 
 
-class StreamParser:
+class ResponseParser:
     """Chunk-by-chunk structuring service owned by the Agent.
 
     Usage (the agent drives this loop inside run()):
 
-        parser = StreamParser(whitelist=["think", "tool_call"], ...)
+        parser = ResponseParser(whitelist=["think", "tool_call"], ...)
         for chunk in llm.stream(messages):
             for ev in parser.feed(chunk):        # [(WORD|SPECIAL, payload)]
                 if not all plugins vote continue:
@@ -226,7 +228,7 @@ class StreamParser:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def feed(self, chunk: str) -> List[Tuple[ResponseParser, Optional[str]]]:
+    def feed(self, chunk: str) -> List[Tuple[ParseStatus, Optional[str]]]:
         """Consume one raw SSE delta / token string.
 
         Returns the READY events produced by this chunk — empty list while
@@ -239,7 +241,7 @@ class StreamParser:
             raise RuntimeError("stream already finalized ([DONE] received)")
         st.buffer += chunk
         self._chunks_in_buffer += 1
-        events: List[Tuple[ResponseParser, Optional[str]]] = []
+        events: List[Tuple[ParseStatus, Optional[str]]] = []
         while True:
             ev = self._next_event()
             if ev is None:
@@ -254,25 +256,25 @@ class StreamParser:
             events.append(self._flush_buffer_as_word())
         return events
 
-    def commit(self, event: Tuple[ResponseParser, Optional[str]]) -> None:
+    def commit(self, event: Tuple[ParseStatus, Optional[str]]) -> None:
         """Apply a VOTED element to the segment tree (rule 7).
 
         Call ONLY after every RuntimePlugin.on_upload returned continue.
         """
         status, payload = event
         st = self.state
-        if status is ResponseParser.WORD:
+        if status is ParseStatus.WORD:
             assert payload is not None
             target = st.current or self._ensure_response_segment()
             target.text += payload + " "
             st.word_count += 1             # committed words counter
-        elif status is ResponseParser.SPECIAL:
+        elif status is ParseStatus.SPECIAL:
             assert payload is not None
             self._apply_special(payload)
         else:                                 # PARTIAL is never committed
             raise ValueError(f"cannot commit a partial element: {event!r}")
 
-    def drain_buffer(self) -> Optional[Tuple[ResponseParser, Optional[str]]]:
+    def drain_buffer(self) -> Optional[Tuple[ParseStatus, Optional[str]]]:
         """Turn the raw buffer remainder into one votable WORD event.
 
         Shared by rule 9 (max_buffer_chunks overflow), the agent's
@@ -291,7 +293,7 @@ class StreamParser:
         st.buffer = ""
         self._chunks_in_buffer = 0
         st.token_offset += 1
-        return (ResponseParser.WORD, leftover)
+        return (ParseStatus.WORD, leftover)
 
     def finalize(self, reason: str = "stop") -> ParseState:
         """Close the stream ([DONE] / finish_reason). Rule 8.
@@ -308,7 +310,7 @@ class StreamParser:
                 # the same WORD/SPECIAL pipeline (token_offset counter) so
                 # the last word of the stream still gets its runtime vote.
                 self.commit(tail)
-            st.status = ResponseParser.WORD
+            st.status = ParseStatus.WORD
             st.word = None
             while len(st.stack) > 1:          # keep RESPONSE at the bottom
                 top = st.stack.pop()
@@ -338,7 +340,7 @@ class StreamParser:
         # those chunks were never delivered as elements.
         st.buffer = ""
         self._chunks_in_buffer = 0
-        st.status = ResponseParser.WORD
+        st.status = ParseStatus.WORD
         st.word = None
         while len(st.stack) > 1:          # keep RESPONSE at the bottom
             top = st.stack.pop()
@@ -361,7 +363,7 @@ class StreamParser:
     # ------------------------------------------------------------------
     # Element extraction
     # ------------------------------------------------------------------
-    def _next_event(self) -> Optional[Tuple[ResponseParser, Optional[str]]]:
+    def _next_event(self) -> Optional[Tuple[ParseStatus, Optional[str]]]:
         """Extract the next ready element from the head of the buffer."""
         st = self.state
         buf = st.buffer
@@ -389,9 +391,9 @@ class StreamParser:
             # nothing closable before the tag → emit SPECIAL now
             st.buffer = buf[m.end():]
             self._chunks_in_buffer = max(0, self._chunks_in_buffer - 1)
-            st.status = ResponseParser.SPECIAL
+            st.status = ParseStatus.SPECIAL
             st.word = body
-            return (ResponseParser.SPECIAL, body)
+            return (ParseStatus.SPECIAL, body)
         # No complete tag. If an unterminated '<...' tail could still
         # become a whitelisted tag, hold it as PARTIAL (chunk-boundary
         # ambiguity, model doc §v2 п.4); otherwise process words.
@@ -421,7 +423,7 @@ class StreamParser:
                 return True
         return False
 
-    def _pop_closed_word(self) -> Optional[Tuple[ResponseParser, Optional[str]]]:
+    def _pop_closed_word(self) -> Optional[Tuple[ParseStatus, Optional[str]]]:
         """Cut the first boundary-closed word off the buffer head."""
         st = self.state
         m = WORD_BOUNDARY_RE.search(st.buffer)
@@ -432,19 +434,19 @@ class StreamParser:
         self._chunks_in_buffer = max(0, self._chunks_in_buffer - 1)
         if not word:                          # leading-only boundary
             return self._pop_closed_word() if st.buffer else None
-        st.status = ResponseParser.WORD
+        st.status = ParseStatus.WORD
         st.word = word
-        return (ResponseParser.WORD, word)
+        return (ParseStatus.WORD, word)
 
-    def _flush_buffer_as_word(self) -> Tuple[ResponseParser, Optional[str]]:
+    def _flush_buffer_as_word(self) -> Tuple[ParseStatus, Optional[str]]:
         """Rule 9 overflow: whole buffer becomes one WORD."""
         st = self.state
         word = st.buffer.strip()
         st.buffer = ""
         self._chunks_in_buffer = 0
-        st.status = ResponseParser.WORD
+        st.status = ParseStatus.WORD
         st.word = word
-        return (ResponseParser.WORD, word)
+        return (ParseStatus.WORD, word)
 
     # ------------------------------------------------------------------
     # Tag recognition & segment application

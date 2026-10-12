@@ -5,7 +5,7 @@ TaskParserPlugin — decomposition parsing and duplicate detection,
 including the absorbed DuplicateDetector rules), history. The former
 standalone parser.py module is deleted. Think/response splitting lives
 neither in plugins nor in TaskParserPlugin: it is a built-in agent
-service (StreamParser), not a plugin; OutputSplitterPlugin was removed.
+service (ResponseParser), not a plugin; OutputSplitterPlugin was removed.
 
 CPU-algorithm layer (Этап 4, started): bk_tree — BK-tree fuzzy search with
 pluggable distance metrics, usage statistics and rebalancing (P4 tool-name

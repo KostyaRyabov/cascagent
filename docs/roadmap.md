@@ -709,7 +709,7 @@ port-этап (§1), full observability/dashboards.
       `detector.py` удалены (поглощены `plugins/task_parser.py`); добавить
       `memory.py`, `stream_parser.py`, `plugins/base.py`, `plugins/task_parser.py`.
 - [ ] `AGENTS.md` §7: признать, что v3-слой (Memory/Workspace/Project/Agent,
-      Pre/Runtime/Post, StreamParser, TaskParserPlugin) реализован ДОСРОЧНО
+      Pre/Runtime/Post, ResponseParser, TaskParserPlugin) реализован ДОСРОЧНО
       (был Этап 5+); переставить этапы: оставшийся путь — client/history/
       kanban/cli/orchestrator (см. фазу 2).
 - [ ] `AGENTS.md` §10: снять «код ещё на v1, миграция не начата» — миграция
@@ -739,7 +739,7 @@ port-этап (§1), full observability/dashboards.
 - [ ] `docs/prompts.md` §5 (промпты enricher/executor/reflector/researcher) —
       пометить как целевой дизайн: этих агентов в коде нет.
 - [ ] `docs/stream_parser_model.md`: снять неявную метку «не реализовано» —
-      `StreamParser` реализован и протестирован; добавить ссылку на
+      `ResponseParser` реализован и протестирован; добавить ссылку на
       реализацию и зафиксировать фактическое окно (window_size).
 - [ ] Ссылки на несуществующие ADR: `docs/plugins.md:1729` (ADR-007),
       `docs/roadmap.md:508` (ADR-005) — либо завести ADR-005/007, либо
