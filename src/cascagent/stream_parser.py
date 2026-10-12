@@ -96,9 +96,11 @@ class ParseState:
     # --- word reconstruction ---
     buffer: str = ""                      # raw un-assembled tail
 
-    # --- stream position (decision 2026-10-12) ---
+    # --- stream position (decision 2026-10-12; two counters per leader
+    #     decision 2026-10-13: tokens AND words, global over the response) ---
     token_offset: int = 0                 # ordinal number of the current
                                           # element delivered to plugins
+    token_count: int = 0                  # raw chunks fed (transport units)
     word_count: int = 0                   # committed WORDs so far
 
     # --- segments ---
@@ -239,6 +241,7 @@ class ResponseParser:
         st = self.state
         if st.done:
             raise RuntimeError("stream already finalized ([DONE] received)")
+        st.token_count += 1               # raw transport counter (chunks)
         st.buffer += chunk
         self._chunks_in_buffer += 1
         events: List[Tuple[ParseStatus, Optional[str]]] = []
