@@ -40,14 +40,18 @@ def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
     # TaskStatus; product §5)
     kanban.update_status(task.id, TaskStatus.ENRICHMENT, started_at=datetime.now(timezone.utc))
 
-    # 1. Обогащение контекста (CPU, §2) — этап ENRICHMENT: выбор агента-исполнителя,
-    #    MCP-инструменты, базы знаний/recall, формирование контекста
+    # 1. Обогащение контекста (CPU, §2) — этап ENRICHMENT: сначала PrePlugin-секция
+    #    (DecomposeTool как agent-as-tool, Enricher, MCP-инструменты, базы
+    #    знаний/recall), затем CPU-диспетчер выбирает исполнителя по фактам
+    #    PrePlugin'ов (ADR 005): is_atom=True → Executor (в т.ч. "сбой"
+    #    Decomposer: <atom> или degenerate-ребёнок), is_atom=False → Orchestrator
+    #    уровня, тупик → Orchestrator аварийный режим.
     enriched = enricher.enrich(
         brief=task.brief,
         parent_context=context,
         completed_siblings=kanban.done_siblings(task.id),
     )
-    # ENRICHMENT → RUNNING: контекст собран, начинаем LLM-вызовы
+    # ENRICHMENT → RUNNING: контекст собран, агент выбран, начинаем LLM-вызовы
     kanban.update_status(task.id, TaskStatus.RUNNING)
 
     # 2. Декомпозиция — только если детей ещё нет (ленивость)

@@ -119,26 +119,97 @@ siblings; результаты «стекают» вверх, формируя r
 | Агент | Модуль | Триггер | Вход | Выход (контракт) | Кто вызывает |
 |-------|--------|---------|------|------------------|--------------|
 | **DecomposerAgent** (специализация — декомпозиция задач) | `decomposer.py` / v3: агент-композиция плагинов (plugins §8.1) | задача не атом (`is_atom=False`), детей ещё нет | brief + enriched context + siblings-checklist | текст по протоколу: блоки «Название / Описание» через пустую строку или `<atom>`; дальше — CPU-конвейер TaskParser (process §1.3) | Оркестратор |
-| **ExecutorAgent** | `executor.py` | задача — атом (неатомы — не его зона, см. ConflictResolver) | brief + description + контекст родителя (≤ budget) | текст результата (или ошибка с кодом) | Оркестратор |
+| **ExecutorAgent** | `executor.py` | задача — атом после PrePlugin (неатомы — не его зона, см. Orchestrator; в т.ч. «сбой» Decomposer → атом, ADR 005) | brief + description + контекст родителя (≤ budget) | текст результата (или ошибка с кодом) | CPU-диспетчер (после PrePlugin) |
 | **ReflectAgent** | `reflector.py` | FAILED атома или degenerate-цикл декомпозиции | brief + description + result/error + trace статуса | JSON-lite: `причина` + `предложение` (переформулировка задачи) | Оркестратор (после retry) |
 | **ResearchAgent** | `researcher.py` | enrichment не нашёл ничего релевантного (recall/RAG пусты) | вопрос (brief) | краткая сводка фактов ≤ K токенов | Enricher через оркестратор |
 | **SummarizerAgent** | `executor.py` | children done, результат > budget | конкатенация детских results | сжатые выводы для `parent.result` | Оркестратор |
 | **ValidatorAgent** | ⬜ план (опц.) | сомнительные результаты Executor | задача + результат | pass/fail + причина | PostPlugin Executor |
-| **ConflictResolverAgent** | `conflict_resolver.py` (⬜ план) | неатомная задача (оркестратор своего уровня декомпозиции); тупик: FAILED после retry/reflect, degenerate-цикл, зацикливание | diagnosis + дерево задач + история статусов / сводка результатов детей | подтверждение DONE, новый план (редекомпозиция) или ask (вопрос пользователю) | Оркестратор = он же (для неатомов — свой экземпляр на уровень) |
+| **OrchestratorAgent** (бывш. ConflictResolver, переименован ADR 005) | `orchestrator.py` (⬜ план) | неатомная задача после PrePlugin (оркестратор своего уровня декомпозиции); тупик: FAILED после retry/reflect, degenerate-цикл, зацикливание, contradictory siblings | diagnosis + дерево задач + история статусов / сводка результатов детей | подтверждение DONE, новый план (редекомпозиция) или ask (вопрос пользователю) | CPU-диспетчер = он же для всех неатомных уровней (свой экземпляр на уровень) |
 
-**Ролевая модель v5 (зафиксировано 2026-10-13, уточнение к v4):**
+**Ролевая модель v6 (зафиксировано 2026-10-13; ADR 005; уточняет v4/v5):**
 Агенты делятся на шесть специализированных ролей:
 1. **Executor** — выполняет ТОЛЬКО атомарные задачи: использует MCP tools, может вызывать Researcher. Не дергает Decomposer и не редекомпозирует.
 2. **Researcher** — изолированный поиск информации через MCP/RAG; никто другой не выполняет поиск.
 3. **Validator** — опциональная проверка результата через PostPlugin (заметка: механика передачи контекста решается отдельно).
-4. **Decomposer** — декомпозиция одного уровня до атомарных подзадач.
+4. **Decomposer** — декомпозиция одного уровня до атомарных подзадач; вызывается как PrePlugin (agent-as-tool); его вывод — ФАКТ для диспетчера, а не приказ.
 5. **Summarizer** — опциональный суммаризатор по требованию других агентов.
-6. **ConflictResolver (= Оркестратор уровня)** — выполняет НЕатомарные задачи как оркестратор СВОЕГО уровня декомпозиции: запрашивает Decomposer, получает результаты детей как контекст, затем либо подтверждает выполнение, либо ищет новые подходы (редекомпозиция), либо зовёт ask-диалог с пользователем. Также разрешает тупики нижних уровней (FAILED после retry/reflect, зацикливание).
+6. **Orchestrator** (переименован из ConflictResolver) — выполняет НЕатомарные задачи как оркестратор СВОЕГО уровня декомпозиции: запрашивает Decomposer, получает результаты детей как контекст, затем либо подтверждает выполнение, либо ищет новые подходы (редекомпозиция), либо зовёт ask-диалог с пользователем. Также разрешает тупики нижних уровней (FAILED после retry/reflect, зацикливание, противоречия sibling-результатов). Работает одинаково на всех уровнях дерева.
 
-**Двухконтурная модель исполнения (v5):**
+**Привязка агента после PrePlugin (ADR 005).** Разрыв между «Decomposer сказал: неатом» и «на деле оказался атом» (`<atom>` или degenerate-ребёнок) — штатный путь, а не ошибка:
+- ENRICHMENT = сначала PrePlugin-секция (DecomposeTool, Enricher, recall), затем CPU-диспетчер выбирает исполнителя по собранным фактам;
+- `is_atom=True` → Executor; `is_atom=False`, есть дети → Orchestrator; тупик → Orchestrator (аварийный режим);
+- Kanban-задача едина, смена роли не пересоздаёт задачу; повторной декомпозиции нет (ленивость, ADR 004).
+
+```mermaid
+flowchart TD
+    U[Запрос пользователя] --> ROOT[Корневая задача в Kanban PENDING]
+    ROOT --> ENR[ENRICHMENT]
+    subgraph ENRICH[Этап ENRICHMENT: PrePlugin → выбор агента]
+        PRE[PrePlugin-секция:\nDecomposeTool agent-as-tool,\nEnricher, recall/RAG] --> FACTS{Факты:\nis_atom? дети?}
+    end
+    ENR --> PRE
+    FACTS -- "is_atom=True\n(в т.ч. 'сбой' Decomposer)" --> RUN_E[RUNNING: Executor]
+    FACTS -- "is_atom=False" --> RUN_O[RUNNING: Orchestrator уровня]
+    RUN_E --> POST[PostPlugin: Validator опц.] --> DONE[DONE]
+    DONE --> UP{родитель есть?}
+    UP -- да --> WAIT[Оркестратор родителя ждёт детей]
+    WAIT --> SUM[Сводка/Summarizer → результат родителя] --> DONE
+    RUN_O -- "дети → Kanban" --> ENR
+    RUN_O -- "тупик ребёнка:\nFAILED после retry/reflect,\nзацикливание, конфликт siblings" --> CRISIS[Orchestrator аварийный режим]
+    CRISIS --> REFLECT[ReflectAgent: reframe] --> PEND[PENDING depth+1]
+    CRISIS --> REDEC[Редекомпозиция → новые дети] --> ENR
+    CRISIS --> ASK[ask: вопрос пользователю] --> USERDIALOG[Диалог, корректировка плана] --> ENR
+    style CRISIS fill:#fde,stroke:#c6c
+    style RUN_O fill:#eef,stroke:#66c
+```
+
+**Двухконтурная модель исполнения (v6):**
 - **Контур атомов (дешёвый):** PENDING(атом) → Executor → PostPlugin/Validator → DONE. Никакого LLM-оркестрирования.
-- **Контур неатомов (дорогой, рекурсивный):** PENDING(неатом) → ConflictResolver как оркестратор уровня: PrePlugin-decompose → дети в Kanban → дождаться детей → сводка результатов детей в контекст → подтвердить/редекомпозировать/ask. Каждый уровень дерева — свой экземпляр ConflictResolver со своим контекстом.
-- Глобальный детерминированный CPU-конвейер (A10/A11) остаётся диспетчером очередей и родителем обоих контуров; ConflictResolver включается только внутри неатомных узлов и в тупиках.
+- **Контур неатомов (дорогой, рекурсивный):** PENDING(неатом) → Orchestrator как оркестратор уровня: PrePlugin-decompose → дети в Kanban → дождаться детей → сводка результатов детей в контекст → подтвердить/редекомпозировать/ask. Каждый уровень дерева — свой экземпляр Orchestrator со своим контекстом.
+- Глобальный детерминированный CPU-конвейер (A10/A11) остаётся диспетчером очередей и родителем обоих контуров; Orchestrator включается только внутри неатомных узлов и в тупиках.
+
+```mermaid
+sequenceDiagram
+    participant U as Пользователь
+    participant CPU as CPU-конвейер (A10/A11)
+    participant O as Orchestrator (уровень N)
+    participant D as Decomposer (PrePlugin)
+    participant K as Kanban
+    participant E as Executor (атом)
+    participant R as Researcher
+    U->>CPU: запрос
+    CPU->>K: корневая задача PENDING
+    CPU->>O: старт уровня (после PrePlugin: is_atom=false)
+    O->>D: decompose(task) [agent-as-tool]
+    D-->>O: блоки подзадач / <atom>
+    alt <atom> или degenerate-ребёнок
+        O-->>CPU: факт is_atom=true
+        CPU->>E: RUNNING (привязка после PrePlugin, ADR 005)
+    else есть дети
+        O->>K: дети PENDING
+        loop каждый ребёнок (FIFO, single-flight)
+            CPU->>K: PENDING → ENRICHMENT
+            alt атом
+                CPU->>E: RUNNING
+                E->>R: research(question) [tool]
+                R-->>E: сводка ≤ K токенов
+                E-->>K: DONE(result)
+            else неатом
+                CPU->>O: новый экземпляр Orchestrator (уровень N+1)
+            end
+        end
+        K-->>O: все дети DONE
+        O->>O: сводка результатов детей (Summarizer при превышении budget)
+        alt подтверждаем
+            O-->>K: DONE(parent.result)
+        else тупик/конфликт
+            O->>U: ask: варианты разрешения
+            U-->>O: решение / авто-режим конфига
+            O->>D: редекомпозиция
+        end
+    end
+    K-->>U: отчёт: результат + дерево + метрики
+```
 
 **Вызов агентов как MCP tools:** подагенты (Decomposer, Researcher, Summarizer, Validator) регистрируются в реестре инструментов вызывающего агента; вызов подагентa — это `agent-as-tool` плагин (Pre/Post секция), который запускает изолированный `run()` подагента и возвращает результат как вывод инструмента. Пользователь может декларировать своих агентов и правила: кто кого имеет право вызывать.
 
@@ -163,8 +234,8 @@ siblings; результаты «стекают» вверх, формируя r
 - `DONE` / `FAILED` — корректно выполнена / ошибка или недостаточно данных.
 
 ```
-PENDING ──(старт: ENRICHMENT — агент, MCP, БЗ, контекст)──► разбита? ──да──► ДЕТИ в Kanban, родитель (ConflictResolver, оркестратор уровня) ждёт детей → сводка детей → подтвердить/редекомпозировать/ask
-   │                        │нет(<atom>)
+PENDING ──(старт: ENRICHMENT — PrePlugin → CPU-выбор агента, MCP, БЗ, контекст)──► разбита? ──да──► ДЕТИ в Kanban, родитель (Orchestrator, оркестратор уровня) ждёт детей → сводка детей → подтвердить/редекомпозировать/ask
+   │                        │нет(<atom>, в т.ч. "сбой" Decomposer → роль привязывается после PrePlugin, ADR 005)
    ▼                        ▼
  RUNNING(атом: Executor) ──ok──► DONE ──► summarize_results() вверх по дереву
    │ failed
