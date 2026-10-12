@@ -257,7 +257,7 @@ class Agent:
             # bare chunk iterator (tests/fakes). Chunks are raw SSE
             # delta.content pieces — the parser assembles words from them.
             gen = self.llm(messages) if callable(self.llm) else self.llm
-            stop: Optional[Dict[str, Any]] = None
+            stop: Optional[str] = None      # finish_reason of a plugin stop
             if isinstance(gen, str):          # fake/test LLM: whole text
                 for ev in parser.feed(gen):
                     parser.commit(ev)         # no runtime vote on a string LLM
@@ -271,30 +271,33 @@ class Agent:
                         status, payload = ev
                         parser.state.status = status
                         parser.state.word = payload
-                        # v4 API (2026-10-12): hooks receive (state, context)
-                        # and return the ParseState — possibly with stop
-                        # params edited in place (finish_reason). Returning
-                        # None means "no changes". The element is committed
-                        # ONLY if every voter left finish_reason falsy.
-                        voted = None
+                        # v5 API (2026-10-12): hooks receive (state, context)
+                        # BY REFERENCE and return bool — True keeps the loop
+                        # running, False stops it. state is edited in place
+                        # (finish_reason / error / counters). On the first
+                        # False the agent breaks and inspects finish_reason:
+                        # "stop" → clean end, "error" (or unset) → raise.
+                        # The element is committed ONLY if every voter said
+                        # True.
                         for rt in self.runtime_plugins:
-                            res = rt.on_upload(parser.state, context)
-                            if res is not None:
-                                parser.state = res   # keep edits for parsing
-                            fr = getattr(parser.state, "finish_reason", None)
-                            if fr:
-                                voted = {"op": fr}
+                            ok = rt.on_upload(parser.state, context)
+                            if not ok:
+                                fr = getattr(parser.state,
+                                             "finish_reason", None)
+                                stop = fr or "error"
+                                parser.state.finish_reason = stop
                                 break
-                        if voted is not None:
-                            stop = voted   # element NOT committed (vote rule)
-                            break
+                        if stop is not None:
+                            break             # element NOT committed (vote rule)
                         parser.commit(ev)
                     if stop is not None:
                         break
                 parser.state.finish_reason = None    # finalize sets the truth
-                parser.finalize(stop["op"] if stop else "stop")
-                if stop is not None and stop["op"] == "error":
-                    raise RuntimeError(f"runtime stopped with error: {stop}")
+                parser.finalize(stop if stop else "stop")
+                if stop is not None and stop == "error":
+                    msg = getattr(parser.state, "error", None)
+                    raise RuntimeError(f"runtime stopped with error: "
+                                       f"{msg or 'no message'}")
             response = parser.response_text() or response
 
         #: Live parser state is passed to plugins directly via context —
@@ -306,7 +309,9 @@ class Agent:
             if s.kind.name == "THINK").strip())
         result: Dict[str, Any] = {"response": response, "context": context,
                                   "segments": parser.state.segments,
-                                  "finish_reason": parser.state.finish_reason}
+                                  "finish_reason": parser.state.finish_reason,
+                                  "error": getattr(parser.state, "error",
+                                                   None)}
         for plugin in self.post_plugins:
             r = plugin.on_output(response, context)
             response = r.get("response", response)

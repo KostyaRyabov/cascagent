@@ -157,12 +157,14 @@ bind(): состояние агента между вызовами живёт �
 InputPlugin → **PrePlugin**, TriggerPlugin → **RuntimePlugin**,
 OutputPlugin → **PostPlugin**. Хук `on_token` удалён 2026-10-12: Runtime
 плагины голосуют по разобранным элементам встроенного StreamParser через
-`on_upload(state, context)`; `should_stop` и `on_stream_end` убраны. С
-2026-10-12 семантика останова живёт НА САМОМ ParseState: плагин возвращает
-state (обычно тот же объект) с отредактированным `finish_reason`
-(None → продолжить, `"stop"` → стоп без ошибки, `"error"` → стоп с
-ошибкой); op-словари `{"op": ...}` сняты. Финализация потока — работа
-парсера/агента.
+`on_upload(state, context)`; `should_stop` и `on_stream_end` убраны.
+Контракт уточнён 2026-10-12 (финальный): `state` и `context` передаются
+**по ссылке**, плагин редактирует state на месте и возвращает **bool** —
+`True` = продолжать цикл, `False` = остановить. При первом `False` агент
+анализирует `state.finish_reason`: `"stop"` → чистый конец без ошибки,
+`"error"` (или не задан) → RuntimeError; кастомное сообщение текста ошибки
+несёт новое поле `state.error`. op-словари `{"op": ...}` сняты. Финализация
+потока — работа парсера/агента.
 
 | Секция | Когда | Частота | Назначение |
 |--------|-------|---------|-----------|
@@ -241,28 +243,37 @@ class ContextEnricher(PrePlugin):        # ПЛАН — не реализова�
 class StopOnDone(RuntimePlugin):         # ПЛАН — не реализован
     """Останавливает генерацию, когда встречен маркер конца ответа."""
 
-    def on_upload(self, state, context):
+    def on_upload(self, state, context) -> bool:
         if state.status == ParseStatus.SPECIAL and state.word == "</done>":
             state.finish_reason = "stop"
-        return state
+            return False                 # стоп цикла
+        return True                      # всё хорошо, продолжаем
 ```
 
-**Контракт Runtime-плагина (`on_upload(state, context)`), решён 2026-10-12:**
+**Контракт Runtime-плагина (`on_upload(state, context) -> bool`), решён
+2026-10-12 (финальный):**
 
 ```python
-return state                            # дефолт базы: continue (finish_reason None)
-state.finish_reason = "stop"            # стоп БЕЗ ошибки (EOS, бюджет достигнут)
-state.finish_reason = "error"           # стоп С ошибкой (битый вывод, guard) —
-                                        # агент поднимает RuntimeError наружу
-return None                             # «без изменений» (то же, что вернуть state)
+return True                             # дефолт базы: всё хорошо, продолжать
+state.finish_reason = "stop"; return False   # стоп БЕЗ ошибки (EOS, бюджет)
+state.finish_reason = "error"; return False  # стоп С ошибкой — агент
+#                                          поднимет RuntimeError наружу;
+#                                          текст: state.error = "..." (поле)
 ```
+
+Возвращаемое значение — только `bool`; объект state наружу не возвращается
+(он и так передан по ссылке). Если плагин вернул `False`, но
+`finish_reason` не задал, агент трактует останов как `"error"` (останов
+без заявленной причины подозрителен по определению).
 
 `context` — общий словарь прогона, передаётся ВСЕМ хукам всех секций
 по ссылке (Pre/Runtime/Post видят один и тот же объект; обмен данными
 между плагинами — через него). Останов-параметры редактируются прямо на
 ParseState; счётчики позиции для budget-гардов: `state.token_offset`
 (порядковый номер текущего элемента) и `state.word_count` (число
-закоммиченных слов). План v5 (docs/stream_parser_model.md, «Модель Word»):
+закоммиченных слов). Кастомное сообщение ошибки — поле `state.error`
+(попадает в текст RuntimeError и в результат прогона как `result["error"]`).
+План v5 (docs/stream_parser_model.md, «Модель Word»):
 сегмент станет лентой объектов `Word` (`segment.words`, глобальный `idx`,
 `is_hidden` от `kind`), плагинам разрешается прямой доступ — мутация текста,
 reorder и любые операции со СЛОВАМИ ПОСЛЕ их коммита (append-at-commit,
@@ -275,10 +286,10 @@ mutate-after); до коммита слово плагинам не видно.
   `self.local_memory` (агент трёт её каждым `run()`, reset() плагинам не нужен);
 - **правило коммита**: элемент применяется к дереву сегментов (слово →
   `stack[-1].text`, special → открытие/закрытие Segment) только если ВСЕ
-  Runtime-плагины оставили `finish_reason` пустым; непустой `finish_reason`
-  прерывает голосование и останавливает поток (docs/stream_parser_model.md §7);
-- порядок runtime-плагинов значим: голосование идёт списком, побеждает
-  первый непустой `finish_reason`.
+  Runtime-плагины вернули `True`; первый вернувший `False` прерывает
+  голосование и останавливает поток (docs/stream_parser_model.md §7);
+- порядок runtime-плагинов значим: голосование идёт списком, останавливает
+  первый вернувший `False`.
 
 Известное расхождение поведения (открытый вопрос, фаза 2): str-LLM
 (тестовый фейк) коммитит элементы без голосования, chunk-iterator —
@@ -820,7 +831,7 @@ domain-плагинов (например `indices`, `precompiled_prompt`) — �
 > TriggerPlugin → RuntimePlugin, OutputPlugin → PostPlugin. Из API убраны
 > `reset()` (очистка — ответственность агента: `run()` стирает local-скоуп
 > памяти), `should_stop` и `on_stream_end` (семантика останова живёт в
-> `finish_reason` возвращаемого ParseState — см. §4.2; с 2026-10-12 хук
+> bool-возврате `on_upload` + `state.finish_reason` — см. §4.2; с 2026-10-12 хук
 > `on_token` удалён — плагины голосуют по
 > разобранным элементам встроенного StreamParser; финализация потока — работа
 > парсера/агента). Память биндится в плагин
@@ -851,15 +862,16 @@ class PrePlugin(Plugin):               # секция PRE (был InputPlugin)
 class RuntimePlugin(Plugin):           # секция RUNTIME (был TriggerPlugin)
     name = "base_runtime"
 
-    def on_upload(self, state, context):        # -> ParseState | None
+    def on_upload(self, state, context) -> bool:
         """Голосование по готовому элементу потока (WORD/SPECIAL) от
-        встроенного StreamParser; state — живой ParseState
-        (state.status, state.word, state.token_offset, state.word_count).
-        Возвращает тот же ParseState с отредактированными стоп-параметрами
-        (finish_reason: None → продолжить, "stop" → стоп без ошибки,
-        "error" → стоп с ошибкой); None = «без изменений».
-        context — общий словарь прогона (по ссылке). Дефолт: pass-through."""
-        return state
+        встроенного StreamParser; state — живой ParseState ПО ССЫЛКЕ
+        (state.status, state.word, state.token_offset, state.word_count,
+        state.finish_reason, state.error) — редактируется на месте.
+        Возврат bool: True = всё хорошо, продолжать цикл; False = стоп
+        (агент смотрит state.finish_reason: "stop" → чистый конец,
+        "error"/не задан → RuntimeError; текст ошибки — state.error).
+        context — общий словарь прогона (по ссылке). Дефолт: True."""
+        return True
 
 class PostPlugin(Plugin):              # секция POST (был OutputPlugin)
     name = "base_post"
@@ -889,18 +901,19 @@ class Agent:
         #    for chunk in gen:                       # стрим или str-файк
         #        for ev in parser.feed(chunk):       # WORD/SPECIAL элементы
         #            st.token_offset += 1            # позиция элемента
-        #            голосуют ВСЕ runtime-плагины on_upload(state, context);
-        #            finish_reason пуст у всех -> parser.commit(ev)
-        #              (commit инкрементит word_count),
-        #            иначе стоп -> элемент НЕ коммитится
+        #            голосуют ВСЕ runtime-плагины on_upload(state, context)
+        #            -> bool; все True -> parser.commit(ev)
+        #              (commit инкрементит word_count);
+        #            первый False -> стоп (finish_reason: "stop"|"error",
+        #            не задан -> "error"), элемент НЕ коммитится
         #    parser.state.finish_reason = None       # finalize ставит истину
         #    parser.finalize("stop"|"error")         # хвост буфера флашится
-        #    finish_reason == "error" -> RuntimeError
+        #    finish_reason == "error" -> RuntimeError(state.error)
         # 4. context["response"], context["think"]   # think из THINK-сегментов
         #    context["parse_state"] = parser.state   # живой state для POST (§5.6)
         # 5. POST:   r = p.on_output(response, context)  # цепочкой
         #    result = {"response", "context", "segments", "finish_reason",
-        #              "parsed", "metadata", "action"}
+        #              "error", "parsed", "metadata", "action"}
         #    action != "accept" -> выход из цепочки   # retry/reject — план:
         #    # max_retries/AgentRejectedError в код ещё не завезены (§9.3)
         return result
@@ -1372,18 +1385,18 @@ run(messages, context)
   +-- GENERATION + RUNTIME (стрим chunk'ами через встроенный StreamParser)
   |     для каждого ГОТОВОГО элемента (WORD/SPECIAL):
   |       st.token_offset += 1
-  |       голосуют все runtime-плагины on_upload(state, context)
-  |       finish_reason пуст у всех -> parser.commit(ev) (+word_count);
-  |                                  иначе -> элемент не коммитится
+  |       голосуют все runtime-плагины on_upload(state, context) -> bool
+  |       все True -> parser.commit(ev) (+word_count);
+  |       первый False -> стоп по state.finish_reason, элемент не коммитится
   |     конец стрима: parser.finalize("stop"|"error") -> флаш хвоста буфера
-  |     finish_reason == "error" -> RuntimeError
+  |     finish_reason == "error" -> RuntimeError(state.error)
   +-- context["response"], context["think"]   # think = THINK-сегменты дерева
   +-- POST plugins  (парсинг TaskParserPlugin -> ...)
   |     читают local/context; пишут parsed/metadata/action в результат;
   |     могут писать global (статистика), project (tasks), workspace (суммы)
   |     action != "accept" -> выход из цепочки
   |     # retry/reject-цикл (max_retries, AgentRejectedError) — ПЛАН, в коде нет
-  +-- return {"response", "context", "segments", "finish_reason",
+  +-- return {"response", "context", "segments", "finish_reason", "error",
               "parsed", "metadata", "action"}
       # local будет очищен в начале следующего run
 ```
@@ -1412,7 +1425,7 @@ SQLite-запись (<1 мс на ключ) появится с персисте
 | Источник ошибки | Поведение |
 |-----------------|-----------|
 | Pre-плагин упал | **факт v0.1: исключение летит из run()** (fail fast); «логируется и пропускается» — план |
-| Runtime-плагин вернул stop | поток останавливается без ошибки, finish_reason="stop" |
+| Runtime-плагин вернул False (finish_reason="stop") | поток останавливается без ошибки |
 | Runtime-плагин вернул error | finalize("error") + RuntimeError(data) |
 | Runtime-плагин упал | **факт v0.1: исключение летит из run()**; «отключается на текущий стрим» — план |
 | Post-плагин вернул retry/reject | **факт v0.1: только выход из цепочки post**; повтор run()/AgentRejectedError — план |
@@ -1684,7 +1697,7 @@ my_limiter = "mypackage.plugins:TokenBudgetLimiter"
 | Иерархия Workspace/Project/Agent (add_*, *_memory свойства) | да (semver minor) | project/workspace могут быть None у невстроенного агента |
 | Сигнатуры on_input/on_upload(state, context)/on_output | да (semver major на ломку) | context — общий словарь прогона, передаётся всем хукам по ссылке (решение 2026-10-12); новые optional-параметры — minor |
 | bind(workspace/project/global/local_memory) | да (semver major на ломку) | порядок/наборы keyword-аргументов фиксированы |
-| Контракт runtime: возврат ParseState, стоп через finish_reason (None/"stop"/"error") | нет до 1.0.0 | op-словари сняты (2026-10-12); новые значения finish_reason добавляются расширением enum |
+| Контракт runtime: bool-возврат (False = стоп), причина в state.finish_reason ("stop"/"error"), текст в state.error | нет до 1.0.0 | op-словари сняты (2026-10-12); возврат ParseState заменён на bool (2026-10-12); новые значения finish_reason добавляются расширением enum |
 | Результат run() (dict: response/context/segments/parsed/metadata/action) | нет до 1.0.0 | поля добавляются; удаление — major |
 | PersistentStore API (set/get/all/clear) | да (semver minor) — ПЛАН | схема таблицы `memory(namespace,key,value,updated_at)` |
 | BreakpointManager JSONL-формат | нет до 1.0.0 — ПЛАН | при смене формата — версионирование записи `v` |

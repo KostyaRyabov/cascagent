@@ -68,6 +68,7 @@ class ParseState:
 
     # --- поток / протокол ---
     finish_reason: Optional[str] = None   # "stop" | "length" | "tool_calls" | None
+    error: Optional[str] = None           # кастомный текст при finish_reason == "error"
     done: bool = False                    # получен [DONE]
 ```
 
@@ -94,14 +95,18 @@ class ParseState:
 
 ```python
 class RuntimePlugin:
-    def on_upload(self, state: ParseState, context: dict) -> ParseState | None:
+    def on_upload(self, state: ParseState, context: dict) -> bool:
         """Вызывается когда элемент готов (WORD/SPECIAL).
-        Возврат: тот же ParseState с отредактированными стоп-параметрами
-        (finish_reason: None → продолжить, "stop" → стоп без ошибки,
-        "error" → стоп с ошибкой); None = «без изменений» (решение 2026-10-12,
-        op-словари сняты).
+        state и context передаются ПО ССЫЛКЕ — плагин редактирует state
+        на месте (счётчики, finish_reason, error), объект наружу не
+        возвращается. Возврат bool (финальное решение 2026-10-12):
+        True = всё хорошо, продолжать цикл; False = остановить поток.
+        При первом False агент смотрит state.finish_reason:
+        "stop" → чистый конец без ошибки; "error" или не задан →
+        RuntimeError (кастомный текст — в поле state.error).
+        op-словари и возврат ParseState сняты.
         Слово попадает в stack[-1].text, а special-элемент создаёт/закрывает сегмент
-        ТОЛЬКО если все плагины оставили finish_reason пустым."""
+        ТОЛЬКО если все плагины вернули True."""
 ```
 
 ## Правила, зафиксированные в обсуждении

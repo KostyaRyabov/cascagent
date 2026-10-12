@@ -131,53 +131,56 @@ class RuntimePlugin(Plugin):
     (was TriggerPlugin). Budget: microseconds, NO I/O (§12.2 п.3).
 
     ``should_stop`` was removed: deciding when to cut the stream short
-    is exactly what ``on_upload``'s operation types are for. The hook
-    signature changed from raw ``on_token(token, accumulated)`` to
-    ``on_upload(state)`` (decision 2026-10-12): plugins no longer see
-    raw tokens — they vote on structured units in ParseState."""
+    is exactly what ``on_upload``'s boolean + finish_reason split is for.
+    The hook signature changed from raw ``on_token(token, accumulated)``
+    to ``on_upload(state, context)`` (decision 2026-10-12): plugins no
+    longer see raw tokens — they vote on structured units in ParseState."""
 
     name = "base_runtime"
 
     def on_upload(self, state: "Any",
-                  context: Dict[str, Any]) -> "Any":
+                  context: Dict[str, Any]) -> bool:
         """Vote on one ready element (WORD / SPECIAL) of the stream.
 
-        ``state`` is the live ``cascagent.stream_parser.ParseState``:
+        ``state`` is the live ``cascagent.stream_parser.ParseState``
+        passed BY REFERENCE (decision 2026-10-12, refined same day):
+        plugins edit it in place — there is no returned state object.
         ``state.status`` tells which kind of element is pending
         (``WORD`` — closed word in ``state.word``; ``SPECIAL`` — a
         service tag from the whitelist, also in ``state.word``; PARTIAL
         elements are NOT delivered — plugins never see half-words).
         ``context`` is the run's shared context dict — passed BY
-        REFERENCE (decision 2026-10-12): all section hooks receive the
-        same object; plugin-to-plugin data exchange goes through it.
+        REFERENCE too: all section hooks receive the same object;
+        plugin-to-plugin data exchange goes through it.
 
-        Return contract (decision 2026-10-12): return the SAME
-        ``ParseState`` object — possibly with stop parameters edited
-        in place (``finish_reason``, counters like ``word_count`` /
-        ``token_offset``). The agent continues parsing with the
-        returned value. Returning None means "no changes".
+        Return contract (decision 2026-10-12, final): ``bool`` —
+        True = «all good, keep the loop running»; False = stop the
+        stream NOW. On the FIRST False the agent breaks the loop and
+        inspects ``state.finish_reason`` to decide what to do:
+        - ``"stop"``   → natural end without error (EOS, budget met);
+        - ``"error"``  → corrupted output / guard tripped; the agent
+          raises RuntimeError. For a custom message set
+          ``state.error = "..."`` alongside finish_reason — it is
+          carried into the exception text and the run result.
+        Leaving ``state.finish_reason`` untouched while returning
+        False is treated as ``"error"`` (a stop without a declared
+        reason is suspicious by definition).
 
-        Stop semantics now live ON THE STATE (the old operation-type
-        dicts {"op": continue|stop|error} were replaced by direct
-        finish_reason editing):
-        - leave ``state.finish_reason`` as None → keep generating;
-        - set ``state.finish_reason = "stop"``  → natural end without
-          error (EOS seen, budget met);
-        - set ``state.finish_reason = "error"`` → corrupted output /
-          guard tripped; the agent surfaces it.
+        So the idiomatic body is: mutate ``state`` (counters,
+        finish_reason/error) as needed, then ``return True``.
+        A bare ``Plugin`` subclass carries no stream opinion at all →
+        pass-through default ``True``.
 
         Commit rule (docs/stream_parser_model.md, §7): the element is
         applied to the segment tree (word appended to ``stack[-1].text``;
         special opens/closes a Segment) ONLY if EVERY RuntimePlugin
-        left the stream running (finish_reason falsy). A bare ``Plugin``
-        subclass carries no stream opinion at all → pass-through
-        default. Position info for budget guards: ``state.token_offset``
-        (ordinal number of the current element) and ``state.word_count``
-        (committed words so far). Transient buffers must live in
-        ``self.local_memory`` — the agent wipes it next run(), so
-        nothing here needs manual cleanup.
+        returned True. Position info for budget guards:
+        ``state.token_offset`` (ordinal number of the current element)
+        and ``state.word_count`` (committed words so far). Transient
+        buffers must live in ``self.local_memory`` — the agent wipes it
+        next run(), so nothing here needs manual cleanup.
         """
-        return state
+        return True
 
 
 class PostPlugin(Plugin):

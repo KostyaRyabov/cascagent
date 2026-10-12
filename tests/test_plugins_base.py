@@ -113,8 +113,8 @@ class TestRuntimePlugin:
 
     def test_defaults_pass_through(self):
         p = self.Bare()
-        assert p.on_upload(None, {}) is None     # state returned untouched
-        # should_stop is GONE — stop semantics live in finish_reason edits.
+        assert p.on_upload(None, {}) is True     # default: keep the loop
+        # should_stop is GONE — stop semantics live in bool + finish_reason.
         assert not hasattr(RuntimePlugin, "should_stop")
         # on_stream_end is GONE — stream finalization is PostPlugin's job.
         assert not hasattr(RuntimePlugin, "on_stream_end")
@@ -122,28 +122,35 @@ class TestRuntimePlugin:
         # raw tokens belong to the built-in StreamParser service.
         assert not hasattr(RuntimePlugin, "on_token")
 
-    def test_finish_reason_edit_contract(self):
-        """v4 API (2026-10-12): on_upload(state, context) returns the
-        ParseState with stop params edited in place — no op-dicts."""
+    def test_bool_stop_contract(self):
+        """v5 API (2026-10-12): on_upload(state, context) returns bool —
+        True keeps the loop running, False stops it; state is edited IN
+        PLACE (passed by reference), never returned."""
         from cascagent.stream_parser import ParseState, ParseStatus
 
         class Stopper(self.Bare):
             def on_upload(self, state, context):
                 if state.word == "STOP":
                     state.finish_reason = "stop"
+                    return False
                 if state.word == "!!!":
                     state.finish_reason = "error"
-                return state
+                    state.error = "corrupted output"
+                    return False
+                return True
 
         p = Stopper()
         mk = lambda w: ParseState(status=ParseStatus.WORD, word=w)
         s = mk("x")
-        assert p.on_upload(s, {}) is s
+        assert p.on_upload(s, {}) is True
         assert s.finish_reason is None           # keep generating
         s = mk("STOP")
-        assert p.on_upload(s, {}).finish_reason == "stop"
+        assert p.on_upload(s, {}) is False
+        assert s.finish_reason == "stop"         # edited in place
         s = mk("!!!")
-        assert p.on_upload(s, {}).finish_reason == "error"
+        assert p.on_upload(s, {}) is False
+        assert s.finish_reason == "error"
+        assert s.error == "corrupted output"     # custom message field
 
     def test_context_shared_by_reference(self):
         """context is passed by reference — plugin mutations visible."""
@@ -152,7 +159,7 @@ class TestRuntimePlugin:
         class Note(self.Bare):
             def on_upload(self, state, context):
                 context.setdefault("seen", []).append(state.word)
-                return state
+                return True
 
         ctx: dict = {}
         p = Note()
@@ -340,7 +347,7 @@ class TestHierarchy:
             def on_upload(self, state, context):
                 n = self.global_memory.get("units", 0)
                 self.global_memory.set("units", n + 1)
-                return state
+                return True
 
         ws, pr, ag = self._build()
         ag.llm = iter(["a ", "b "])
@@ -364,10 +371,10 @@ class TestHierarchy:
         assert res["response"] == "HELLO" and res["action"] == "accept"
 
     def test_runtime_stop_without_error(self):
-        """v4 API (2026-10-12): RuntimePlugin votes via
-        ``on_upload(state, context)`` and returns the ParseState with
-        ``finish_reason`` edited in place — no op-dicts. A stop vote means
-        the element is NOT committed to the segment tree
+        """v5 API (2026-10-12): RuntimePlugin votes via
+        ``on_upload(state, context)`` returning bool; False stops the loop
+        and ``state.finish_reason`` (edited in place) says why. A stop vote
+        means the element is NOT committed to the segment tree
         (docs/stream_parser_model.md §7 commit rule), so the stop-marker
         word itself never reaches the response.
 
@@ -384,7 +391,8 @@ class TestHierarchy:
                 seen.append(state.word)
                 if state.word == "STOP":
                     state.finish_reason = "stop"
-                return state
+                    return False
+                return True
 
         ws, pr, ag = self._build()
         ag.add_plugin(Stopper())
@@ -406,10 +414,12 @@ class TestHierarchy:
             def on_upload(self, state, context):
                 if state.word == "corrupted":
                     state.finish_reason = "error"
-                return state
+                    state.error = "guardian: bad word"
+                    return False
+                return True
 
         ws, pr, ag = self._build()
         ag.add_plugin(Guardian())
         ag.llm = iter(["ok ", "corrupted!", " b"])   # WORDs: 'ok', 'corrupted'
-        with pytest.raises(RuntimeError, match="error"):
+        with pytest.raises(RuntimeError, match="guardian: bad word"):
             ag.run([{"role": "user", "content": "q"}])
