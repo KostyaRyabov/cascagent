@@ -1008,24 +1008,38 @@ global, super → workspace):
 ### 6.7 BreakpointManager (ПЛАН, не реализовано)
 
 Черновик ниже написан под снятый `SessionMemory`; при реализации
- (`breakpoints.py` нет в дереве) конструктор принимает `Agent`, а
+(`breakpoints.py` нет в дереве) конструктор принимает `Agent`, а
 `snapshot()` строится копированием четырёх экземпляров `Memory`
-(§5.8). Логику save/load/restore оставляем как ориентир формата JSONL:
+(§5.8). Логику save/load/restore оставляем как ориентир формата JSONL;
+метод `restore_from()` переписан под фактический API v0.1
+(`Memory.set/get/clear`, без суффиксов-скоупов):
 
 ```python
 class BreakpointManager:
     """Точки восстановления (§5.8). Формат — JSONL, append-only."""
 
-    def __init__(self, memory: SessionMemory, storage_path: Path):
-        self.memory = memory
+    def __init__(self, agent: "Agent", storage_path: Path):
+        # ПЛАН: память агента — четыре экземпляра Memory (§5.3),
+        # а не единый SessionMemory из черновика.
+        self.agent = agent
         self.storage = storage_path
 
     def save_breakpoint(self, label: str, context: dict | None = None):
+        # ПЛАН: snapshot() = {level: dict-копия} по четырём Memory (§5.8);
+        # метода Agent.snapshot() в v0.1 ещё нет.
+        snap = {
+            "local":     dict(self.agent.local_memory._data),
+            "global":    dict(self.agent.global_memory._data),
+            "project":   dict(self.agent.project_memory._data)
+                         if self.agent.project_memory else {},
+            "workspace": dict(self.agent.workspace_memory._data)
+                         if self.agent.workspace_memory else {},
+        }
         bp = {
             "label": label,
             "timestamp": datetime.now().isoformat(),
             "context": context or {},
-            "snapshot": self.memory.snapshot(),
+            "snapshot": snap,
         }
         self.storage.parent.mkdir(parents=True, exist_ok=True)
         with open(self.storage, "a", encoding="utf-8") as f:
@@ -1043,16 +1057,18 @@ class BreakpointManager:
         return last
 
     def restore_from(self, breakpoint: dict):
-        """local пересоздаётся; session восстанавливается целиком;
-        project/super НЕ трогаем (персистентны, могли измениться другими
-        агентами пока процесс был мёртв)."""
+        """local пересоздаётся; global (был \"session\") восстанавливается
+        целиком; project/workspace НЕ трогаем (персистентны, могли измениться
+        другими агентами пока процесс был мёртв)."""
         snap = breakpoint["snapshot"]
-        self.memory.reset_local()
+        local = self.agent.local_memory
+        local.clear()                        # bulk wipe без per-key событий
         for k, v in snap.get("local", {}).items():
-            self.memory.set_local(k, v)
-        self.memory._session.clear()
-        for k, v in snap.get("session", {}).items():
-            self.memory.set_session(k, v)
+            local.set(k, v)
+        gmem = self.agent.global_memory
+        gmem.clear()
+        for k, v in snap.get("global", {}).items():
+            gmem.set(k, v)
 ```
 
 ---
