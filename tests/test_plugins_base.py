@@ -179,6 +179,28 @@ class TestMemory:
         m.clear()
         assert m.get("a") is None
 
+    def test_delete_removes_key_and_reports(self):
+        m = Memory()
+        m.set("a", 1)
+        assert m.delete("a") is True
+        assert m.get("a") is None
+        assert m.delete("a") is False          # already gone
+
+    def test_delete_none_value_vs_absent(self):
+        """Sentinel: stored None must be deletable as an existing key."""
+        m = Memory()
+        m.set("a", None)
+        assert m.delete("a") is True
+        assert m.delete("a") is False
+
+    def test_delete_is_silent(self):
+        m = Memory()
+        seen = []
+        m.subscribe("*", lambda k, v: seen.append(k))
+        m.set("a", 1)
+        m.delete("a")
+        assert seen == ["a"]                   # only the set event
+
     def test_no_scope_bucket_all_apis(self):
         """Decision 2026-10-11: one Memory = one store. No scopes, no
         buckets, no all(), no on_change in __init__."""

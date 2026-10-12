@@ -29,6 +29,9 @@ from __future__ import annotations
 import fnmatch
 from typing import Any, Callable, Dict, List, Optional
 
+#: Sentinel for delete(): distinguishes "key absent" from a stored None.
+_MISSING = object()
+
 
 class Memory:
     """A flat KV store with glob-pattern subscriptions.
@@ -56,6 +59,15 @@ class Memory:
         """Read ``key`` (``default`` when absent). Never fires callbacks."""
         return self._data.get(key, default)
 
+
+    def delete(self, key: str) -> bool:
+        """Remove ``key``; return True if it existed, False otherwise.
+
+        Silent removal: no subscriber notification (there is no new value
+        to deliver). Pair with get(key, default) semantics — after delete
+        the key reads back as absent.
+        """
+        return self._data.pop(key, _MISSING) is not _MISSING
 
     def clear(self) -> None:
         """Drop ALL keys silently (no per-key events — a bulk wipe is not

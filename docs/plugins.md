@@ -720,6 +720,10 @@ class Memory:
     def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default)      # read callbacks НЕ вызывает
 
+    def delete(self, key: str) -> bool:
+        """Удаление по ключу: True если существовал. Silent — без событий."""
+        return self._data.pop(key, _MISSING) is not _MISSING
+
     def clear(self) -> None:
         """Bulk wipe без per-key событий (вызывает Agent.run() на local)."""
         self._data.clear()
