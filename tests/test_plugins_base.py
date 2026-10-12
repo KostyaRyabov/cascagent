@@ -113,26 +113,32 @@ class TestRuntimePlugin:
 
     def test_defaults_pass_through(self):
         p = self.Bare()
-        assert p.on_token("tok", "acc") == {"op": "continue"}
-        # should_stop is GONE — stop semantics live in on_token ops.
+        assert p.on_upload(None) == {"op": "continue"}
+        # should_stop is GONE — stop semantics live in on_upload ops.
         assert not hasattr(RuntimePlugin, "should_stop")
         # on_stream_end is GONE — stream finalization is PostPlugin's job.
         assert not hasattr(RuntimePlugin, "on_stream_end")
+        # on_token is GONE (2026-10-12) — plugins vote on parsed elements,
+        # raw tokens belong to the built-in StreamParser service.
+        assert not hasattr(RuntimePlugin, "on_token")
 
     def test_op_types_shape(self):
+        from cascagent.stream_parser import ParseState, ParseStatus
+
         class Stopper(self.Bare):
-            def on_token(self, token, accumulated):
-                if "STOP" in accumulated:
+            def on_upload(self, state):
+                if state.word == "STOP":
                     return {"op": "stop", "data": "tail"}
-                if "!!!" in accumulated:
+                if state.word == "!!!":
                     return {"op": "error", "data": "corrupted"}
                 return {"op": "continue"}
 
         p = Stopper()
-        assert p.on_token("x", "GO") == {"op": "continue"}
-        r = p.on_token("P", "GO STOP")
+        mk = lambda w: ParseState(status=ParseStatus.WORD, word=w)
+        assert p.on_upload(mk("x")) == {"op": "continue"}
+        r = p.on_upload(mk("STOP"))
         assert r["op"] == "stop" and r["data"] == "tail"
-        r = p.on_token("!", "!!!")
+        r = p.on_upload(mk("!!!"))
         assert r["op"] == "error" and r["data"] == "corrupted"
 
 
@@ -277,19 +283,19 @@ class TestHierarchy:
 
     def test_global_memory_survives_iterations(self):
         class Counter(RuntimePlugin):
-            def on_token(self, token, accumulated):
-                n = self.global_memory.get("tokens", 0)
-                self.global_memory.set("tokens", n + 1)
+            def on_upload(self, state):
+                n = self.global_memory.get("units", 0)
+                self.global_memory.set("units", n + 1)
                 return {"op": "continue"}
 
         ws, pr, ag = self._build()
-        ag.llm = iter(["a", "b"])
+        ag.llm = iter(["a ", "b "])
         ag.add_plugin(Counter())
         ag.run([{"role": "user", "content": "q"}])
-        assert ag.global_memory.get("tokens") == 2
-        ag.llm = iter(["c"])
+        assert ag.global_memory.get("units") == 2
+        ag.llm = iter(["c "])
         ag.run([{"role": "user", "content": "q"}])
-        assert ag.global_memory.get("tokens") == 3       # survived the wipe
+        assert ag.global_memory.get("units") == 3       # survived the wipe
 
     def test_full_loop_accept_path(self):
         class Echo(PostPlugin):

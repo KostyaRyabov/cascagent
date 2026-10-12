@@ -10,9 +10,10 @@ Specification: docs/plugins.md §4 (sections), §6.3 (base classes), §12.2
     InputPlugin     PrePlugin       runs BEFORE the LLM call; modifies ONLY
                                     user messages (system/assistant stay
                                     byte-exact — llama.cpp prefix cache, P8)
-    TriggerPlugin   RuntimePlugin   runs DURING generation (per token);
-                                    should_stop REMOVED — stop semantics
-                                    live in on_token's operation types
+    TriggerPlugin   RuntimePlugin   runs DURING generation (per parsed
+                                    word/special unit); should_stop
+                                    REMOVED — stop semantics live in
+                                    on_upload's operation types
     OutputPlugin    PostPlugin      runs AFTER generation (post-process)
 
 Two structural decisions of 2026-10-11 shape the API below:
@@ -34,7 +35,10 @@ Two structural decisions of 2026-10-11 shape the API below:
    the bare ``Plugin`` is a shared identity/config/bind container.
 
 4. Naming convention: every concrete plugin class ends with the suffix
-   ``Plugin`` (TaskParserPlugin, OutputSplitterPlugin, ...).
+   ``Plugin`` (TaskParserPlugin, ...). Think/response splitting is NOT a
+   plugin — OutputSplitterPlugin was removed (2026-10-12); stream
+   structure is produced by the built-in agent service ``StreamParser``
+   (cascagent.stream_parser, spec docs/stream_parser_model.md).
 
 Contract notes:
 - Plugins never call each other directly — communication is only through
@@ -122,18 +126,28 @@ class PrePlugin(Plugin):
 
 
 class RuntimePlugin(Plugin):
-    """Section RUNTIME — hot path, called on every streamed token
+    """Section RUNTIME — hot path, called on every parsed stream unit
+    (WORD / SPECIAL) produced by the agent's built-in StreamParser
     (was TriggerPlugin). Budget: microseconds, NO I/O (§12.2 п.3).
 
     ``should_stop`` was removed: deciding when to cut the stream short
-    is exactly what ``on_token``'s operation types are for."""
+    is exactly what ``on_upload``'s operation types are for. The hook
+    signature changed from raw ``on_token(token, accumulated)`` to
+    ``on_upload(state)`` (decision 2026-10-12): plugins no longer see
+    raw tokens — they vote on structured units in ParseState."""
 
     name = "base_runtime"
 
-    def on_token(self, token: str, accumulated: str) -> Dict[str, Any]:
-        """Inspect/modify one token; return {op, data}.
+    def on_upload(self, state: "Any") -> Dict[str, Any]:
+        """Vote on one ready element (WORD / SPECIAL) of the stream.
 
-        Operation types (decision 2026-10-11):
+        ``state`` is the live ``cascagent.stream_parser.ParseState``:
+        ``state.status`` tells which kind of element is pending
+        (``WORD`` — closed word in ``state.word``; ``SPECIAL`` — a
+        service tag from the whitelist, also in ``state.word``; PARTIAL
+        elements are NOT delivered — plugins never see half-words).
+
+        Operation types (semantics unchanged since 2026-10-11):
         - ``{"op": "continue"}``               — keep generating;
         - ``{"op": "stop",    "data": ...}``   — stop WITHOUT error
           (natural end: EOS marker seen, budget met); data may carry a
@@ -141,7 +155,11 @@ class RuntimePlugin(Plugin):
         - ``{"op": "error",   "data": "..."}`` — stop WITH error
           (corrupted output, guard tripped); the agent surfaces it.
 
-        Default implementation: pass-through. Transient buffers must
+        Commit rule (docs/stream_parser_model.md, §7): the element is
+        applied to the segment tree (word appended to ``stack[-1].text``;
+        special opens/closes a Segment) ONLY if EVERY RuntimePlugin
+        returned continue. A bare ``Plugin`` subclass carries no stream
+        opinion at all → pass-through default. Transient buffers must
         live in ``self.local_memory`` — the agent wipes it next run(),
         so nothing here needs manual cleanup.
         """
