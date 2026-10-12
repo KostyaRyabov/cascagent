@@ -48,7 +48,7 @@ Details: docs/protocol.md §2–3.
 | `executor.py` | TaskExecutor (выполнение атомарной задачи) | ⬜ Этап 4+ |
 | `reflector.py` | ReflectAgent: анализ провалов, обратная связь | ⬜ Этап 4+ |
 | `researcher.py` | ResearchAgent: изолированный сбор информации | ⬜ Этап 4+ |
-| `bk_tree.py` | BK-tree fuzzy поиск инструментов, fix_typo | ⬜ Этап 4 |
+| `bk_tree.py` | BK-tree fuzzy поиск инструментов, fix_typo | ✅ Этап 4 (метрики + stats + rebalance) |
 | `semantic.py` | SemanticMemory (эмбеддинги + cosine, remember/recall) | ⬜ Этап 4 |
 | `rag.py` | BM25 + vector search по документации | ⬜ Этап 4 |
 
@@ -102,6 +102,7 @@ stack.md §5. Архитектурное следствие для всех мо
 | `docs/product.md` | продукт: миссия, сценарии, системные агенты, state machine |
 | `docs/cpu-offload.md` | реестр CPU-алгоритмов P1–P9 / A1–A13 vs LLM-вызовы |
 | `docs/algorithms.md` | эталонные реализации CPU-алгоритмов (BK-tree, fuzzy, memory, RAG, YAML) |
+| `docs/bk_tree_diagrams.md` | Mermaid-схемы BK-tree: архитектура, add/query, ребалансировка, интеграция |
 | `docs/performance.md` | кэш L1–L3, префилл, draft model, PerformanceMetrics |
 | `docs/stack.md` | стек инференса: движки, модель, think, KV-кэш, бюджет токенов |
 | `docs/data.md` | модель данных: Task, ID, история вызовов, схема SQLite, EnrichedContext |

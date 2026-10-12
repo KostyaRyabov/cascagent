@@ -26,12 +26,17 @@
 
 ## 1. BK-tree — fuzzy-поиск по метрическому пространству (`bk_tree.py`)
 
+> Визуальные схемы (Mermaid): архитектура классов, структура дерева, add/query,
+> цикл ребалансировки, метрики, интеграция ToolResolver — `docs/bk_tree_diagrams.md`.
+
 **Задача:** агент написал `read_fiel`; найти правильный инструмент из ~1000
 кандидатов за O(log n) вместо перебора. Применяется для: выбора MCP-инструмента
 (P4), исправления опечаток имён, поиска похожих задач/файлов по имени.
 
 ```python
 from typing import Callable, Optional
+
+from cascagent.bk_tree import BKTree   # эталон — реализация в src (Этап 4)
 
 
 class BKTree:
@@ -83,6 +88,16 @@ class BKTree:
 |---|---|---|
 | Наивный перебор + Левенштейн | ~50 мс | O(n·len²) |
 | BK-tree, max_distance=2 | ~0.5 мс | ≈100× быстрее; деградация O(n) только при плохом дереве |
+
+**Реализация (Этап 4): `src/cascagent/bk_tree.py`** — полный API по «BK-tree:
+полная документация»: `DistanceMetric` (ABC) + метрики `LevenshteinDistance` /
+`SemanticDistance` / `HammingDistance` / `JaccardDistance`; `BKTreeConfig`
+(analytics/rebalance, метрика — отдельный параметр конструктора, не конфиг);
+`BKTreeStats` (read_weights + depths, качество mean/sum); `BKTree`
+(add/append/query/contains/rebalance, thread-safe вставка). Отличия листинга §1
+от кода (код — эталон, §0 п.5): normalize() на входе (§0 п.4), stdlib-фallback
+Левенштейна (§0 п.2), вместо `find_best` — модульная функция `fix_typo`
+(AGENTS.md §6); сборка дерева с приоритетом частых слов — `rebalance()`.
 
 ## 2. Левенштейн и фонетика (`fuzzy.py`)
 
