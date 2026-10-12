@@ -22,7 +22,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
-class ParseStatus(str, Enum):
+class ResponseParser(str, Enum):
     """Насколько токены текущей итерации сформировали элемент."""
     PARTIAL = "partial"   # элемент ещё не дописан — ждём следующие чанки
     WORD = "word"         # слово явно замкнуто (пробел/пунктуация/граница сообщения)
@@ -49,7 +49,7 @@ class ParseState:
     """Единственное ТЕКУЩЕЕ состояние парсера."""
 
     # --- статус текущего элемента ---
-    status: ParseStatus = ParseStatus.PARTIAL
+    status: ResponseParser = ResponseParser.PARTIAL
     word: Optional[str] = None            # заполняется только при WORD / SPECIAL
 
     # --- реконструкция слов ---
@@ -72,11 +72,11 @@ class ParseState:
     done: bool = False                    # получен [DONE]
 ```
 
-**Финальная правка (раунд v3): `finish_reason` убран из `ParseStatus`.**
+**Финальная правка (раунд v3): `finish_reason` убран из `ResponseParser`.**
 Он есть у каждого `Segment` (как сегмент завершился) и остаётся в `ParseState` только как
 протокольное поле потока (почему остановилась генерация LLM). Дублировать его в статусе
 текущего элемента незачем — они могут не совпадать (поток закончился по "length",
-а открытый сегмент будет закрыт с "unclosed"). В `ParseStatus` остаются только
+а открытый сегмент будет закрыт с "unclosed"). В `ResponseParser` остаются только
 `PARTIAL` / `WORD` / `SPECIAL`.
 
 ## Что убрали по ходу обсуждения
@@ -89,7 +89,7 @@ class ParseState:
 - `source`, `open_tag`, `is_open_tag` — информация дублировала `kind`.
 - `truncated: bool` — заменён на `finish_reason` по аналогии с выводом LLM.
 - `children` -> `segments` (единая терминология: сегменты и подсегменты).
-- `finish_reason` из `ParseStatus` — дублировал `Segment.finish_reason` и протокольный `ParseState.finish_reason`.
+- `finish_reason` из `ResponseParser` — дублировал `Segment.finish_reason` и протокольный `ParseState.finish_reason`.
 
 ## Интерфейс плагина
 

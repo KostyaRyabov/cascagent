@@ -126,7 +126,7 @@ class TestRuntimePlugin:
         """v5 API (2026-10-12): on_upload(state, context) returns bool —
         True keeps the loop running, False stops it; state is edited IN
         PLACE (passed by reference), never returned."""
-        from cascagent.stream_parser import ParseState, ParseStatus
+        from cascagent.stream_parser import ParseState, ResponseParser
 
         class Stopper(self.Bare):
             def on_upload(self, state, context):
@@ -140,7 +140,7 @@ class TestRuntimePlugin:
                 return True
 
         p = Stopper()
-        mk = lambda w: ParseState(status=ParseStatus.WORD, word=w)
+        mk = lambda w: ParseState(status=ResponseParser.WORD, word=w)
         s = mk("x")
         assert p.on_upload(s, {}) is True
         assert s.finish_reason is None           # keep generating
@@ -154,7 +154,7 @@ class TestRuntimePlugin:
 
     def test_context_shared_by_reference(self):
         """context is passed by reference — plugin mutations visible."""
-        from cascagent.stream_parser import ParseState, ParseStatus
+        from cascagent.stream_parser import ParseState, ResponseParser
 
         class Note(self.Bare):
             def on_upload(self, state, context):
@@ -163,8 +163,8 @@ class TestRuntimePlugin:
 
         ctx: dict = {}
         p = Note()
-        p.on_upload(ParseState(status=ParseStatus.WORD, word="a"), ctx)
-        p.on_upload(ParseState(status=ParseStatus.WORD, word="b"), ctx)
+        p.on_upload(ParseState(status=ResponseParser.WORD, word="a"), ctx)
+        p.on_upload(ParseState(status=ResponseParser.WORD, word="b"), ctx)
         assert ctx["seen"] == ["a", "b"]
 
 
@@ -334,7 +334,7 @@ class TestHierarchy:
                 return messages
 
         ws, pr, ag = self._build()
-        ag.llm = lambda msgs: "ok"
+        ag.llm = iter(["ok"])
         ag.add_plugin(NoteTaker())
         ag.run([{"role": "user", "content": "q"}])
         assert ag.local_memory.get("touched") is True
@@ -365,7 +365,7 @@ class TestHierarchy:
                         "metadata": {}, "action": "accept"}
 
         ws, pr, ag = self._build()
-        ag.llm = lambda msgs: "hello"
+        ag.llm = iter(["hello"])
         ag.add_plugin(Echo())
         res = ag.run([{"role": "user", "content": "q"}])
         assert res["response"] == "HELLO" and res["action"] == "accept"
@@ -379,11 +379,11 @@ class TestHierarchy:
         word itself never reaches the response.
 
         Chunk layout mirrors real SSE deltas: words close only on the
-        boundary chunk ('STOP' closes when ' junk' arrives). NOTE (found by
-        this test): after a runtime stop the agent still flushes the raw
-        buffer tail into the segment tree in finalize() — 'junk' lands in
-        the response although the stream was cut short. Pinned as-is for
-        v0.1; to be revisited when client.py/kanban land (roadmap фаза 2)."""
+        boundary chunk ('STOP' closes when ' junk' arrives). BEHAVIOR FIX
+        (2026-10-13): after a runtime stop the agent no longer flushes the
+        raw buffer tail into the segment tree — previously 'junk' leaked
+        into the response although the stream was cut short; now the
+        un-voted tail is discarded and the committed tree is the output."""
         seen: list = []
 
         class Stopper(RuntimePlugin):
@@ -399,7 +399,8 @@ class TestHierarchy:
         ag.llm = iter(["go ", "STOP", " junk"])
         res = ag.run([{"role": "user", "content": "q"}])
         assert seen[-1] == "STOP"                # plugin saw the element
-        assert res["response"] == "go junk"      # STOP not committed...
+        assert res["response"] == "go"           # STOP not committed,
+                                                 # un-voted tail dropped
         assert res["finish_reason"] == "stop"    # stop WITHOUT error
 
     def test_runtime_error_raises(self):
@@ -423,3 +424,43 @@ class TestHierarchy:
         ag.llm = iter(["ok ", "corrupted!", " b"])   # WORDs: 'ok', 'corrupted'
         with pytest.raises(RuntimeError, match="guardian: bad word"):
             ag.run([{"role": "user", "content": "q"}])
+
+
+def test_bare_string_llm_is_rejected():
+    """Stream-only contract (decision 2026-10-13): the LLM must yield
+    chunks — a bare str is iterated character-by-character, which is NOT
+    a supported stream shape. Passing iter([str]) IS supported."""
+    from cascagent.memory import Agent
+    from cascagent.plugins.base import RuntimePlugin
+
+    seen = []
+
+    class Spy(RuntimePlugin):
+        def on_upload(self, state, context):
+            seen.append(state.word)
+            return True
+
+    # proper way: one-chunk iterator (caller wraps the string)
+    agent = Agent(name="a", llm=iter(["hello world"]))
+    agent.add_plugin(Spy())
+    res = agent.run([{"role": "user", "content": "hi"}])
+    assert res["response"] == "hello world"
+    assert len(seen) >= 2          # both words voted on
+
+
+def test_stop_via_vote_midstream():
+    from cascagent.memory import Agent
+    from cascagent.plugins.base import RuntimePlugin
+
+    class Stopper(RuntimePlugin):
+        def on_upload(self, state, context):
+            if state.word == "world":
+                state.finish_reason = "stop"
+                return False
+            return True
+
+    agent = Agent(name="a", llm=iter(["hello world stop-me"]))
+    agent.add_plugin(Stopper())
+    res = agent.run([{"role": "user", "content": "hi"}])
+    assert "stop-me" not in res["response"]
+    assert res["finish_reason"] == "stop"

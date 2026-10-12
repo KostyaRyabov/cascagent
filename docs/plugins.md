@@ -244,7 +244,7 @@ class StopOnDone(RuntimePlugin):         # ПЛАН — не реализова�
     """Останавливает генерацию, когда встречен маркер конца ответа."""
 
     def on_upload(self, state, context) -> bool:
-        if state.status == ParseStatus.SPECIAL and state.word == "</done>":
+        if state.status == ResponseParser.SPECIAL and state.word == "</done>":
             state.finish_reason = "stop"
             return False                 # стоп цикла
         return True                      # всё хорошо, продолжаем
@@ -291,9 +291,10 @@ mutate-after); до коммита слово плагинам не видно.
 - порядок runtime-плагинов значим: голосование идёт списком, останавливает
   первый вернувший `False`.
 
-Известное расхождение поведения (открытый вопрос, фаза 2): str-LLM
-(тестовый фейк) коммитит элементы без голосования, chunk-iterator —
-строго через голосование; при подключении реального клиента унифицировать.
+Контракт LLM-transport (решение 2026-10-13): LLM — ТОЛЬКО чанк-итератор
+(`callable(messages) -> iterator[str]` или голый `iterator[str]`). Особый
+путь для строчного ответа удалён из `Agent.run`; тесты используют
+`iter([...])`. Голосование `on_upload` едино для всех элементов потока.
 
 ### 4.3 Post-плагины
 
@@ -313,7 +314,7 @@ mutate-after); до коммита слово плагинам не видно.
 - retry при ошибках парсинга.
 
 ```python
-class ResponseParser(PostPlugin):        # ПЛАН — его роль несёт TaskParserPlugin
+class TaskResponseParser(PostPlugin):   # ПЛАН — его роль несёт TaskParserPlugin
     """Парсит текстовый ответ в список задач."""
 
     def __init__(self, parser_fn):
@@ -925,9 +926,10 @@ trigger_plugins/output_plugins` (секции pre/runtime/post), нет отде
 `add_plugin()`), нет `_generate_with_triggers` с `should_stop/on_token/
 on_stream_end` (голосование по элементам `on_upload`), нет `tools` и
 `system_prompt` параметром (промпт приносит вызывающий в `messages`;
-`SYSTEM_PROMPT` — константа модуля task_parser). Поведение str-LLM:
-элементы коммитятся без голоса плагинов (файк не стрим) — расхождение с
-chunk-iterator зафиксировано как открытый вопрос (roadmap фаза 2).
+`SYSTEM_PROMPT` — константа модуля task_parser). Контракт transport
+(2026-10-13): только chunk-iterator; все элементы проходят голосование
+`on_upload`, ответ берётся из commit-дерева (`parser.response_text()`),
+хвостовой сброс буфера — методом `parser.drain_buffer()`.
 
 ### 6.5 MemoryStore — унифицированный бэкенд (ПЛАН, не реализовано)
 
@@ -1193,7 +1195,7 @@ docs/roadmap.md §7).
 
 | Плагин | Назначение |
 |--------|-----------|
-| `TaskParser` (`ResponseParser`) | Единый конвейер пост-обработки decompose-ответа (process §1.3), три стадии в одном проходе: **парсинг** protocol §3 (блоки «Название / Описание» через пустую строку, двухуровневый `<atom>`) → `Task[]` (все поля — в `__init__`: created_at → snowflake id, `embedding = embed(brief)`, depth от parent; порядок детей = позиция в списке, поля `order` нет); **фильтрация/проверка** F1–F3 (F1 brief==description ⇒ атом; F2 семантическая близость brief ребёнка к brief родителя ≥ порога ⇒ ребёнок удаляется; F3 у родителя не осталось детей ⇒ родитель становится атомом) по эмбеддингам стадии 1, без повторного кодирования; **сохранение** — подставляет отфильтрованное поддерево детей нужному родителю в уже заполненный project-ключ `tasks` (`parent.subtasks = List[Task]`, прямые ссылки; не перезаписывает дерево целиком); атом ⇒ `description=None`, `is_atom=True` |
+| `TaskParser` (`TaskResponseParser`) | Единый конвейер пост-обработки decompose-ответа (process §1.3), три стадии в одном проходе: **парсинг** protocol §3 (блоки «Название / Описание» через пустую строку, двухуровневый `<atom>`) → `Task[]` (все поля — в `__init__`: created_at → snowflake id, `embedding = embed(brief)`, depth от parent; порядок детей = позиция в списке, поля `order` нет); **фильтрация/проверка** F1–F3 (F1 brief==description ⇒ атом; F2 семантическая близость brief ребёнка к brief родителя ≥ порога ⇒ ребёнок удаляется; F3 у родителя не осталось детей ⇒ родитель становится атомом) по эмбеддингам стадии 1, без повторного кодирования; **сохранение** — подставляет отфильтрованное поддерево детей нужному родителю в уже заполненный project-ключ `tasks` (`parent.subtasks = List[Task]`, прямые ссылки; не перезаписывает дерево целиком); атом ⇒ `description=None`, `is_atom=True` |
 | `DuplicateFilter` | Удаляет дубликаты подзадач (DuplicateDetector, порог 0.75) |
 | `QualityValidator` | Проверки: пустой ответ, вырожденный повтор родителя, мусор |
 | `RefusalDetector` | Детект отказа модели → action=retry с reframe или ошибка (#5) |
@@ -1301,7 +1303,7 @@ trigger = [
   { plugin = "LengthGuard", warn_at_tokens = 6000 },
 ]
 output = [
-  { plugin = "ResponseParser", parser = "research_findings" },
+  { plugin = "TaskResponseParser", parser = "research_findings" },
   { plugin = "HistoryLogger" },
 ]
 max_iterations = 5                               # защита от зацикливания
@@ -1325,7 +1327,7 @@ trigger = [
   { plugin = "ThinkBlockExtractor" },
 ]
 output = [
-  { plugin = "ResponseParser", parser = "reflect_decision" },  # retry|reframe|give_up
+  { plugin = "TaskResponseParser", parser = "reflect_decision" },  # retry|reframe|give_up
   { plugin = "HistoryLogger" },
 ]
 max_retries = 1

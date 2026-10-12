@@ -680,10 +680,11 @@ port-этап (§1), full observability/dashboards.
    рассматриваем (локальный однопоточный продукт без сервера). От `Memory`
    (in-memory dict) нужен переход к персистентному бэкенду — решение до
    реализации Recovery-плагинов (#3).
-4. **Соглашение об LLM-transport**: код (`Agent.run`) поддерживает и
-   sync-callable (str), и async/sync chunk-iterator; поведение Runtime-
-   плагинов (голосование `on_upload`) при str-LLM отличается (один проход
-   на полном тексте) — зафиксировать в docs/protocol.md / plugins.md.
+4. [x] **Соглашение об LLM-transport** (решение 2026-10-13): `Agent.run`
+   принимает ТОЛЬКО chunk-iterator (голый или `callable(messages)`);
+   строчный путь удалён, голосование `on_upload` едино для всех элементов;
+   зафиксировано в docs/plugins.md §4.2/§6.4. Enum статуса элемента
+   переименован `ParseStatus` → `ResponseParser`.
 
 ## 10. План работ (аудит «код ↔ документация», 2026-10-12)
 

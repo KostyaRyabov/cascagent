@@ -251,54 +251,76 @@ class Agent:
             messages = plugin.on_input(messages, context)
 
         parser = self._make_parser()
-        response = ""
         if self.llm is not None:
-            # LLM seam: callable(messages) -> str | chunk iterator, or a
-            # bare chunk iterator (tests/fakes). Chunks are raw SSE
-            # delta.content pieces — the parser assembles words from them.
+            # LLM seam (stream-only contract, decision 2026-10-13): the LLM
+            # MUST be a chunk iterator — either a bare iterable or a
+            # callable(messages) -> chunk iterator. Returning a plain string
+            # is NOT supported anymore: it is the caller's responsibility to
+            # wrap it (iter(["hello world"])). The agent never iterates over
+            # characters of a str.
             gen = self.llm(messages) if callable(self.llm) else self.llm
             stop: Optional[str] = None      # finish_reason of a plugin stop
-            if isinstance(gen, str):          # fake/test LLM: whole text
-                for ev in parser.feed(gen):
-                    parser.commit(ev)         # no runtime vote on a string LLM
+
+            def vote(ev):
+                """Deliver one ready element to ALL runtime plugins; commit
+                ONLY on unanimous True (v5 contract, 2026-10-12). Returns
+                False when a voter stopped the loop."""
+                nonlocal stop
+                status, payload = ev
+                parser.state.status = status
+                parser.state.word = payload
+                for rt in self.runtime_plugins:
+                    if not rt.on_upload(parser.state, context):
+                        fr = getattr(parser.state,
+                                     "finish_reason", None)
+                        stop = fr or "error"
+                        parser.state.finish_reason = stop
+                        return False        # element NOT committed
+                parser.commit(ev)
+                return True
+
+            for chunk in gen:
+                if chunk == "[DONE]":
+                    break
+                for ev in parser.feed(chunk):
+                    if not vote(ev):
+                        break               # plugin stop mid-chunk
+                if stop is not None:
+                    break
+            if stop is None:
+                # Tail flush goes through the SAME vote path: the last
+                # word of the stream must be votable too (rule 8).
+                tail = parser.drain_buffer()
+                if tail is not None:
+                    vote(tail)
                 parser.finalize("stop")
-            else:                             # real LLM: chunk iterator
-                for chunk in gen:
-                    if chunk == "[DONE]":
-                        break
-                    response += chunk
-                    for ev in parser.feed(chunk):
-                        status, payload = ev
-                        parser.state.status = status
-                        parser.state.word = payload
-                        # v5 API (2026-10-12): hooks receive (state, context)
-                        # BY REFERENCE and return bool — True keeps the loop
-                        # running, False stops it. state is edited in place
-                        # (finish_reason / error / counters). On the first
-                        # False the agent breaks and inspects finish_reason:
-                        # "stop" → clean end, "error" (or unset) → raise.
-                        # The element is committed ONLY if every voter said
-                        # True.
-                        for rt in self.runtime_plugins:
-                            ok = rt.on_upload(parser.state, context)
-                            if not ok:
-                                fr = getattr(parser.state,
-                                             "finish_reason", None)
-                                stop = fr or "error"
-                                parser.state.finish_reason = stop
-                                break
-                        if stop is not None:
-                            break             # element NOT committed (vote rule)
-                        parser.commit(ev)
-                    if stop is not None:
-                        break
-                parser.state.finish_reason = None    # finalize sets the truth
-                parser.finalize(stop if stop else "stop")
-                if stop is not None and stop == "error":
-                    msg = getattr(parser.state, "error", None)
-                    raise RuntimeError(f"runtime stopped with error: "
-                                       f"{msg or 'no message'}")
-            response = parser.response_text() or response
+            else:
+                # Plugin stopped the loop: close the tree WITHOUT touching
+                # the raw buffer — a rejected element must never be flushed
+                # into the committed output (rule 8 applies to clean ends).
+                parser.state.finish_reason = None    # close sets the truth
+                st = parser.state
+                st.buffer = ""
+                parser._chunks_in_buffer = 0
+                st.status = parser.state.status      # keep last delivered status
+                st.word = None
+                while len(st.stack) > 1:      # keep RESPONSE at the bottom
+                    top = st.stack.pop()
+                    if top.finish_reason is None:
+                        top.finish_reason = "unclosed"
+                st.finish_reason = stop
+                st.done = True
+                if st.stack and st.stack[0].kind.name == "RESPONSE":
+                    resp = st.stack.pop(0)
+                    if resp.finish_reason is None:
+                        resp.finish_reason = stop
+            #: Authoritative output is the COMMITTED segment tree, not the
+            #: raw transport echo: a stopped element never reaches response.
+            response = parser.response_text()
+            if stop is not None and stop == "error":
+                msg = getattr(parser.state, "error", None)
+                raise RuntimeError(f"runtime stopped with error: "
+                                   f"{msg or 'no message'}")
 
         #: Live parser state is passed to plugins directly via context —
         #: it is an internal mechanism, not memory data (docs/plugins.md §2.4).
