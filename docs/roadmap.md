@@ -692,15 +692,13 @@ port-этап (§1), full observability/dashboards.
       — сделано: закомментирован в pyproject.toml с пометкой «включить в фазе 2».
 
 ### Фаза 1 — рефакторинг документации (привести к фактическому состоянию кода)
-- [ ] `AGENTS.md` §6: дерево src не соответствует факту — `parser.py`/
-      `detector.py` удалены (поглощены `plugins/task_parser.py`); добавить
-      `memory.py`, `stream_parser.py`, `plugins/base.py`, `plugins/task_parser.py`.
-- [ ] `AGENTS.md` §7: признать, что v3-слой (Memory/Workspace/Project/Agent,
-      Pre/Runtime/Post, ResponseParser, TaskParserPlugin) реализован ДОСРОЧНО
-      (был Этап 5+); переставить этапы: оставшийся путь — client/history/
-      kanban/cli/orchestrator (см. фазу 2).
-- [ ] `AGENTS.md` §10: снять «код ещё на v1, миграция не начата» — миграция
-      фактически выполнена (models v2, snowflake id, статусы, TaskParserPlugin).
+- [x] `AGENTS.md` §2.3/§6: дерево src приведено к факту (2026-10-13):
+      parser.py/detector.py убраны, добавлены memory.py, stream_parser.py,
+      plugins/base.py, plugins/task_parser.py.
+- [x] `AGENTS.md` §7 (2026-10-13): v3-слой признан реализованным досрочно;
+      этапы размечены ✅/⬜ по факту.
+- [x] `AGENTS.md` §10 (2026-10-13): «код ещё на v1» снят; реализовано =
+      models/memory/stream_parser/plugins/bk_tree; ближайшие шаги = фаза 2.
 - [x] `docs/plugins.md`: §4 переписан под фактические секции Pre
       (`on_input(messages, context)`) / Runtime (`on_upload(state, context)`;
       `on_token` удалён 2026-10-12; с 2026-10-12 контракт — возврат ParseState
@@ -712,25 +710,21 @@ port-этап (§1), full observability/dashboards.
       сверена с деревом; ссылки на
       несуществующие `parser.py`/`detector.py`/`enricher.py` (строки ~299,
       1543, 1564).
-- [ ] `docs/architecture.md` §2: таблица модулей — убрать строки
-      `parser.py`/`detector.py` («миграция v1→v2» больше не актуальна),
-      добавить реальные модули и колонку статуса (done/planned: client,
-      history, kanban, cli, decomposer-orchestrator, semantic, rag,
-      enricher/executor/reflector/researcher, cache_manager).
-- [ ] `docs/protocol.md` §9: чеклист миграции `parser.py`/`detector.py`
-      (строки ~248–252) закрыть/переписать под `plugins/task_parser.py`;
-      §4/§5 сверить с полем `Task` v2 (snowflake, parent/children, depth).
-- [ ] `docs/algorithms.md`: §2/§5/§6 — эталонные алгоритмы живут в
-      `bk_tree.py` (done), `stream_parser.py` (done), `plugins/task_parser.py`
-      (duplicate-логика done); §3 semantic, §4 rag — пометить planned.
-- [ ] `docs/prompts.md` §5 (промпты enricher/executor/reflector/researcher) —
-      пометить как целевой дизайн: этих агентов в коде нет.
-- [ ] `docs/stream_parser_model.md`: снять неявную метку «не реализовано» —
-      `ResponseParser` реализован и протестирован; добавить ссылку на
-      реализацию и зафиксировать фактическое окно (window_size).
+- [x] `docs/architecture.md` §2 (2026-10-13): таблица модулей переписана под
+      фактическое дерево + статусы done/planned; строки parser.py/detector.py
+      заменены на plugins/task_parser.py; cache_manager помечен отложенным.
+- [x] `docs/protocol.md` §9 (2026-10-13): чеклист миграции закрыт (парсинг
+      живёт в plugins/task_parser.py, parser.py/detector.py удалены).
+- [x] `docs/algorithms.md` (2026-10-13): §6 DuplicateDetector помечен
+      «реализовано в plugins/task_parser.py»; §2/§5 сверены.
+- [x] `docs/prompts.md` §5 (2026-10-13): помечен целевым дизайном (draft до
+      Этапа 5 — модулей агентов в коде нет).
+- [x] `docs/stream_parser_model.md` (2026-10-13): статус = реализовано
+      (ResponseParser + Word v5); зафиксировано фактическое окно
+      max_buffer_chunks=256.
 - [x] Ссылки на несуществующие ADR исправлены (2026-10-13): plugins.md
       ADR-007→ADR-003, roadmap.md ADR-005→ADR-002 (заводить новые ADR не нужно).
-- [ ] README.md — сверить раздел «статус» с новым AGENTS.md §10.
+- [x] README.md (2026-10-13): написан честный статус v0.1 вместо TODO.
 
 ### Фаза 2 — терминальный агент (минимальный сквозной путь CLI → LLM → Kanban)
 Порядок зависимостей: client → history → kanban → orchestrator → cli → e2e.
