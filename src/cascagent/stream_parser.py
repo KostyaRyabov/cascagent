@@ -75,14 +75,101 @@ class SegmentKind(str, Enum):
 
 
 @dataclass
+class Word:
+    """One committed element of the editable segment tape (model v5,
+    implemented 2026-10-13; decisions A–F in docs/stream_parser_model.md).
+
+    Lifecycle rule: the parser creates a Word ONLY at commit time (the
+    WORD/SPECIAL event passed every RuntimePlugin vote) — append-at-commit,
+    mutate-after. Plugins may then edit ``text``, reorder/remove/add words
+    through direct access to ``segment.words`` (leader decision 2026-10-13:
+    words and segments are the ONLY things you manage — no flat-text
+    editing API).
+    """
+
+    text: str = ""                # word text INCLUDING its closing delimiter
+                                  # (decision C: no separate tail field)
+    segment: "Segment" = None     # direct link to the owning segment
+                                  # (decision A: links, not indices)
+    idx: int = 0                  # GLOBAL ordinal from the start of the
+                                  # response generation (decision F)
+    is_hidden: bool = False       # inherited from the segment on creation
+                                  # (decision E: e.g. THINK → hidden);
+                                  # per-word override allowed afterwards
+
+    def __post_init__(self) -> None:
+        # Any mutation of the words list invalidates the segment's lazy
+        # text cache (decision B).
+        if self.segment is not None:
+            self.segment._text_cache = None
+
+
+@dataclass
 class Segment:
-    """One output block. ``text`` accumulates ONLY confirmed elements
-    (every RuntimePlugin voted continue)."""
+    """One output block. ``words`` is the primary representation (v5):
+    ONLY confirmed elements land here (every RuntimePlugin voted continue).
+    ``text`` stays a backwards-compatible derived view (lazy, cached until
+    the words list is touched)."""
 
     kind: SegmentKind
-    text: str = ""                        # only CONFIRMED word/special content
+    words: List[Word] = field(default_factory=list)
     finish_reason: Optional[str] = None   # None = open; stop|length|aborted|unclosed
     segments: List["Segment"] = field(default_factory=list)  # subsegments
+    #: Lazy cache for the derived ``text`` (decision B); invalidated by
+    #: Word.__post_init__ and by any structural change of ``words``.
+    _text_cache: Optional[str] = None
+
+    @property
+    def is_hidden(self) -> bool:
+        """Decision E: visibility is bound to SegmentKind — THINK and
+        TOOL_CALL segments are hidden from the user stream; RESPONSE is
+        visible. Words inherit this value at commit time."""
+        return self.kind in (SegmentKind.THINK, SegmentKind.TOOL_CALL)
+
+    @property
+    def text(self) -> str:
+        """Derived: ''.join(w.text for w in words), lazily cached (B)."""
+        if self._text_cache is None:
+            self._text_cache = "".join(w.text for w in self.words)
+        return self._text_cache
+
+    @text.setter
+    def text(self, value: str) -> None:
+        """Back-compat setter (old code/tests wrote raw text into a
+        segment): replaces the whole word list with a single Word.
+        ``idx`` stays untouched — global renumbering is owned by the
+        parser's tape rebuild (ParseState.words)."""
+        self.words = [Word(text=value, segment=self, is_hidden=self.is_hidden)]
+
+    # --- direct word management (leader decision 2026-10-13: manage
+    #     words/segments directly; these helpers keep idx consistent) ---
+    def add_word(self, word: "Word") -> "Word":
+        """Append an existing/new Word to this segment (fixes the link;
+        global ``idx`` is owned by the parser tape)."""
+        word.segment = self
+        self.words.append(word)
+        self._text_cache = None
+        return word
+
+    def remove_word(self, word: "Word") -> bool:
+        """Remove a Word object from this segment."""
+        try:
+            self.words.remove(word)
+        except ValueError:
+            return False
+        self._text_cache = None
+        return True
+
+    def move_word(self, word: "Word", to_pos: int) -> None:
+        """Reorder: move an existing Word to position ``to_pos``."""
+        self.words.remove(word)
+        self.words.insert(max(0, min(to_pos, len(self.words))), word)
+        self._text_cache = None
+
+    def reindex(self) -> None:
+        """Invalidate the text cache after any external mutation of
+        ``words`` (reorder/remove/insert done through the raw list)."""
+        self._text_cache = None
 
 
 @dataclass
@@ -106,6 +193,11 @@ class ParseState:
     # --- segments ---
     segments: List[Segment] = field(default_factory=list)  # all collected
     stack: List[Segment] = field(default_factory=list)     # OPEN ones; [-1] = current
+
+    #: Global word tape (decision F): every committed Word in generation
+    #: order, across all segments. ``word.idx == len(words)`` at commit →
+    #: idx is the position in this list AND equals the word_count counter.
+    words: List["Word"] = field(default_factory=list)
 
     # --- stream / protocol ---
     finish_reason: Optional[str] = None   # stop | length | tool_calls | ...
@@ -269,7 +361,16 @@ class ResponseParser:
         if status is ParseStatus.WORD:
             assert payload is not None
             target = st.current or self._ensure_response_segment()
-            target.text += payload + " "
+            # v5 Word model: append-at-commit. text carries the closing
+            # delimiter (decision C); idx is GLOBAL over the response tape
+            # (decision F) — equal to word_count before increment; the Word
+            # links back to its segment (decision A) and inherits visibility
+            # from Segment.kind (decision E).
+            word = Word(text=payload + " ", segment=target,
+                        idx=st.word_count, is_hidden=target.is_hidden)
+            target.words.append(word)
+            target._text_cache = None
+            st.words.append(word)          # global tape (idx == position)
             st.word_count += 1             # committed words counter
         elif status is ParseStatus.SPECIAL:
             assert payload is not None
@@ -482,7 +583,7 @@ class ResponseParser:
         canonical = self._fuzzy_tag(name)
         if canonical is None:                 # defensive: text fallback
             target = st.current or self._ensure_response_segment()
-            target.text += f"<{body}> "
+            self._append_noise(target, f"<{body}> ")
             return
         kind = self.tag_kinds.get(canonical, SegmentKind(canonical))
         if self._is_self_closing_body(body):  # rule 5: stack untouched
@@ -504,7 +605,7 @@ class ResponseParser:
                     return
             # stray closer (no opener anywhere) → noise, kept as text
             target = st.current or self._ensure_response_segment()
-            target.text += f"</{canonical}> "
+            self._append_noise(target, f"</{canonical}> ")
             return
         # opening tag
         # rule 4: tool_call inside think — anomaly
@@ -526,11 +627,22 @@ class ResponseParser:
         # depth limit (rule 3): deeper than allowed → literal text
         if len(st.stack) >= self.max_depth:
             target = st.current or self._ensure_response_segment()
-            target.text += f"<{canonical}> "
+            self._append_noise(target, f"<{canonical}> ")
             return
         seg = Segment(kind=kind)
         st.segments.append(seg)
         st.stack.append(seg)
+
+    def _append_noise(self, target: Segment, text: str) -> None:
+        """Append a literal-text fragment (noise tag / stray closer /
+        depth-limit fallback) as a Word — v5 keeps ``words`` the single
+        primary representation of segment content."""
+        word = Word(text=text, segment=target,
+                    idx=self.state.word_count, is_hidden=target.is_hidden)
+        target.words.append(word)
+        target._text_cache = None
+        self.state.words.append(word)
+        self.state.word_count += 1
 
     def _ensure_response_segment(self) -> Segment:
         """RESPONSE == «вне тегов» (rule 2): implicit bottom-of-stack segment."""

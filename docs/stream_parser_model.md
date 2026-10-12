@@ -119,7 +119,7 @@ class RuntimePlugin:
 7. Сегмент рождается и закрывается тем же голосованием плагинов, что и слово.
 8. На `[DONE]`/`finish_reason` все открытые сегменты закрываются с `finish_reason="unclosed"`, остаток `buffer` дописывается как слово.
 
-## Модель Word (план v5, согласовано 2026-10-12 — НЕ реализовано)
+## Модель Word (v5, согласовано 2026-10-12 — РЕАЛИЗОВАНО 2026-10-13)
 
 Цель: превратить сегмент в редактируемую ленту слов — прямой доступ
 RuntimePlugin к словам (мутация, reorder, любые операции) для стрим-рендеринга
@@ -135,8 +135,10 @@ class Word:
                                 # не индексы; о сериализации снапшотов пока не думаем)
     idx: int = 0                # ГЛОБАЛЬНЫЙ порядковый номер слова от начала
                                 # генерации ответа (решение F), не внутри сегмента;
-                                # имя — просто idx (не birth_idx)
-    is_hidden: bool = False     # наследуется от сегмента (см. ниже Segment.kind)
+                                # имя — просто idx (не birth_idx);
+                                # == позиция в глобальной ленте ParseState.words
+    is_hidden: bool = False     # наследуется от сегмента при коммите
+                                # (см. ниже Segment.kind); per-word override допустим
 
 @dataclass
 class Segment:
@@ -144,12 +146,26 @@ class Segment:
     words: List["Word"] = field(default_factory=list)  # primary-представление
     finish_reason: Optional[str] = None
     segments: List["Segment"] = field(default_factory=list)
+    _text_cache: Optional[str] = None   # ленивый кэш derived text (решение B)
+
+    @property
+    def is_hidden(self) -> bool: ...    # THINK/TOOL_CALL → True (решение E)
 
     @property
     def text(self) -> str:
-        """Derived: ''.join(w.text for w in words). Ленивое кэширование
-        допустимо, инвалидируется при любой мутации words (решение B)."""
+        """Derived: ''.join(w.text for w in words). Ленивое кэширование,
+        инвалидация при любой мутации words (решение B). Есть back-compat
+        setter: запись текста заменяет слова одним Word."""
+
+    # helpers прямого управления (add_word/remove_word/move_word/reindex)
 ```
+
+Реализация (2026-10-13): `ParseState.words` — глобальная лента всех
+закоммиченных Word (idx == позиция); `ResponseParser.commit()` создаёт Word
+при коммите (append-at-commit); шумовые теги тоже становятся Word
+(единственное представление контента). **Лидерское решение 2026-10-13:**
+никакого API сплошного текста для редактирования — управляем только словами
+и сегментами (прямой доступ + helpers).
 
 Зафиксированные решения:
 - **A. Владелец слов** — двусторонние ссылки (`word.segment`); циклические

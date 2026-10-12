@@ -464,3 +464,72 @@ def test_stop_via_vote_midstream():
     res = agent.run([{"role": "user", "content": "hi"}])
     assert "stop-me" not in res["response"]
     assert res["finish_reason"] == "stop"
+
+
+class TestWordModelV5:
+    """Word model v5 (docs/stream_parser_model.md) — implemented 2026-10-13.
+    Decisions A–F + lifecycle rule append-at-commit, mutate-after."""
+
+    @staticmethod
+    def _run(chunks):
+        from cascagent.stream_parser import ResponseParser
+        p = ResponseParser()
+        for c in chunks:
+            for ev in p.feed(c):
+                p.commit(ev)
+        p.finalize("stop")
+        return p
+
+    def test_words_primary_text_derived(self):
+        """B: words is primary; text is a derived lazy view."""
+        from cascagent.stream_parser import SegmentKind
+        p = self._run(["Hello ", "wor", "ld!"])
+        resp = p.state.segments[0]
+        assert [w.text for w in resp.words] == ["Hello ", "world "]
+        assert resp.text == "Hello world "           # derived property
+        assert resp._text_cache == "Hello world "     # cached after first read
+
+    def test_word_fields_and_global_idx(self):
+        """A/C/F: link back to segment, delimiter inside text,
+        idx global across segments == position on the tape."""
+        p = self._run(["a b ", "<think>", " c ", "</think>", " d"])
+        tape = p.state.words
+        assert [w.idx for w in tape] == list(range(len(tape)))
+        assert [w.text for w in tape] == ["a ", "b ", "c ", "d "]
+        kinds = [w.segment.kind.value for w in tape]
+        assert kinds == ["response", "response", "think", "response"]
+        # word_count counter == tape length
+        assert p.state.word_count == len(tape)
+
+    def test_is_hidden_inherited_from_kind(self):
+        """E: THINK/TOOL_CALL words hidden, RESPONSE visible."""
+        p = self._run(["out ", "<think>", " secret ", "</think>"])
+        by_kind = {w.segment.kind.value: w.is_hidden for w in p.state.words}
+        assert by_kind == {"response": False, "think": True}
+        # response_text() already skips think via segment kind
+        assert p.response_text() == "out"
+
+    def test_mutate_after_commit(self):
+        """D: edit/reorder/remove/add through direct access; reindex()
+        refreshes the derived text."""
+        p = self._run(["one two three"])
+        resp = p.state.segments[0]
+        resp.words[1].text = "TWO "       # mutate committed word
+        resp.reindex()
+        assert p.response_text() == "one TWO three"
+        last = resp.words[-1]
+        resp.move_word(last, 0)           # reorder
+        assert p.response_text() == "three one TWO"
+        assert resp.remove_word(last)     # remove
+        assert p.response_text() == "one TWO"
+        from cascagent.stream_parser import Word
+        resp.add_word(Word(text="x "))    # add (link fixed by helper)
+        assert resp.words[-1].segment is resp
+        assert p.response_text() == "one TWO x"
+
+    def test_noise_tag_is_a_word(self):
+        """Stray closers land in words too (single representation)."""
+        p = self._run(["a </nope> b"])
+        texts = [w.text for w in p.state.segments[0].words]
+        assert texts == ["a ", "</nope> ", "b "]
+        assert p.response_text() == "a </nope> b"
