@@ -63,3 +63,29 @@ Decomposer остаётся PrePlugin-инструментом. Его выво�
   суммаризация результатов детей — компетенция Orchestrator (зовёт Summarizer).
 - Documented in: product §4–5 (v6 + mermaid), process §1.1, plugins §agent-as-tool,
   roadmap #20.
+
+---
+
+## Дополнение (2026-10-13): диспетчеризация — часть внутреннего цикла агента
+
+**Решение:** `Agent` объединяет «обычный цикл» и диспетчеризацию: это не
+промпт + MCP tools, а полный конвейер PENDING → ENRICHMENT(Pre + выбор
+роли) → RUNNING(run) → оценка(Post/Validator). Внешний рекурсивный
+`execute_task` (эталон v2) заменён тонким циклом `dispatch_loop`
+(process §1.2): рекурсия дерева выражена очередью задач + park/wake
+родителя, а не Python-стеком.
+
+Пункты:
+1. Каждый агент имеет **локальный набор задач** (дети его уровня) — как
+   view над единым Kanban-persistence (`parent_id`); одной общей
+   in-memory структуры не требуется.
+2. Механизм выбора роли из п.2 этого ADR получает API-форму:
+   `Agent(role="auto")` → Pre-секция → `pick_role(local_memory)` →
+   `bind_body(role)` → RUNNING. Смены роли внутри run() нет.
+3. CPU-диспетчер не упразднён — он живёт внутри каждого агента как
+   детерминированная обвязка этапов; границы «когда/кем vs что» не меняются.
+4. Оценка выполнения — этап PostPlugin (Validator): DONE только при
+   `action == "accept"`; reject → FAILED → эскалация родителю-Orchestrator.
+
+Spec: process §1.1–1.3 (таблица этапов, dispatch_loop, mermaid),
+plugins §6.4 (примечание).

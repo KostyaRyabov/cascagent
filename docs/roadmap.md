@@ -733,9 +733,11 @@ port-этап (§1), full observability/dashboards.
       режим; transport инъектируем (для MockLLM).
 - [ ] `history.py`: JSONL-история вызовов + debug.log (формат — docs/data.md §3).
 - [ ] `kanban.py`: SQLite-хранилище дерева задач (schema — docs/data.md).
-- [ ] Оркестратор `execute_task` (декомпозиция ленивая, ADR-004): поверх
-      `Agent.run()` + TaskParserPlugin; цикл brief→decompose→child…; здесь же
-      решается протокол parent-child (§9.1).
+- [ ] Диспетчер `dispatch_loop` (декомпозиция ленивая, ADR-004 + ADR-005
+      с дополнением 2026-10-13): тонкий цикл поверх жизненного цикла агента
+      PENDING→ENRICHMENT(Pre+pick_role)→RUNNING(Agent.run)→оценка(Post);
+      рекурсия дерева — очередью задач + park/wake родителя, не стеком;
+      здесь же решается протокол parent-child (§9.1). Spec: process §1.1–1.3.
 - [ ] `cli.py` + фикс entry point: `--query`, `--max-depth`, рендер дерева,
       режимы resume/replay (зависит от #3/#4 MVP-чеклиста).
 - [ ] `MockLLM` (roadmap #7) + e2e-тест «CLI → mock → дерево задач» — без сети.

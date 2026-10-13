@@ -205,9 +205,9 @@ completed_siblings)` (pure function, тестируется без сети).
 
 Сокращённая схема (только протокольные развилки: атом/degenerate-repeat →
 Executor, иначе parse+dedup → дети; суммаризация вверх). **Эталонный
-полный алгоритм ленивого выполнения (`execute_task` с enrich/kanban/
-history/reflect-ветками) — `docs/process.md §1.1`, там же отличия от
-Главы IX:**
+полный алгоритм ленивого выполнения (v3: `dispatch_loop` с Pre-обогащением,
+pick_role, kanban/history/reflect-ветками) — `docs/process.md §1.1–1.3`,
+там же отличия от эталона v2 и Главы IX:**
 
 ```python
 def execute_with_decomposition(task: Task) -> str:
