@@ -111,11 +111,12 @@ class LlamaCppClient:
 
         if cfg.backend == "llama_cpp":
             payload["think"] = bool(use_think)
-        elif not use_think:
-            for i in range(len(msgs) - 1, -1, -1):
-                if msgs[i].get("role") == "user":
-                    msgs[i]["content"] = "/no_think\n" + msgs[i].get("content", "")
-                    break
+        elif cfg.backend == "chatml":
+            if not use_think:
+                for i in range(len(msgs) - 1, -1, -1):
+                    if msgs[i].get("role") == "user":
+                        msgs[i]["content"] = "/no_think\n" + msgs[i].get("content", "")
+                        break
         else:
             raise ValueError(f"unknown backend flavour: {cfg.backend!r}")
         return payload

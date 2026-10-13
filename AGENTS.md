@@ -197,10 +197,12 @@ cascagent/
 ## 7. Этапы реализации (v2)
 
 - **Этап 1 (Фундамент):** ✅ models на протоколе v2; парсинг/дедуп в
-  `plugins/task_parser.py`; history.py (+тесты; формат записи — docs/data.md §3) — ⬜. pyproject — готов.
-- **Этап 2 (LLM-инфраструктура):** client, cache_manager (отложен: slot API нет)
-- **Этап 3 (Ядро):** decomposer (DecomposerSession + execute_with_decomposition),
-  kanban, cli
+  `plugins/task_parser.py`; ~~history.py~~ — СНЯТ (решение 2026-10-13,
+  data.md §3: отдельной истории LLM-вызовов нет). pyproject — готов.
+- **Этап 2 (LLM-инфраструктура):** ✅ client (LlamaCppClient, chunk-iterator
+  контракт roadmap §9.4, transport инъектируем); cache_manager (отложен: slot API нет)
+- **Этап 3 (Ядро):** kanban — ✅ код (тесты ⬜); decomposer-обвязка
+  (dispatch_loop/pick_role поверх Agent.run) и cli — ⬜
 - **Этап 4 (CPU-алгоритмы):** ✅ bk_tree; semantic, rag — ⬜
 - **Этап 5 (Обвязка агентов):** enricher, executor, reflector, researcher
   (базовый плагинный слой v3 реализован досрочно: memory.py, stream_parser.py, plugins/)
@@ -251,14 +253,17 @@ Research/Reflect, суммаризация) специфицирован в `doc
 (Workspace/Project/Agent + Memory flat-KV), `stream_parser.py`
 (ResponseParser, Segment/Word v5), `plugins/base.py` +
 `plugins/task_parser.py` (поглотил parser.py/detector.py, удалены),
-`bk_tree.py`.
+`bk_tree.py`; с 2026-10-14 — `client.py` (LlamaCppClient) и `kanban.py`
+(SQLite; оба БЕЗ тестов).
 
 Ближайшие шаги (порядок — см. docs/roadmap.md, Фаза 2):
-1. `history.py` (JSONL + debug.log) + тесты;
-2. `client.py` (стриминг, think-параметр, chunk-iterator контракт);
-3. `kanban.py` + оркестратор execute_task поверх Agent.run();
-4. `cli.py` (--query, рендер дерева) → e2e на MockLLM;
-5. Далее по AGENTS.md §7 (enricher/executor/reflector/researcher).
+1. Тесты на `client.py` (payload/SSE на fake-session) и `kanban.py`
+   (CRUD/дерево/semantic_memory/resume) — без сети, tmp_path БД;
+2. Диспетчер `dispatch_loop` + park/wake Kanban (process §1.2, ADR-005;
+   здесь же решается протокол parent-child roadmap §9.1);
+3. `cli.py` (--query, рендер дерева; entry point раскомментить) →
+   e2e-тест «CLI → MockLLM → дерево задач»;
+4. Далее по AGENTS.md §7 (enricher/executor/reflector/researcher).
 
 Конвенции кода:
 - `from __future__ import annotations` везде; type hints обязательны.
