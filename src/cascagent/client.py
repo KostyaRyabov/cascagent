@@ -47,9 +47,14 @@ stream=..., timeout=...)`` — в реальной работе ``requests.Sessi
 from __future__ import annotations
 
 import json
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
+                     Optional, Union)
+
+if TYPE_CHECKING:                       # только для аннотаций, без рантайм-цикла
+    from cascagent.stream_parser import ParseState
 
 #: Сентинел, выдаваемый после последней дельты — соответствует проверке
 #: в цикле агента (memory.py run(): `if chunk == "[DONE]": break`).
@@ -204,21 +209,57 @@ class ToolCallDelta(StreamEventBase):
 
 
 @dataclass(slots=True)
+class StatsEvent(StreamEventBase):
+    """Телеметрия стрима — выдаётся ПОСЛЕДНИМ событием, после FinishEvent.
+
+    Зачем нужен «показатель прогресса» (запрос лидера 2026-10-14): интерфейс
+    должен отличать живую генерацию от зависания. Во время самого стрима
+    живой сигнал дают дельты (каждый фрейм = токен дошёл); итоговые счётчики
+    приходят здесь. Потребитель может печатать ``(len(sr.stats.content_chars),
+    sr.stats.elapsed)`` в цикле ``words()`` — обновляется на каждом фрейме.
+
+    Поля заполняются только по факту получения (usage есть не у всех
+    серверов; tokens_per_sec вычисляется лишь при наличии usage.response).
+    """
+
+    #: Время жизни запроса от POST до конца потока, сек.
+    elapsed: float = 0.0
+    #: Сколько текстовых символол продублировано ContentDelta.
+    content_chars: int = 0
+    #: Сколько символов продублировано ReasoningDelta (thinking-поля).
+    reasoning_chars: int = 0
+    #: Число событий ToolCallDelta (куски вызовов, не сами вызовы).
+    tool_call_deltas: int = 0
+    #: Сырое поле usage из последнего SSE-фрейма (prompt/completion/total).
+    usage: Dict[str, Any] = field(default_factory=dict)
+    #: completion_tokens / elapsed — если usage пришёл; иначе None.
+    tokens_per_sec: Optional[float] = None
+
+
+@dataclass(slots=True)
 class FinishEvent(StreamEventBase):
-    """Финальное событие потока: причина остановки и накопленные tool_calls.
+    """Финальное событие потока: причина остановки и агрегированные tool_calls.
 
     Не является исключением при нормальных finish_reason. Выдаётся
     исключительно внутри ``stream_events()``, когда поток дошёл до конца
     или получил ``data: [DONE]`` без явного выбора с finish_reason.
+
+    ВАЖНО (решение лидера 2026-10-14): здесь НЕТ накопленных text/reasoning.
+    Дельты — единственная форма выдачи текста; сборка full-text — прерогатива
+    ResponseParser (delta → segment + word), а не транспорта. Исключение —
+    tool_calls: их JSON-аргументы приходят кусками через границу фреймов и
+    обязаны быть агрегированы именно на транспортном уровне (иначе следующий
+    HTTP-запрос цикла function calling физически невозможно собрать).
     """
 
     finish_reason: str
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
-    content_text: Optional[str] = None
 
 
-#: Общий тип «промежуточных» событий stream_events() до финального FinishEvent.
-StreamEvent = Union[ContentDelta, ReasoningDelta, ToolCallDelta]
+#: Общий тип событий stream_events(): промежуточные дельты + финальные
+#: FinishEvent и StatsEvent (последний — всегда самый последний).
+StreamEvent = Union[ContentDelta, ReasoningDelta, ToolCallDelta,
+                    FinishEvent, StatsEvent]
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +330,11 @@ class LLMClient(ABC):
     def __init__(self, config: Optional[LLMConfig] = None,
                  session: Optional[Any] = None) -> None:
         self.config = config or LLMConfig()
+        #: Живой указатель на телеметрию текущего/последнего стрима
+        #: (обновляется на каждом фрейме внутри stream_events). Позволяет
+        #: наблюдать прогресс генерации из другого кода без хранения
+        #: возвращаемого генератора. Сбрасывается в начале каждого вызова.
+        self._last_stats: StatsEvent = StatsEvent()
         #: Инъектируемый транспорт: любой объект с методом
         #: .post(url, json, stream, timeout), возвращающий ответ с
         #: .raise_for_status(), .iter_lines() и .close().
@@ -360,8 +406,7 @@ class LLMClient(ABC):
                       max_tokens: Optional[int] = None,
                       tools: Optional[List[Dict[str, Any]]] = None,
                       tool_choice: Optional[Any] = None,
-                      ) -> Iterator[Union[ContentDelta, ReasoningDelta,
-                                          ToolCallDelta, FinishEvent]]:
+                      ) -> Iterator[StreamEvent]:
         """Низкоуровневый стриминг событий SSE — полный контракт OpenAI API.
 
         Выдаёт по одному объекту на смысловое событие потока:
@@ -369,7 +414,11 @@ class LLMClient(ABC):
         - ``ReasoningDelta``  — дельта скрытых рассуждений (thinking);
         - ``ToolCallDelta``   — частичный вызов инструмента (``delta.tool_calls``);
         - ``FinishEvent``     — ровно ОДИН раз в конце: причина завершения
-          (``finish_reason``) и агрегированные дополненные tool_calls.
+          (``finish_reason``) и агрегированные tool_calls;
+        - ``StatsEvent``      — ВСЕГДА самое последнее событие: телеметрия
+          (elapsed, счётчики символов, usage, tokens_per_sec). Живой объект
+          обновляется уже во время стрима (``client._last_stats``), поэтому
+          live-UI может читать прогресс, не дожидаясь финала.
 
         Обработка finish_reason:
         - нормальные причины: "stop", "length", "content_filter", "tool_calls";
@@ -413,7 +462,12 @@ class LLMClient(ABC):
         tc_acc: Dict[int, Dict[str, Any]] = {}
         finish_reason: Optional[str] = None
         got_done_frame = False               # сервер прислал data: [DONE]
-        text_parts: List[str] = []
+        usage: Dict[str, Any] = {}           # сырое поле usage из фреймов
+        started = time.monotonic()           # для live-телеметрии (StatsEvent)
+        #: Живой счётчик телеметрии: обновляется НА КАЖДОМ фрейме, поэтому
+        #: потребитель стрима (live-UI) видит прогресс даже до FinishEvent.
+        stats = StatsEvent()
+        self._last_stats = stats
 
         try:
             resp.raise_for_status()
@@ -437,6 +491,9 @@ class LLMClient(ABC):
                 if obj.get("error"):
                     raise LLMError(f"server returned stream error: {obj['error']}")
 
+                if obj.get("usage"):
+                    usage.update(obj["usage"])   # llama.cpp/tabby шлют в последнем фрейме
+
                 choices = obj.get("choices") or []
                 if not choices:
                     continue
@@ -446,13 +503,14 @@ class LLMClient(ABC):
                 # --- текстовая дельта ------------------------------------
                 content = delta.get("content")
                 if content:
-                    text_parts.append(content)
+                    stats.content_chars += len(content)
                     yield ContentDelta(content)
 
                 # --- дельта рассуждений (thinking) ------------------------
                 # normalize разных имён полей у разных бэкендов
                 reasoning = delta.get("reasoning") or delta.get("reasoning_content")
                 if reasoning:
+                    stats.reasoning_chars += len(reasoning)
                     yield ReasoningDelta(reasoning)
 
                 # --- tool_calls (стриминговые куски) ----------------------
@@ -472,6 +530,7 @@ class LLMClient(ABC):
                         raise LLMToolCallNotSupported(
                             "backend returned tool_calls but "
                             "LLMConfig.enable_tools is False")
+                    stats.tool_call_deltas += 1
                     yield ToolCallDelta(index=idx, id=tc.get("id"),
                                         name=fn.get("name"),
                                         arguments_delta=arg_delta, raw=dict(tc))
@@ -521,8 +580,14 @@ class LLMClient(ABC):
             yield FinishEvent(
                 finish_reason=finish_reason or "stop",
                 tool_calls=tool_calls_msg,
-                content_text="".join(text_parts) if text_parts else None,
             )
+            # --- телеметрия: всегда последним событием после FinishEvent --
+            stats.elapsed = time.monotonic() - started
+            stats.usage = usage
+            comp = usage.get("completion_tokens") or usage.get("response")
+            if comp and stats.elapsed > 0:
+                stats.tokens_per_sec = comp / stats.elapsed
+            yield stats
         finally:
             # всегда освобождаем соединение, даже при обрыве итерации сверху
             close = getattr(resp, "close", None)
@@ -586,21 +651,39 @@ class LLMClient(ABC):
                       tool_map: Dict[str, Callable[..., Any]], *,
                       max_rounds: int = 8,
                       use_think: bool = True,
-                      **kwargs: Any) -> str:
+                      stream: bool = False,
+                      on_round: Optional[Callable[[Dict[str, Any]], None]] = None,
+                      **kwargs: Any) -> "ToolLoopResult":
         """Полный цикл function calling: запрос → tool_calls → результаты → повтор.
 
         ``tool_map``: имя инструмента → python-функция (например, MCP-мост).
-        Возвращает финальный текстовый ответ модели. Бросает LLMError,
-        если модель просит инструмент, которого нет в tool_map, или если
-        цикл не сошёлся за max_rounds раундов.
+        Возвращает ``ToolLoopResult``: финальный текст (text), причину
+        остановки (finish_reason), телеметрию всех раундов (rounds) и
+        суммарную статистику (stats). Бросает LLMError, если модель просит
+        инструмент, которого нет в tool_map, или если цикл не сошёлся за
+        max_rounds раундов.
+
+        Два режима выдачи ответа (решение лидера 2026-10-14):
+        - ``stream=False`` (по умолчанию) — каждый раунд идёт через
+          ``complete()``: ответ собирается целиком, без промежуточных
+          событий. Просто и предсказуемо;
+        - ``stream=True`` — каждый раунд идёт через конвейер
+          ``stream_parsed().words()``: коммитнутые слова приходят ПО МЕРЕ
+          генерации (плавный интерфейс), а после каждого раунда вызывается
+          ``on_round({"round", "phase", "stats"})`` — живой прогресс
+          («сколько символов/сек уже нагенерировано», «инструмент N выполнен»).
+          Финальный текст при этом собирается из слов парсером (delta →
+          segment + word), а не транспортом.
 
         Пример::
 
-            text = client.run_tool_loop(
+            res = client.run_tool_loop(
                 [{"role": "user", "content": "Какая погода в Москве?"}],
                 tool_map={"get_weather": get_weather_fn},
-                tools=[...],
+                tools=[...], stream=True,
+                on_round=lambda info: print(info["stats"]),   # live-прогресс
             )
+            print(res.text)
         """
         msgs = [dict(m) for m in messages]
         tool_specs = kwargs.pop("tools", None)
@@ -608,20 +691,56 @@ class LLMClient(ABC):
             # автоматически построить схемы из docstring'ов нельзя —
             # caller обязан дать точные схемы; пустой список запрещён:
             raise LLMError("run_tool_loop requires explicit 'tools=[...]' specs")
+        rounds_log: List[Dict[str, Any]] = []
+        agg = StatsEvent()                    # накопитель по всем раундам
+        started = time.monotonic()
         rounds = 0
         while True:
             rounds += 1
             if rounds > max_rounds:
                 raise LLMError(f"tool loop exceeded {max_rounds} rounds")
-            fin = self.complete(msgs, tools=tool_specs,
-                                use_think=use_think, **kwargs)
+
+            # --- раунд LLM: стримно или одним куском ---------------------
+            if stream:
+                sr = self.stream_parsed(msgs, tools=tool_specs,
+                                        use_think=use_think, **kwargs)
+                parts = [w.text for w in sr.words()]   # live-выдача слов
+                fin = sr.finish_event or FinishEvent(finish_reason="stop")
+                st = sr.stats
+                asst_text = "".join(parts).strip()
+            else:
+                fin = self.complete(msgs, tools=tool_specs,
+                                    use_think=use_think, **kwargs)
+                st = self._last_stats
+                asst_text = ""               # text — вне транспорта (см. FinishEvent)
+
+            # --- накопление телеметрии и сигнал прогресса ---------------
+            agg.content_chars += st.content_chars
+            agg.reasoning_chars += st.reasoning_chars
+            agg.tool_call_deltas += st.tool_call_deltas
+            agg.usage.update(st.usage)
+            rounds_log.append({"round": rounds, "phase": "llm",
+                               "finish_reason": fin.finish_reason,
+                               "stats": st})
+            if on_round:
+                on_round(rounds_log[-1])
+
             if not fin.tool_calls:
-                return fin.content_text or ""
+                # финал: причина остановки и полная телеметрия цикла
+                agg.elapsed = time.monotonic() - started
+                comp = agg.usage.get("completion_tokens") \
+                    or agg.usage.get("response")
+                if comp and agg.elapsed > 0:
+                    agg.tokens_per_sec = comp / agg.elapsed
+                return ToolLoopResult(text=asst_text,
+                                      finish_reason=fin.finish_reason,
+                                      rounds=rounds_log, stats=agg)
+
             # дописываем assistant-сообщение с запрошенными инструментами
             asst: Dict[str, Any] = {"role": "assistant",
                                     "tool_calls": fin.tool_calls}
-            if fin.content_text:
-                asst["content"] = fin.content_text
+            if asst_text:
+                asst["content"] = asst_text
             msgs.append(asst)
             # выполняем каждый запрошенный инструмент и кладём результат
             # в сообщение role="tool" (современное имя; "function" — легаси-алиас)
@@ -630,11 +749,21 @@ class LLMClient(ABC):
                 fn = tool_map.get(name)
                 if fn is None:
                     raise LLMError(f"model requested unknown tool: {name!r}")
+                t0 = time.monotonic()
                 try:
                     args = json.loads(call["function"]["arguments"] or "{}")
                     result = fn(**args)
+                    phase = "ok"
                 except Exception as exc:      # ошибку тоже отдаём модели
                     result = f"ERROR: {exc}"
+                    phase = "error"
+                # сигнал прогресса: инструмент выполнен (для live-UI видно,
+                # что фаза tool-execution не виснет)
+                info = {"round": rounds, "phase": phase, "tool": name,
+                        "elapsed": time.monotonic() - t0}
+                rounds_log.append(info)
+                if on_round:
+                    on_round(info)
                 msgs.append({"role": "tool",
                              "tool_call_id": call["id"],
                              "content": (result if isinstance(result, str)
@@ -648,6 +777,33 @@ class LLMClient(ABC):
         def _call(messages: List[Dict[str, Any]]) -> Iterator[str]:
             return self.stream(messages, use_think=use_think)
         return _call
+
+    # ---- объединённая сущность «стрим + парсер» -------------------------
+    def stream_parsed(self, messages: List[Dict[str, Any]], *,
+                      use_think: bool = True,
+                      parser: Optional[Any] = None,
+                      voters: Optional[Callable] = None,
+                      **kwargs: Any) -> "StreamedResponse":
+        """Одна итерация LLM целиком: SSE-стрим + ResponseParser в одном объекте.
+
+        Возвращает ``StreamedResponse`` — ленивый конвейер: транспортные
+        события (stream_events) пропускаются через адаптивный парсер
+        (структурированные reasoning/tool_calls ИЛИ теги прямо в content —
+        оба варианта одновременно). Запуск: ``sr.run()`` (всё сразу) или
+        ``for w in sr.words(): ...`` (по коммитнутому слову, для live-UI).
+
+        ``parser`` — готовый экземпляр ResponseParser (по умолчанию создаётся
+        с дефолтным whitelist); передавайте свой, если нужен кастомный
+        max_depth/whitelist/on_anomaly. ``voters`` — hook голосования
+        runtime-плагинов: callable((WORD|SPECIAL, payload), ParseState)->bool.
+        """
+        if parser is None:
+            from cascagent.stream_parser import ResponseParser
+            parser = ResponseParser()
+        return StreamedResponse(
+            self,
+            self.stream_events(messages, use_think=use_think, **kwargs),
+            parser, voters=voters)
 
 
 # ---------------------------------------------------------------------------
@@ -719,3 +875,256 @@ def create_client(config: Optional[LLMConfig] = None,
 # ChatmlLLMClient / create_client.
 OpenAIChatClient = LlamaCppLLMClient
 LlamaCppClient = LlamaCppLLMClient
+
+
+# ---------------------------------------------------------------------------
+# Объединённая сущность «стрим + адаптивный парсер» (решение 2026-10-14)
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class ToolLoopResult:
+    """Итог ``run_tool_loop``: текст + протокол + телеметрия всех раундов.
+
+    Поле ``text`` заполняется только в режиме ``stream=True`` (там его
+    собирает парсер из коммитнутых слов). В режиме по умолчанию транспорт
+    намеренно не копит текст (решение лидера: дельты — единственная форма
+    выдачи текста), поэтому caller использует стримный режим, если нужен
+    ответ; либо читает сегменты через собственный конвейер stream_parsed.
+    """
+
+    text: str = ""
+    finish_reason: str = "stop"
+    #: Журнал событий цикла: {"round", "phase": llm|ok|error, ...}.
+    rounds: List[Dict[str, Any]] = field(default_factory=list)
+    #: Суммарная телеметрия по всем раундам LLM.
+    stats: Optional[StatsEvent] = None
+
+
+class StreamedResponse:
+    """Одна итерация LLM: транспорт (stream_events) + ResponseParser в одном объекте.
+
+    Мотивация (leader request 2026-10-14): логика структурирования ответа
+    тесно связана со стримом и работает только с ним — вместо двух раздельных
+    объектов (клиент-генератор + парсер, которыми вручную дирижирует агент)
+    здесь ОДИН метод ``client.stream_parsed(messages)``, возвращающий этот
+    объект. Внутри он инкапсулирует весь цикл feed → голосование плагинов →
+    commit, который раньше был размазан по ``Agent.run``.
+
+    Адаптивность к форматам thinking / tool_call (главный вопрос 2026-10-14:
+    «не всегда понятно, теги это или структурированные поля» — верно, поэтому
+    оба варианта поддерживаются одновременно, без конфигурации):
+
+    1. СТРУКТУРИРОВАННЫЙ вариант (бэкенд отдаёт отдельные поля SSE-дельт):
+       - ``delta.reasoning`` / ``delta.reasoning_content`` → ReasoningDelta;
+         конвейер оборачивает каждую дельту в служебные SPECIAL-события
+         ``<think>`` … ``</think>``, и парсер складывает их в скрытый
+         SegmentKind.THINK-сегмент;
+       - ``delta.tool_calls`` → ToolCallDelta; вызов складывается в
+         отдельный TOOL_CALL-сегмент тем же приёмом (открывающий SPECIAL
+         при первом куске вызова, закрывающий — на FinishEvent).
+    2. ТЕКСТОВЫЙ вариант (модель генерирует ``<think>…</think>`` и теги/JSON
+       вызовов прямо внутри ``content``): дельты приходят как ContentDelta,
+       сырой текст идёт в ``parser.feed()`` как раньше — теги распознаёт сам
+       ResponseParser (whitelist + fuzzy BKTree), никакой отдельной логики
+       не нужно.
+
+    Смешанный случай тоже безопасен: если сервер шлёт reasoning-поле И модель
+    пишет теги в content, оба потока попадают в один THINK-сегмент корректно
+    (конвейер никогда не открывает второй вложенный <think> — повторное
+    открытие игнорируется).
+
+    Голосование runtime-плагинов (plugins.md §12.2) принимает опциональный
+    ``voters`` — callable(WORD|SPECIAL-событие, live ParseState) -> bool;
+    False означает «элемент не коммитится» (стоп-цикл агента). finish_reason
+    из протокола (FinishEvent) пробрасывается в ``state.finish_reason`` через
+    finalize()/close_on_stop() — контракт ParseState не меняется.
+    """
+
+    def __init__(self, client: "LLMClient", events: Iterator[StreamEvent],
+                 parser, voters: Optional[Callable] = None) -> None:
+        self.client = client
+        #: Внутренний генератор событий транспорта — трогать напрямую не нужно.
+        self._events = events
+        #: Экземпляр ResponseParser (cascagent.stream_parser) — живое состояние
+        #: доступно как ``self.parser.state`` в любой момент итерации.
+        self.parser = parser
+        self._voters = voters
+        self.finish_event: Optional[FinishEvent] = None
+        #: Телеметрия стрима: тот же живой объект StatsEvent, что и
+        #: ``client._last_stats`` во время итерации (обновляется на каждом
+        #: фрейме), поэтому UI может читать прогресс прямо из ``sr.stats``.
+        self.stats: StatsEvent = getattr(client, '_last_stats', StatsEvent())
+        self._consumed = False
+        #: Фазы структурных сегментов: открыты ли уже служебные теги
+        #: <think> / <tool_call> (инъектируются конвейером при первых
+        #: дельтах соответствующего типа; закрываются на FinishEvent).
+        self._think_open = False
+        self._tool_open = False
+        #: Причина завершения потока ("stop" | "length" | "tool_calls" |
+        #: "abort" …); None пока стрим не дошёл до конца.
+        self.finish_reason: Optional[str] = None
+
+    # ---- обработка одного события (общий код run() и words()) --------
+    def _step(self, ev: StreamEvent) -> str:
+        """Пропустить одно транспортное событие через конвейер.
+
+        Возвращает вердикт: ``"ok"`` — продолжать, ``"stop"`` — голос
+        плагинов остановил коммит, ``"end"`` — поток завершён
+        (FinishEvent/StatsEvent; финализация уже выполнена).
+        """
+        if isinstance(ev, ContentDelta):
+            if self._feed(ev.text):
+                return "stop"
+            return "ok"
+        if isinstance(ev, ReasoningDelta):
+            # структурный thinking → оборачиваем дельты в служебные теги
+            # парсера (первая открывает THINK-сегмент, остальные фидятся
+            # внутрь него)
+            if not self._think_open:
+                self._think_open = self._special("think")
+            if self._think_open and self._feed(ev.text):
+                return "stop"
+            return "ok"
+        if isinstance(ev, ToolCallDelta):
+            if not self._tool_open:
+                self._tool_open = self._special("tool_call")
+            if self._tool_open:
+                txt = (ev.name or "") + (ev.arguments_delta or "")
+                if txt and self._feed(txt):
+                    return "stop"
+            return "ok"
+        if isinstance(ev, StatsEvent):
+            # телеметрия приходит последним событием (после FinishEvent):
+            # сохраняем живой объект и завершаем конвейер.
+            self.stats = ev
+            return "end"
+        if isinstance(ev, FinishEvent):
+            self.finish_event = ev
+            self.finish_reason = ev.finish_reason or "stop"
+            self._finalize_structured()
+            return "end"
+        raise LLMError(f"unknown stream event type: {ev!r}")   # pragma: no cover
+
+    # ---- драйвер конвейера --------------------------------------------
+    def run(self) -> "ParseState":
+        """Прогнать весь поток до конца: feed → vote → commit для каждого события.
+
+        Возвращает финальный ``ParseState`` парсера (text доступен через
+        ``parser.response_text()``, tool-вызовы — через ``finish_event``).
+        Идемпотентен: повторный вызов после завершения ничего не делает.
+        Исключения транспорта (LLMAborted / LLMError) propagate наружу —
+        в этом случае state остаётся частично заполненным для диагностики.
+        """
+        if self._consumed:
+            return self.parser.state
+        for ev in self._events:
+            verdict = self._step(ev)
+            if verdict == "stop":            # голос плагинов: стоп
+                self.finish_reason = "stop"
+                self.parser.close_on_stop("stop")
+                break
+            if verdict == "end":
+                break
+        else:
+            # события кончились без FinishEvent (теоретически: только при
+            # внешнем обрыве генератора) — фиксируем мягкий "abort"
+            if self.finish_reason is None:
+                self.finish_reason = "abort"
+                self.parser.close_on_stop("abort")
+        self._consumed = True
+        return self.parser.state
+
+    # ---- потоковый интерфейс (для live-UI, по слову) -------------------
+    def words(self):
+        """Лениво отдавать каждый КОММИТНУТЫЙ Word по мере прогона потока.
+
+        Потребителю, которому нужен только текст (например, печатающий чат),
+        достаточно ``"".join(w.text for w in sr.words())``; скрытые слова
+        (THINK/TOOL_CALL) помечены ``w.is_hidden``. Телеметрию прогресса
+        можно читать из ``sr.stats`` прямо внутри цикла — объект живой и
+        обновляется на каждом фрейме транспорта.
+        """
+        if self._consumed:
+            # поток уже прогнан целиком — просто отдаём коммитнутые слова
+            yield from list(self.parser.state.words)
+            return
+        tape = self.parser.state.words
+        seen = 0
+        for ev in self._events:
+            verdict = self._step(ev)
+            while seen < len(tape):             # отдаём новые слова стрима
+                yield tape[seen]
+                seen += 1
+            if verdict == "stop":               # голос плагинов: стоп
+                self.finish_reason = "stop"
+                self.parser.close_on_stop("stop")
+                break
+            if verdict == "end":
+                break
+        else:
+            if self.finish_reason is None:      # события кончились без FinishEvent
+                self.finish_reason = "abort"
+                self.parser.close_on_stop("abort")
+        self._consumed = True
+        while seen < len(tape):
+            yield tape[seen]
+            seen += 1
+
+    # ---- внутреннее ------------------------------------------------------
+    def _feed(self, text: str) -> bool:
+        """Один кусок текста через feed+vote+commit. True = голос «стоп»."""
+        for item in self.parser.feed(text):
+            if not self._vote(item):
+                return True
+            self.parser.commit(item)
+        return False
+
+    def _special(self, body: str) -> bool:
+        """Инъекция служебного тега (SPECIAL) через тот же vote-контур.
+
+        True = элемент прошёл голосование и закоммичен; False = вето.
+        """
+        from cascagent.stream_parser import ParseStatus
+        item = (ParseStatus.SPECIAL, body)
+        st = self.parser.state
+        st.token_offset += 1
+        if not self._vote(item):
+            return False
+        self.parser.commit(item)
+        return True
+
+    def _finalize_structured(self) -> None:
+        """Закрыть незакрытые структурные сегменты и финализировать ленту.
+
+        Нормальные причины ("stop"/"length"/"tool_calls") → finalize():
+        буфер дренируется как последнее слово (правило 8). Аномальные
+        ("abort"…) → close_on_stop(): непроглоченный хвост буфера не должен
+        утечь в ответ. ВАЖНО: порядок закрытия — сначала /think, потом
+        /tool_call: tolerant-close парсера (правило 3) при закрытии внешнего
+        think сам закроет вложенный tool_call с причиной "unclosed", и
+        повторный закрывающий тег стал бы шумом внутри RESPONSE.
+        """
+        if self._think_open:
+            self._special("/think")
+        if self._tool_open:
+            self._special("/tool_call")
+        reason = self.finish_reason or "stop"
+        if reason in NORMAL_FINISH_REASONS:
+            # нормальное завершение протокола: незакрытые структурные
+            # сегменты получают "unclosed" (правило 8), буфер дренируется
+            # как последнее слово; RESPONSE закрывается причиной reason
+            self.parser.finalize(reason)
+        else:
+            # аномалия ("abort"/вето): сначала принудительно закрыть все
+            # открытые сегменты стека с "unclosed" — иначе close_on_stop
+            # дал бы незакрытому think причину внешнего события ("stop"),
+            # что неверно семантически; непроглоченный хвост буфера не
+            # должен утечь в ответ → close_on_stopdiscard-ит buffer
+            self.parser.force_close_open("unclosed")
+            self.parser.close_on_stop(reason)
+
+    def _vote(self, item) -> bool:
+        """Голосование runtime-плагинов над готовым элементом (по умолчанию — за)."""
+        if self._voters is None:
+            return True
+        return bool(self._voters(item, self.parser.state))

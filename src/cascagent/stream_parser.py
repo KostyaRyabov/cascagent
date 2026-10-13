@@ -426,7 +426,32 @@ class ResponseParser:
                 resp = st.stack.pop(0)
                 if resp.finish_reason is None:
                     resp.finish_reason = reason
+            # гарантия правила 8: ни один сегмент не остаётся открытым
+            # (в flat-ленте могут лежать сегменты, вытолкнутые со стека
+            #  tolerant-close / rule-4 аномалией без финализации).
+            # Сегменты, закрытые ЯВНО (например, </think> в потоке),
+            # сохраняют свою причину; незакрытые получают "unclosed".
+            for seg in st.segments:
+                if seg.finish_reason is None:
+                    seg.finish_reason = "unclosed"
         return st
+
+    def force_close_open(self, reason: str = "unclosed") -> None:
+        """Принудительно закрыть ВСЕ открытые сегменты стека.
+
+        Используется конвейером ``client.StreamedResponse`` на аномальных
+        завершениях потока (обрыв без finish_reason / без [DONE]): в flat-
+        ленте не должно оставаться сегментов с ``finish_reason=None``, а
+        последующий ``close_on_stop()`` должен закрыть только RESPONSE —
+        иначе незакрытый think получил бы причину внешнего события ("stop"),
+        что неверно семантически (он был закрыт НЕЯВНО → "unclosed",
+        правило 8).
+        """
+        st = self.state
+        while len(st.stack) > 1:              # RESPONSE (низ стека) не трогаем
+            top = st.stack.pop()
+            if top.finish_reason is None:
+                top.finish_reason = reason
 
     def close_on_stop(self, reason: str) -> ParseState:
         """Close the segment tree after a runtime-plugin stop.
@@ -456,6 +481,11 @@ class ResponseParser:
             resp = st.stack.pop(0)
             if resp.finish_reason is None:
                 resp.finish_reason = reason
+        # см. finalize: все сегменты обязаны быть закрыты;
+        # явно закрытые сохраняют свою причину, незакрытые — "unclosed"
+        for seg in st.segments:
+            if seg.finish_reason is None:
+                seg.finish_reason = "unclosed"
         return st
 
     def response_text(self) -> str:
@@ -650,6 +680,9 @@ class ResponseParser:
         if st.stack and st.stack[0].kind is SegmentKind.RESPONSE:
             return st.stack[0]
         resp = Segment(kind=SegmentKind.RESPONSE)
-        st.segments.insert(0, resp)
+        # порядок в flat-ленте segments = порядок рождения (правило модели v3:
+        # segments — плоский список; «вне тегов» сегмент рождается lazily при
+        # первом слове/теге и может появиться ПОСЛЕ уже открытых think/tool_call)
+        st.segments.append(resp)
         st.stack.insert(0, resp)
         return resp

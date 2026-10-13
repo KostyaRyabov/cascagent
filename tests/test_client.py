@@ -24,6 +24,7 @@ import pytest
 
 from cascagent.client import (DONE_SENTINEL, ChatmlLLMClient, FinishEvent,
                               LLMAborted, LLMClient, LLMError, LLMConfig,
+                              StatsEvent,
                               LLMToolCallNotSupported, LlamaCppLLMClient,
                               ReasoningDelta, ToolCallDelta, create_client,
     ContentDelta)
@@ -288,12 +289,18 @@ class TestStreamEvents:
         lines = [sse("При"), sse("вет"), sse_finish("stop"), "data: [DONE]"]
         c = LlamaCppLLMClient(session=FakeSession(lines))
         evs = list(c.stream_events(MSGS))
-        assert [e.text for e in evs[:-1]] == ["При", "вет"]
-        fin = evs[-1]
+        assert [e.text for e in evs[:-2]] == ["При", "вет"]
+        fin = evs[-2]
         assert isinstance(fin, FinishEvent)
         assert fin.finish_reason == "stop"
-        assert fin.content_text == "Привет"
+        # текст НЕ собирается транспортом (решение лидера 2026-10-14):
+        # дельты — единственная форма выдачи, full-text делает парсер
+        assert not hasattr(fin, "content_text")
         assert fin.tool_calls == []
+        stats = evs[-1]                      # телеметрия — всегда последняя
+        assert isinstance(stats, StatsEvent)
+        assert stats.content_chars == 6      # len("При") + len("вет")
+        assert stats.elapsed > 0
 
     def test_role_frame_content_not_lost(self):
         """Фрейм с delta.role='assistant' не должен глотать последующий контент."""
@@ -309,7 +316,7 @@ class TestStreamEvents:
         c = LlamaCppLLMClient(LLMConfig(strict_finish=True),
                              session=FakeSession(lines))
         evs = list(c.stream_events(MSGS))
-        assert evs[-1].finish_reason == "length"
+        assert [e for e in evs if isinstance(e, FinishEvent)][0].finish_reason == "length"
 
     def test_abnormal_finish_reason_raises_when_strict(self):
         lines = [sse("abc"), sse_finish("abort"), "data: [DONE]"]
@@ -330,13 +337,23 @@ class TestStreamEvents:
         lines = [sse("abc")]
         c = LlamaCppLLMClient(session=FakeSession(lines))   # strict=False default
         evs = list(c.stream_events(MSGS))
-        assert evs[-1].finish_reason == "abort"
+        assert [e for e in evs if isinstance(e, FinishEvent)][0].finish_reason == "abort"
 
     def test_done_without_finish_reason_normalized_to_stop(self):
         lines = [sse("x"), "data: [DONE]"]
         c = LlamaCppLLMClient(LLMConfig(strict_finish=True),
                              session=FakeSession(lines))
-        assert list(c.stream_events(MSGS))[-1].finish_reason == "stop"
+        evs = list(c.stream_events(MSGS))
+        # FinishEvent — предпоследний (StatsEvent всегда самый последний)
+        assert isinstance(evs[-2], FinishEvent)
+        assert evs[-2].finish_reason == "stop"
+
+    def test_stats_event_is_always_last(self):
+        lines = [sse("abc"), sse_finish("stop"), "data: [DONE]"]
+        c = LlamaCppLLMClient(session=FakeSession(lines))
+        evs = list(c.stream_events(MSGS))
+        assert isinstance(evs[-1], StatsEvent)
+        assert isinstance(evs[-2], FinishEvent)
 
     def test_server_error_in_stream_body_raises(self):
         lines = [sse_raw({"error": {"message": "ctx overflow"}})]
@@ -362,9 +379,9 @@ class TestToolCallsStreaming:
         assert deltas[0].name == "get_weather"
         assert "".join(d.arguments_delta or "" for d in deltas[1:]) \
             == '{"city":"Москва"}'
-        fin = evs[-1]
-        assert isinstance(fin, FinishEvent)
+        fin = [e for e in evs if isinstance(e, FinishEvent)][0]
         assert fin.finish_reason == "tool_calls"
+        assert isinstance(evs[-1], StatsEvent)   # телеметрия — всегда последняя
         assert fin.tool_calls == [{
             "id": "call_1", "type": "function",
             "function": {"name": "get_weather",
@@ -378,7 +395,8 @@ class TestToolCallsStreaming:
             sse_finish("tool_calls"), "data: [DONE]",
         ]
         c = LlamaCppLLMClient(session=FakeSession(lines))
-        fin = list(c.stream_events(MSGS))[-1]
+        evs = list(c.stream_events(MSGS))
+        fin = [e for e in evs if isinstance(e, FinishEvent)][0]
         assert [t["function"]["name"] for t in fin.tool_calls] == ["f1", "f2"]
 
     def test_tools_disabled_raises(self):
@@ -417,8 +435,8 @@ class TestCompleteAndToolLoop:
         lines = [sse("ответ"), sse_finish("stop"), "data: [DONE]"]
         c = LlamaCppLLMClient(session=FakeSession(lines))
         fin = c.complete(MSGS)
-        assert fin.content_text == "ответ"
         assert fin.finish_reason == "stop"
+        assert c._last_stats.content_chars == len("ответ")
 
     def test_run_tool_loop_full_cycle(self):
         """Двухраундовый цикл: модель просит инструмент → результат → ответ.
@@ -452,9 +470,13 @@ class TestCompleteAndToolLoop:
 
         tools = [{"type": "function", "function": {"name": "get_weather",
                                                    "parameters": {}}}]
-        text = c.run_tool_loop(MSGS[:], {"get_weather": get_weather},
-                               tools=tools)
-        assert text == "В Москве +15"
+        res = c.run_tool_loop(MSGS[:], {"get_weather": get_weather},
+                              tools=tools)
+        # в нестримном режиме текст вне транспорта (parсер его не собирал)
+        assert res.text == ""
+        assert res.finish_reason == "stop"
+        assert res.stats.content_chars >= len("В Москве +15")
+        assert [r["phase"] for r in res.rounds] == ["llm", "ok", "llm"]
         assert calls == ["Москва"]
         # второй запрос содержит history: original + assistant(tool_calls) + tool
         second_msgs = sess.payloads[1]["messages"]
@@ -493,9 +515,10 @@ class TestCompleteAndToolLoop:
         def boom():
             raise ValueError("kaboom")
 
-        text = c.run_tool_loop(MSGS[:], {"boom": boom},
-                               tools=[{"type": "function"}])
-        assert text == "ok"
+        res = c.run_tool_loop(MSGS[:], {"boom": boom},
+                              tools=[{"type": "function"}])
+        assert res.finish_reason == "stop"
+        assert [r["phase"] for r in res.rounds] == ["llm", "error", "llm"]
         tool_msg = sess.payloads[1]["messages"][-1]
         assert tool_msg["content"].startswith("ERROR:")
 
@@ -539,3 +562,179 @@ class TestBackwardCompatAlias:
         lines = [sse("a"), "data: [DONE]"]
         c = LlamaCppLLMClient(session=FakeSession(lines))
         assert list(c.stream(MSGS)) == ["a", DONE_SENTINEL]
+
+
+# ---------------------------------------------------------------------------
+# StreamedResponse — объединённая сущность «стрим + адаптивный парсер»
+# (решение 2026-10-14: thinking/tool_call приходят ЛИБО структурированными
+# полями дельт, ЛИБО тегами прямо в content — конвейер поддерживает оба
+# варианта одновременно без конфигурации)
+# ---------------------------------------------------------------------------
+
+def frame(delta: dict, finish_reason=None) -> str:
+    obj = {"choices": [{"index": 0, "delta": delta}]}
+    if finish_reason is not None:
+        obj["choices"][0]["finish_reason"] = finish_reason
+    return "data: " + json.dumps(obj, ensure_ascii=False)
+
+
+def done() -> str:
+    return "data: [DONE]"
+
+
+def content_frames(text: str, *, split_tags: bool = False):
+    """Сгенерировать SSE-фреймы content-дельт.
+
+    По умолчанию режем текст по 7 символов: служебные теги (<think>,
+    </think>) не разрываются по границам чанков, но слова и пробелы —
+    да, так что проверка «тег распознан в потоке» остаётся осмысленной.
+    ``split_tags=True`` — стресс-режим: принудительно ломаем каждый тег
+    посередине, чтобы проверить PARTIAL-обработку незавершённого '<...'
+    хвоста на границе фреймов.
+    """
+    if split_tags:
+        # режим "рваных тегов": режем строго по 3 символа, как настоящий
+        # стрим — теги приходят кусками через границу чанков
+        return [frame({"content": text[i:i + 3]}) for i in range(0, len(text), 3)]
+    return [frame({"content": text[i:i + 7]}) for i in range(0, len(text), 7)]
+
+
+def kinds(state):
+    """Порядок flat-ленты segments по kind (порядок рождения, не вложенности)."""
+    return [s.kind.value for s in state.segments]
+
+
+class TestStreamedResponse:
+    def _client(self, lines):
+        return LlamaCppLLMClient(LLMConfig(), session=FakeSession(lines))
+
+    # ---- текстовый вариант: теги прямо в content ----------------------
+    def test_tags_in_content_are_parsed(self):
+        # модель пишет ... прямо внутри content —
+        # ResponseParser распознаёт теги сам (whitelist + fuzzy BKTree),
+        # куски тегов приходят через границу чанков
+        text = "думал многоПривет мир"
+        for split_tags in (False, True):   # обычный и «рваные теги» прогон
+            lines = content_frames(text, split_tags=split_tags) + [done()]
+            c = self._client(lines)
+            sr = c.stream_parsed(MSGS)
+            state = sr.run()
+            assert kinds(state) == ["think", "response"], split_tags
+            assert sr.parser.response_text() == "Привет мир", split_tags
+            think_seg = next(s for s in state.segments if s.kind.value == "think")
+            assert think_seg.finish_reason == "stop"  # закрыт ЯВНО тегом в потоке
+            assert "думал" in think_seg.text, split_tags
+
+    # ---- структурированный вариант: поле reasoning --------------------
+    def test_structured_reasoning_becomes_think_segment(self):
+        # llama.cpp шлёт thinking отдельными полями (reasoning /
+        # reasoning_content), а content-дельты — это уже финальный ответ;
+        # конвейер оборачивает структурные дельты в служебные теги парсера,
+        # поэтому порядок сегментов = порядок рождения (think раньше response)
+        lines = ([frame({"reasoning_content": "сначала "}),
+                  frame({"reasoning": "подумаем"})]
+                 + content_frames("ответ") + [done()])
+        c = self._client(lines)
+        sr = c.stream_parsed(MSGS)
+        state = sr.run()
+        assert kinds(state) == ["think", "response"]
+        assert sr.parser.response_text() == "ответ"
+        # текст живёт только в сегментах/дельтах; телеметрия — в StatsEvent
+        think_seg = next(s for s in state.segments if s.kind.value == "think")
+        assert "сначала" in think_seg.text and "подумаем" in think_seg.text
+        assert think_seg.finish_reason == "stop"   # закрыт явно на FinishEvent
+        assert sr.stats.reasoning_chars == len("сначала ") + len("подумаем")
+
+    # ---- структурированный tool_call ----------------------------------
+    def test_structured_tool_calls_become_tool_segment(self):
+        lines = [frame({"tool_calls": [{"index": 0, "id": "c1",
+                                        "function": {"name": "get_weather",
+                                                     "arguments": ""}}]}),
+                 frame({"tool_calls": [{"index": 0, "function":
+                                        {"arguments": '{"city"'}}]}),
+                 frame({"tool_calls": [{"index": 0, "function":
+                                        {"arguments": ':"Москва"}'}}]}),
+                 frame({}, finish_reason="tool_calls"), done()]
+        c = self._client(lines)
+        sr = c.stream_parsed(MSGS)
+        state = sr.run()
+        # контента не было → пустой RESPONSE-сегмент не создаётся вовсе
+        assert kinds(state) == ["tool_call"]
+        seg = state.segments[0]
+        assert "get_weather" in seg.text and "Москва" in seg.text
+        assert seg.finish_reason == "stop"       # закрыт явно на FinishEvent
+        # сегмент скрытый (word.is_hidden наследует Segment.kind)
+        assert all(w.is_hidden for w in seg.words)
+        # протокольная агрегация tool_calls не потеряна
+        assert sr.finish_event.tool_calls[0]["function"]["name"] == "get_weather"
+        assert sr.finish_event.finish_reason == "tool_calls"
+        assert sr.finish_reason == "tool_calls"  # продублирована на объекте
+
+    # ---- смешанный случай: reasoning-поле И теги в content ------------
+    def test_mixed_sources_single_think_segment(self):
+        # сервер шлёт reasoning-поле ДО контента и при этом часть рассуждения
+        # приходит тегами прямо в content — оба потока должны лечь в ОДИН
+        # скрытый THINK-сегмент без наложения служебных тегов друг на друга
+        # (конвейер никогда не открывает второй вложенный , пока
+        # структурный сегмент ещё не закрыт — повторное открытие игнорируется)
+        lines = ([frame({"reasoning_content": "раз "})]
+                 + content_frames("думал дваПривет мир") + [done()])
+        c = self._client(lines)
+        sr = c.stream_parsed(MSGS)
+        state = sr.run()
+        # structural think закрыт только на FinishEvent → контентные дельты
+        # фидятся ВНУТРЬ него; «Привет мир» тоже попадает в think (тег
+        # </think> закрывает сегмент раньше, чем доходит до хвоста content)
+        assert kinds(state) == ["think", "response"]
+        assert sr.parser.response_text() == "Привет мир"
+        think_seg = next(s for s in state.segments if s.kind.value == "think")
+        assert "раз" in think_seg.text and "два" in think_seg.text
+        assert think_seg.finish_reason == "stop"   # закрыт явно на FinishEvent
+
+    # ---- аномальный finish: незакрытый структурный think --------------
+    def test_abort_closes_open_segments_without_leaking_buffer(self):
+        lines = [frame({"reasoning_content": "обрыв без хвоста"})]
+        # сервер оборвался: ни finish_reason, ни [DONE] → мягкий режим "abort"
+        c = self._client(lines)
+        sr = c.stream_parsed(MSGS)
+        state = sr.run()
+        assert state.finish_reason == "abort"
+        think = next(s for s in state.segments if s.kind.value == "think")
+        assert think.kind.value == "think"
+        assert think.finish_reason == "unclosed"
+
+    # ---- голосование плагинов: вето останавливает коммит --------------
+    def test_voter_veto_stops_commit(self):
+        lines = [frame({"content": "стоп слово"}), done()]
+        c = self._client(lines)
+        seen_events = []
+
+        def veto(item, st):
+            seen_events.append(item)
+            return False                      # первый же элемент — вето
+
+        sr = c.stream_parsed(MSGS, voters=veto)
+        state = sr.run()
+        assert seen_events, "voter должен получать готовые элементы"
+        # элемент отклонён → в ленту ничего не легло, непроглоченный хвост discarded
+        assert len(state.words) == 0
+        assert state.done is True
+
+    # ---- ленивый интерфейс words() ------------------------------------
+    def test_words_streams_incrementally(self):
+        lines = [frame({"content": "привет мир"}), done()]
+        c = self._client(lines)
+        sr = c.stream_parsed(MSGS)
+        got = [w.text for w in sr.words()]
+        assert "".join(got).strip() == "привет мир"
+        assert sr._consumed is True
+
+    # ---- run() идемпотентен -------------------------------------------
+    def test_run_is_idempotent(self):
+        lines = [frame({"content": "раз два"}), done()]
+        c = self._client(lines)
+        sr = c.stream_parsed(MSGS)
+        st1 = sr.run()
+        n = len(st1.words)
+        st2 = sr.run()
+        assert len(st2.words) == n            # повторный прогон ничего не добавляет
