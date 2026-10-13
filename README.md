@@ -17,7 +17,7 @@
 
 Не реализовано (план — `docs/roadmap.md`, Фаза 2): агенты и CPU-диспетчер
 (`executor.py`, `orchestrator.py`, `researcher.py`, `decomposer.py`,
-`summarizer.py`, `validator.py`, `reflector.py`), оркестратор-цикл
+`summarizer.py`, `validator.py`, `reflector.py`), цикл диспетчеризации
 `dispatch_loop` (PENDING → ENRICHMENT → RUNNING → DONE/FAILED, см. ниже),
 CLI, память/RAG, тесты клиента и канбан-доски. Полная карта модулей и
 статусов — `docs/architecture.md` §2; этапы — AGENTS.md §7.
