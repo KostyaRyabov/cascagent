@@ -88,7 +88,7 @@ class LLMToolCallNotSupported(LLMError):
 # ---------------------------------------------------------------------------
 # Полный набор событий, которые может выдать stream_events():
 #
-#   str                 текстовая дельта (delta.content) — основной поток;
+#   ContentDelta        текстовая дельта (delta.content) — основной поток;
 #   ReasoningDelta      дельта «мыслей» модели (delta.reasoning / reasoning_content):
 #                       llama.cpp >= b5xxx и некоторые vLLM-форки отдают thinking
 #                       ОТДЕЛЬНЫМИ полями, а не в content;
@@ -110,12 +110,51 @@ class LLMToolCallNotSupported(LLMError):
 # LLMError (генератор прерывается — сентинел и FinishEvent после них не
 # выдаются). Исключение — мягкий режим strict_finish=False: обрыв там
 # фиксируется как FinishEvent(finish_reason="abort").
+#
+# ------------------------------------------------------------------------
+# Классы против словарей: почему выбраны классы и какова их цена (2026-10-14)
+# ------------------------------------------------------------------------
+# Количество классов событий (4) — не проблема ни по памяти, ни по CPU:
+# * стоимость одного события ≈ 50–200 нс (object.__new__ без __init__), что
+#   на порядки меньше сетевой задержки SSE-фрейма (~1 мс+) и времени
+#   генерации одного токена моделью (~10–100 мс); узкое место стрима —
+#   сеть и инференс, а не аллокации;
+# * словари дешевле по коду, но дороже по эксплуатации: опечатка в ключе
+#   ("contnet") тихо даёт KeyError/None, тогда как несуществующий атрибут
+#   dataclass виден сразу; isinstance(ev, FinishEvent) надёжнее, чем
+#   ev["type"] == "finish"; IDE/тайпчекер со словарями не помогает;
+# * slots=True убирает __dict__ у каждого экземпляра — память на событие
+#   сопоставима с крошечным dict или меньше него;
+# * компромисс: базовый класс маркерный (пустой) — наследование даёт только
+#   общий тип StreamEvent для аннотаций, без лишних полей вроде timestamp.
+# Итог: берём классы — читаемость и статическая проверяемость важнее,
+# производительность здесь измеряется сетью, а не аллокациями объектов.
 
-StreamEvent = Union[str, "ReasoningDelta", "ToolCallDelta"]
+
+#: Маркерный базовый класс всех потоковых событий stream_events().
+class StreamEventBase:
+    """Общий предок типизированных событий (для аннотаций и isinstance)."""
+
+    __slots__ = ()
 
 
-@dataclass
-class ReasoningDelta:
+@dataclass(slots=True)
+class ContentDelta(StreamEventBase):
+    """Текстовая дельта основного потока ответа (``delta.content``).
+
+    Заменила «голую строку» в контракте stream_events(): теперь все
+    события однотипны (объекты с атрибутами), потребителю не нужно
+    различать str и dataclass через isinstance(ev, str).
+    Для упрощённого ``stream()`` (контракт Agent.run) дельты по-прежнему
+    раскрываются в чистые строки — там тип «строка» является частью
+    зафиксированного стыка 2026-10-13.
+    """
+
+    text: str
+
+
+@dataclass(slots=True)
+class ReasoningDelta(StreamEventBase):
     """Дельта скрытого рассуждения модели (thinking/reasoning).
 
     Бэкенды отдают её по-разному: llama.cpp — поле ``reasoning`` в delta,
@@ -123,19 +162,37 @@ class ReasoningDelta:
     этот тип; вызывающая сторона решает, показывать ли мысли пользователю
     (структурирование think/final в терминале — задача ResponseParser,
     plugins.md §3.1, а не клиента).
+
+    ВАРИАНТЫ РЕАЛИЗАЦИИ THINKING (учтено 2026-10-14):
+    1. отдельное поле ``reasoning``/``reasoning_content`` в delta —
+       нормализуется этим клиентом в ReasoningDelta (см. выше);
+    2. теги рассуждения прямо внутри ``content`` (так генерируют
+       DeepSeek-R1/QwQ через llama.cpp, если сервер не настроен на
+       reasoning-парсинг) — клиент НЕ парсит: сырые куски приходят как
+       обычные ContentDelta, а фазы think/final разделяет ResponseParser
+       (whitelist тегов + fuzzy-распознавание, stream_parser.py).
+    Клиент остаётся «глупым транспортом» для обоих вариантов — та же
+    граница ответственности, что и для текстовых tool_call-тегов.
     """
 
     text: str
 
 
-@dataclass
-class ToolCallDelta:
+@dataclass(slots=True)
+class ToolCallDelta(StreamEventBase):
     """Частичный вызов инструмента из SSE ``delta.tool_calls``.
 
     OpenAI-совместимые серверы отдают аргументы инструментов потоково:
     сначала приходит заголовок (id/name), затем куски JSON-аргументов.
     Клиент не собирает их сам — он выдаёт ``ToolCallDelta`` по одному на
     каждый фрейм, чтобы вызывающий код мог агрегировать по своему вкусу.
+
+    ВАРИАНТЫ ВЫДАЧИ TOOL-CALLS (аналогично thinking, учтено 2026-10-14):
+    1. структурированный ``delta.tool_calls`` (OpenAI-контракт) — этот тип;
+    2. текстовый вызов внутри ``content`` (теги вида tool_call или JSON
+       в блоках кода — частая практика локальных моделей без
+       tool-template) — приходит как обычные ContentDelta и распознаётся
+       ResponseParser (SegmentKind.TOOL_CALL), а не клиентом.
     """
 
     index: int = 0
@@ -146,8 +203,8 @@ class ToolCallDelta:
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class FinishEvent:
+@dataclass(slots=True)
+class FinishEvent(StreamEventBase):
     """Финальное событие потока: причина остановки и накопленные tool_calls.
 
     Не является исключением при нормальных finish_reason. Выдаётся
@@ -158,6 +215,10 @@ class FinishEvent:
     finish_reason: str
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     content_text: Optional[str] = None
+
+
+#: Общий тип «промежуточных» событий stream_events() до финального FinishEvent.
+StreamEvent = Union[ContentDelta, ReasoningDelta, ToolCallDelta]
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +276,7 @@ class LLMClient(ABC):
     * ``stream``         — упрощённый чанк-поток под контракт ``Agent.run``
       (текст + сентинел [DONE]);
     * ``stream_events``  — полный контракт: типизированные события
-      (str / ReasoningDelta / ToolCallDelta / FinishEvent);
+      (ContentDelta / ReasoningDelta / ToolCallDelta / FinishEvent);
     * ``complete``       — convenience: собрать весь поток в FinishEvent;
     * ``run_tool_loop``  — полный цикл function calling с исполнением
       инструментов;
@@ -299,11 +360,12 @@ class LLMClient(ABC):
                       max_tokens: Optional[int] = None,
                       tools: Optional[List[Dict[str, Any]]] = None,
                       tool_choice: Optional[Any] = None,
-                      ) -> Iterator[Union[StreamEvent, FinishEvent]]:
+                      ) -> Iterator[Union[ContentDelta, ReasoningDelta,
+                                          ToolCallDelta, FinishEvent]]:
         """Низкоуровневый стриминг событий SSE — полный контракт OpenAI API.
 
         Выдаёт по одному объекту на смысловое событие потока:
-        - ``str``             — текстовая дельта (``delta.content``);
+        - ``ContentDelta``    — текстовая дельта (``delta.content``);
         - ``ReasoningDelta``  — дельта скрытых рассуждений (thinking);
         - ``ToolCallDelta``   — частичный вызов инструмента (``delta.tool_calls``);
         - ``FinishEvent``     — ровно ОДИН раз в конце: причина завершения
@@ -385,7 +447,7 @@ class LLMClient(ABC):
                 content = delta.get("content")
                 if content:
                     text_parts.append(content)
-                    yield content
+                    yield ContentDelta(content)
 
                 # --- дельта рассуждений (thinking) ------------------------
                 # normalize разных имён полей у разных бэкендов
@@ -491,8 +553,8 @@ class LLMClient(ABC):
         for ev in self.stream_events(messages, use_think=use_think,
                                      temperature=temperature,
                                      max_tokens=max_tokens):
-            if isinstance(ev, str):
-                yield ev
+            if isinstance(ev, ContentDelta):
+                yield ev.text                # раскрываем в чистые строки
         yield DONE_SENTINEL                  # штатный финал упрощённого потока
 
     # ---- convenience: весь ответ одним объектом -----------------------

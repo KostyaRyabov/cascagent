@@ -25,7 +25,8 @@ import pytest
 from cascagent.client import (DONE_SENTINEL, ChatmlLLMClient, FinishEvent,
                               LLMAborted, LLMClient, LLMError, LLMConfig,
                               LLMToolCallNotSupported, LlamaCppLLMClient,
-                              ReasoningDelta, ToolCallDelta, create_client)
+                              ReasoningDelta, ToolCallDelta, create_client,
+    ContentDelta)
 from cascagent.client import LlamaCppClient as LlamaCppClientAlias
 
 
@@ -287,7 +288,7 @@ class TestStreamEvents:
         lines = [sse("При"), sse("вет"), sse_finish("stop"), "data: [DONE]"]
         c = LlamaCppLLMClient(session=FakeSession(lines))
         evs = list(c.stream_events(MSGS))
-        assert evs[:-1] == ["При", "вет"]
+        assert [e.text for e in evs[:-1]] == ["При", "вет"]
         fin = evs[-1]
         assert isinstance(fin, FinishEvent)
         assert fin.finish_reason == "stop"
@@ -301,7 +302,7 @@ class TestStreamEvents:
         lines = [sse_raw(first), sse_finish("stop"), "data: [DONE]"]
         c = LlamaCppLLMClient(session=FakeSession(lines))
         evs = list(c.stream_events(MSGS))
-        assert "X" in evs
+        assert any(isinstance(e, ContentDelta) and e.text == "X" for e in evs)
 
     def test_length_finish_reason_is_normal(self):
         lines = [sse("abc"), sse_finish("length"), "data: [DONE]"]
