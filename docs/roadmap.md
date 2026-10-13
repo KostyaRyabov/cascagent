@@ -633,6 +633,10 @@ history|delete`.
 - [ ] #3 Recovery: snapshot()+PersistentStore (ПЛАН, plugins.md §6.5/§11.4.1), ключи stats:*/breakpoints:*, CheckpointSaver,
       `cascagent resume`
 - [ ] #4 Seed + полный слепок входа в истории + `replay`
+      💡 2026-10-14: история LLM-вызовов отменена (data.md §3), поэтому
+      «слепок входа» реализуется в самом Kanban: колонка `input_snapshot`
+      (JSON: messages + seed + параметры) пишется при запуске задачи;
+      `replay` читает её. Решение привязки seed ↔ задача — вместе с #3.
 - [ ] #5 StuckDetector + refusal-детект (минимум; grounding — best effort)
 - [ ] #6 Минимальный observability: trace.jsonl + metrics.jsonl + report
 
@@ -673,7 +677,13 @@ port-этап (§1), full observability/dashboards.
    зафиксировано в docs/plugins.md §4.2/§6.4. Enum статуса элемента
    переименован `ParseStatus` → `ResponseParser`.
 
-## 10. План работ (аудит «код ↔ документация», 2026-10-12)
+## 10. План работ (аудит «код ↔ документация», 2026-10-12; правка 2026-10-14)
+
+> **ПРАВКА 2026-10-14:** пункт «`history.py`: JSONL-история вызовов» снят —
+> решение 2026-10-13 (data.md §3): отдельной истории LLM-вызовов НЕТ,
+> единственный персистентный артефакт — пары `(ключевой текст, result)`
+> в `semantic_memory` через `kanban.remember_done()`. Формат log-перенесён:
+> метрики — StatisticsCollector (plugins.md §7.4), debug.log — отменён.
 
 ### Фаза 0 — гигиена репозитория (без изменения поведения)
 - [x] Починить 2 падающих теста под текущий API: голосование Runtime-
@@ -727,12 +737,17 @@ port-этап (§1), full observability/dashboards.
 - [x] README.md (2026-10-13): написан честный статус v0.1 вместо TODO.
 
 ### Фаза 2 — терминальный агент (минимальный сквозной путь CLI → LLM → Kanban)
-Порядок зависимостей: client → history → kanban → orchestrator → cli → e2e.
-- [ ] `client.py`: `LlamaCppClient` — async-итератор чанков (OpenAI-совместимый
-      `/completion` llama.cpp server), параметры seed/max_tokens/stop, think-
-      режим; transport инъектируем (для MockLLM).
-- [ ] `history.py`: JSONL-история вызовов + debug.log (формат — docs/data.md §3).
-- [ ] `kanban.py`: SQLite-хранилище дерева задач (schema — docs/data.md).
+Порядок зависимостей: client → kanban → orchestrator → cli → e2e.
+- [x] `client.py`: `LlamaCppClient` — итератор чанков (OpenAI-совместимый
+      `/v1/chat/completions` llama.cpp server), параметры seed/max_tokens/stop,
+      think-режим (`{"think": bool}` / `/no_think`); transport инъектируем
+      (`session=`), контракт chunk-iterator §9.4. — сделано (2026-10-14).
+      Тесты payload/SSE на fake-session — сделано (2026-10-14, 21 тест;
+      попутно исправлен branch chatml-флавора в build_payload).
+- ~~`history.py`~~ — СНЯТ (см. правку 2026-10-14 выше; data.md §3).
+- [x] `kanban.py`: SQLite-хранилище дерева задач (schema — docs/data.md §4.2;
+      semantic_memory/remember_done/recall/forget_old; recover_interrupted).
+      — код + тесты сделаны (2026-10-14, 42 offline-теста на tmp_path).
 - [ ] Диспетчер `dispatch_loop` (декомпозиция ленивая, ADR-004 + ADR-005
       с дополнением 2026-10-13): тонкий цикл поверх жизненного цикла агента
       PENDING→ENRICHMENT(Pre+pick_role)→RUNNING(Agent.run)→оценка(Post);
