@@ -28,66 +28,113 @@
 нет общего обзора плана заранее, сложнее планировать параллелизм (сейчас
 single-flight, поэтому несуществующая проблема).
 
-### 1.1. Эталонный алгоритм (v2, соответствует protocol §7)
+### 1.1. Диспетчеризация — часть внутреннего цикла агента (решение 2026-10-13)
+
+**Формулировка:** `Agent` — это не «промпт + набор MCP tools», а полный
+конвейер работы с задачей. Внешний модуль `execute_task` (эталон v2)
+перестал быть точкой входа: его шаги распределены по этапам жизненного
+цикла агента:
+
+| Этап | Статус | Кто выполняет | Что происходит |
+|------|--------|---------------|----------------|
+| Ожидание | `PENDING` | CPU-очередь Kanban | задача ещё не взята в работу, обогащения нет |
+| Исследование | `ENRICHMENT` | **PrePlugin-секция агента** + пост-Pre выбор роли | DecomposeTool (agent-as-tool), Enricher, recall/RAG, MCP-обогатители; по фактам PrePlugin'ов выбирается роль и конфигурируется цикл (ADR 005) |
+| Выполнение | `RUNNING` | `Agent.run()` (LLM-итерации) | внутренний цикл Pre→генерация→Runtime→Post; у Orchestrator-роли дети уходят в ту же очередь (рекурсия через Kanban, а не через рекурсию Python-функции) |
+| Оценка | `RUNNING`→`DONE/FAILED` | **PostPlugin-секция** (Validator) + accept-контракт | проверка результата; FAILED/зацикливание → эскалация родителю-Orchestrator (аварийный режим) |
+
+Следствия:
+
+1. **Локальные очереди задач.** У каждого агента свой набор задач
+   (потомки его уровня). Одна общая структура не обязательна: достаточно
+   единого Kanban-persistence со ссылкой `parent_id`, а «локальная доска»
+   родителя — это view (`done_siblings`/children) поверх неё. Хранение —
+   per-level, маршрутизация — по флагу `is_atom`.
+2. **Выбор роли — после PrePlugin, до инициализации тела агента.**
+   Фактический механизм (заменяет внешний dispatcher v2):
+   - `Agent.__init__` принимает `role="auto"` — агент пока «без тела»;
+   - секция Pre отрабатывает (в т.ч. DecomposeTool пишет детей в local
+     память);
+   - детерминированная функция выбора читает факты Pre и memory:
+     `is_atom=True → Executor`, `есть дети → Orchestrator уровня`,
+     `флаг deadlock/validator-reject → Orchestrator аварийный режим`;
+   - выбранный билд (system prompt, toolset, PostPlugin-цепочка)
+     монтируется, и только затем начинается `RUNNING`.
+     Смены роли внутри одного `run()` нет — «сбой» Decomposer
+     (атомная задача пришла на уровень выше) обрабатывается этим же
+     механизмом штатно (ADR 005).
+3. **CPU-диспетчер не исчезает** — он живёт ВНУТРИ каждого агента как
+   детерминированная обвязка этапов (state transitions, выбор роли,
+   FIFO/single-flight, чтение флагов после `run()`). Он по-прежнему не
+   решает «что» — только «когда» и «кем».
+
+### 1.2. Эталонный алгоритм (v3: execute_task как тонкий цикл диспетчера)
+
+Соответствует protocol §7. Рекурсии по дереву в Python больше нет —
+рекурсия выражена через очередь задач и ре-энтри агента-родителя.
 
 ```python
-def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
-    """Рекурсивное выполнение задачи с ленивой декомпозицией. Чистый CPU-код."""
-    if task.status == TaskStatus.DONE:
-        return task.result                      # идемпотентность / resume
-    # PENDING → ENRICHMENT: именно здесь задача начинает работу и обогащается
-    # контекстом и ресурсами; в PENDING обогащения НЕ происходит (data.md §1,
-    # TaskStatus; product §5)
-    kanban.update_status(task.id, TaskStatus.ENRICHMENT, started_at=datetime.now(timezone.utc))
+def dispatch_loop(ready: queue.Queue[Task]) -> None:
+    """CPU-диспетчер: крутит жизненный цикл агента для каждой задачи.
+    Идемпотентен: resume поднимает статусы из Kanban (см. §7)."""
+    while (task := ready.get()) is not None:
+        if task.status == TaskStatus.DONE:
+            continue                                # идемпотентность / resume
+        # PENDING → ENRICHMENT: работа началась; в PENDING обогащения НЕТ
+        kanban.update_status(task.id, TaskStatus.ENRICHMENT,
+                             started_at=datetime.now(timezone.utc))
 
-    # 1. Обогащение контекста (CPU, §2) — этап ENRICHMENT: выбор агента-исполнителя,
-    #    MCP-инструменты, базы знаний/recall, формирование контекста
-    enriched = enricher.enrich(
-        brief=task.brief,
-        parent_context=context,
-        completed_siblings=kanban.done_siblings(task.id),
-    )
-    # ENRICHMENT → RUNNING: контекст собран, начинаем LLM-вызовы
-    kanban.update_status(task.id, TaskStatus.RUNNING)
+        agent = Agent.get_or_create(task)           # роль пока "auto";
+                                                    # память/биндинг — plugins §6
+        # 1. Обогащение = PrePlugin-секция (этап ENRICHMENT):
+        #    DecomposeTool (agent-as-tool), Enricher, MCP-обогатители, recall.
+        messages = agent.run_pre(task, context=kanban.parent_context(task.id))
+        #    ... затем детерминированный выбор роли ПО ФАКТАМ Pre (ADR 005, §1.1):
+        role = pick_role(agent.local_memory)        # is_atom→Executor;
+                                                    # есть дети→Orchestrator;
+                                                    # deadlock/reject→аварийный режим
+        agent.bind_body(role)                       # prompt + toolset + Post-цепочка
+        # ENRICHMENT → RUNNING: контекст собран, агент выбран, начинаем LLM-вызовы
+        kanban.update_status(task.id, TaskStatus.RUNNING)
 
-    # 2. Декомпозиция — только если детей ещё нет (ленивость)
-    if not task.subtasks:
-        call = decomposer.decompose(task, enriched)   # isolated HTTP call
-        history.save(call)                             # THINK+FINAL, честный лог
-        if call.is_atomic or detector.is_parent_repeat(task.brief, only_child):
-            result = executor.execute(task, enriched)  # атом → Executor (§5)
-            kanban.update_status(task.id, TaskStatus.DONE, result=result)
-            semantic.remember(task.brief, result, task.id)
-            return result
-        children = dedup(filter_dupes(parse(call.final_response), task))
-        # Task(...) фиксирует created_at + snowflake id, считает embedding(brief)
-        # и вычисляет depth из parent — всё в __init__ (data.md §1/§2)
-        task.subtasks = children                    # List[Task], порядок = исполнение
-                                                    # (position == index, поля order нет)
-        for sub in children:                        # SQL-зеркало: parent_id + "order"
-            kanban.add_task(sub, order=task.subtasks.index(sub))
-
-    # 3. Последовательное выполнение детей (порядок = зависимости, A9/A10)
-    results = []
-    for i, child in enumerate(task.subtasks):          # живые объекты, kanban.get не нужен
-        if child.status == TaskStatus.DONE:
-            results.append(child.result)               # resume без инференса
+        # 2. Выполнение = внутренний цикл run() (§ plugins 6.4):
+        #    Pre→генерация→Runtime-голосование→Post(Validator).
+        #    Если роль Orchestrator и появились ДЕТИ (ленивость: узел
+        #    разложен ровно один раз перед исполнением детей):
+        for child in agent.spawned_children(messages):   # уже в kanban, order=index
+            ready.put(child)                             # рекурсия = очередь, не стек
+        if children_pending(task):                       # родитель ждёт детей (A9/A10)
+            kanban.park(task.id, await_children=True)    # resume продолжит RUNNING
             continue
-        try:
-            results.append(execute_task(child, enriched))
-        except TaskFailedError as e:
-            reflector.handle_failure(child, e,
-                                     remaining_siblings=task.subtasks[i + 1:])
-            raise                                      # решение Reflect — ниже (§6)
 
-    # 4. Сборка результата вверх по дереву (A12)
-    final_result = summarize_results(results, task)
-    kanban.update_status(task.id, TaskStatus.DONE, result=final_result)
-    semantic.remember(task.brief, final_result, task.id)
-    return final_result
+        # 3. Оценка = PostPlugin(Validator) + action из result (§ plugins 6.4):
+        result = agent.last_result                       # {"response","action",...}
+        match result["action"]:
+            case "accept":
+                kanban.update_status(task.id, TaskStatus.DONE, result=result["response"])
+                semantic.remember(task.brief, result["response"], task.id)
+                ready.maybe_wake_parent(task.id)         # сводка детей → родителю (A12)
+            case "retry":
+                kanban.update_status(task.id, TaskStatus.PENDING)   # ≤ max_retries (§6)
+                ready.put(task)
+            case _:                                       # reject / FAILED
+                reflector.handle_failure(task, result,
+                                         remaining_siblings=kanban.remaining_siblings(task.id))
+                kanban.update_status(task.id, TaskStatus.FAILED)
+                ready.maybe_wake_parent(task.id, escalation=True)  # тупик →
+                                                    # Orchestrator аварийный режим
 ```
 
-Отличия от листинга Главы IX (осознанные, v2):
+Отличия от эталона v2 (осознанные, v3):
+- `execute_task` → `dispatch_loop`: рекурсия дерева заменена очередью
+  задач + park/wake родителя (локальные доски уровней, §1.1 п.1);
+- выбор исполнителя переехал из внешнего dispatcher в этап ENRICHMENT
+  самого агента (Pre → pick_role → bind_body, §1.1 п.2);
+- сборка результата вверх (A12) — событие wake родителя, а не возврат
+  из стека; суммаризация детей — Summarizer по триггеру CPU (budget),
+  product §4;
+- оценка выполнения — явный этап PostPlugin (Validator), статус DONE
+  ставится только после `action == "accept"`;
+- история пишется на каждом вызове (`history.save(call)`), включая провальные.
 - статусы `TaskStatus.{PENDING,ENRICHMENT,RUNNING,DONE,FAILED}` вместо
   `CANCELLED` (отмена ветки = FAILED с `partial=true`, product §5);
   обогащение контекста/ресурсов — отдельный этап ENRICHMENT между стартом
@@ -95,10 +142,32 @@ def execute_task(task: Task, context: EnrichedContext | None = None) -> str:
 - degenerate-repeat проверка идёт **после** парсинга (правило CPU,
   protocol §3.7), а не как отдельный ответ модели;
 - `RESEARCH_NEEDED` удалён из протокола модели — триггер исследования
-  решает enricher по `gaps/confidence` (ADR-003), см. §5;
-- история пишется на каждом вызове (`history.save(call)`), включая провальные.
+  решает enricher по `gaps/confidence` (ADR-003), см. §5.
 
-### 1.2. Временная линия (из Главы IX, без изменений по смыслу)
+### 1.3. Жизненный цикл агента с диспетчеризацией (mermaid)
+
+```mermaid
+flowchart TD
+    Q[PENDING: очередь Kanban] -->|диспетчер берёт задачу| E[ENRICHMENT]
+    subgraph E_stage [ENRICHMENT = PrePlugin-секция + выбор роли]
+        E --> P1[Pre: DecomposeTool / Enricher / MCP / recall]
+        P1 --> R{pick_role по фактам Pre<br/>чистый CPU}
+        R -->|is_atom=True| B1[bind Executor:<br/>toolset + Post=Validator]
+        R -->|есть дети| B2[bind Orchestrator уровня]
+        R -->|deadlock / reject| B3[bind Orchestrator<br/>аварийный режим]
+    end
+    B1 & B2 & B3 --> RUN[RUNNING: Agent.run()]
+    RUN -->|"Orchestrator: spawn детей<br/>в очередь, park(await_children)"| Q2[дети ожидают в PENDING]
+    Q2 -.->|все дети DONE/FAILED → wake| RUN
+    RUN --> POST{Post: action Validator}
+    POST -->|accept| D[DONE + semantic.remember]
+    POST -->|retry ≤ max| Q
+    POST -->|reject| F[FAILED]
+    D -->|maybe_wake_parent| WK[родитель получает сводку детей A12]
+    F -->|эскалация| B3
+```
+
+### 1.4. Временная линия (из Главы IX, без изменений по смыслу)
 
 ```
 T0: запрос "Создать REST API"          → задача id=1 (pending)
@@ -114,7 +183,7 @@ T4: задача 5 видит результаты 3+4 — и т.д.
 (Идентификаторы — snowflake, растущие со временем; родство видно только
 через `parent`/позицию в `subtasks` (в SQL — `parent_id`/`"order"`), не через сам id — data.md §2.)
 
-### 1.3. Конвейер пост-обработки ответа декомпозиции (плагин TaskParser)
+### 1.5. Конвейер пост-обработки ответа декомпозиции (плагин TaskParser)
 
 Ответ Decomposer-агента превращается в узлы дерева задач **одним**
 output-плагином `TaskParser` (v3, plugins §7.4; вся логика — чистый CPU,
@@ -199,7 +268,7 @@ def on_output(self, response, context, session, memory):
 
 Связь с ядром v2: F1/F2 реализуют правило degenerate-repeat (protocol §3.7,
 cpu-offload A5) и частично дедупликацию A6 — в v3 они вынесены из
-оркестратора в плагин и работают **по эмбеддингам, посчитанным на стадии
+CPU-диспетчера в плагин и работают **по эмбеддингам, посчитанным на стадии
 1**, поэтому повторного кодирования нет (экономия CPU и детерминизм).
 F3 закрывает цикл «родитель → один такой же ребёнок → снова декомпозиция»:
 вместо второго LLM-вызова родитель становится атомом. Порядок секций
@@ -354,7 +423,7 @@ root с FAILED-веткой → завершается с partial=true в рез
 1. `RESEARCH_NEEDED` от модели → CPU-триггер по gaps (ADR-003).
 2. Категории `> ! ?` в примерах → удалены.
 3. `TaskStatus.CANCELLED` → нет такого статуса; FAILED + metadata-пометка.
-4. Reflect `replan` со списком новых задач → reframe одной задачи; планирование списка — оркестратор.
+4. Reflect `replan` со списком новых задач → reframe одной задачи; планирование списка — CPU-диспетчер.
 5. `semantic_memory.remember` эмбеддит `brief`, не description (algorithms §3).
 6. Контекст max_tokens=500 — совпадает с `[enrichment].max_context_tokens` (config §4).
 7. Примеры вывода CLI (Глава XII) используют v1-лейблы категорий — при

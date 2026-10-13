@@ -78,14 +78,14 @@ class Task:
         self.subtasks: List['Task'] = []      # дети; ПОРЯДОК ИСПОЛНЕНИЯ = порядок в этом
                                               # списке (position == index); отдельного поля
                                               # `order` НЕТ — он лишний
-        self.started_at = None                # оркестратор ставит при PENDING → ENRICHMENT
+        self.started_at = None                # CPU-диспетчер ставит при PENDING → ENRICHMENT
         self.finished_at = None               # ставится при DONE / FAILED
 ```
 
 > **Позиция sibling'а.** Порядок исполнения детей определяется индексом в
 > `parent.subtasks` (`i = parent.subtasks.index(task)`), мутаций порядка —
 > `list.insert/reindex`. В SQL-зеркале (§4.2) индекс материализуется колонкой
-> `"order"` при сериализации дерева (пишет её только save-слой TaskParser/оркестратор),
+> `"order"` при сериализации дерева (пишет её только save-слой TaskParser/CPU-диспетчер),
 > чтобы пережить перезагрузку из SQLite; в памяти поля `order` не существует.
 
 > **Реализация:** типизация выше — идеалистическая (прямые ссылки `Task`,
@@ -119,7 +119,7 @@ class Task:
    порядка siblings (индекс в `parent.subtasks`): если A идёт раньше B,
    B зависит от A (FIFO-планирование, cpu-offload A9).
 5. **Нет `acceptance`** — критерии приёмки включаются в `description`;
-   оркестратор проверяет покрытие результатом ребёнка (A7/A8).
+   CPU-диспетчер проверяет покрытие результатом ребёнка (A7/A8).
 6. **Нет поля `order`** — позиция sibling'а выводится напрямую из порядка в
    `parent.subtasks` (position == index); отдельный счётчик был бы вторым
    источником истины о порядке и рассинхронизировался бы при insert/remove.
@@ -145,7 +145,7 @@ class Task:
 Иерархия задач хранится в памяти проекта под системным ключом **`tasks`**
 (project-уровень Memory, plugins §5): словарь `{id: Task}` со
 ссылками parent/children — единое живое рабочее дерево между плагином
-TaskParser и оркестратором; в процессе декомпозиции оно уже заполнено, а
+TaskParser и CPU-диспетчером; в процессе декомпозиции оно уже заполнено, а
 TaskParser подставляет новое поддерево детей к соответствующему родителю
 (process §1.3, три стадии: парсинг → фильтрация → сохранение). Kanban
 (SQLite) — персистентное зеркало того же дерева (resume после краша).
@@ -220,7 +220,7 @@ def created_at_from_id(task_id: int) -> datetime:
 - **Информативность**: `created_at` восстановим из id (§ выше) — дедупликация
   истории и разбор логов не требуют JOIN с таблицей задач;
 - **Коллизии исключены** в пределах узла (sequence + ожидание мс); при запуске
-  нескольких процессов оркестратора каждому выдаётся уникальный `node_id`;
+  нескольких процессов CPU-диспетчера каждому выдаётся уникальный `node_id`;
 - **Компактность**: int64 — одно целое вместо строкового id, без обращения к
   внешнему сервису генерации (децентрализованно, только локальный lock).
 
@@ -253,7 +253,7 @@ CPU-валидация, cpu-offload A13).
 модели — производный шум, их логирование в JSONL/debug.log себя не оправдало.
 
 Единственный персистентный артефакт — **результат корректно завершённой
-задачи**: при переходе в DONE оркестратор вызывает `kanban.remember_done(id)`
+задачи**: при переходе в DONE CPU-диспетчер вызывает `kanban.remember_done(id)`
 (Kanban, algorithms.md §3), которое пишет в `semantic_memory` (§4.2) пару
 `(ключевой текст, result)` и вектор `embed(ключевой текст)`:
 
@@ -346,7 +346,7 @@ CREATE INDEX idx_semantic_created ON semantic_memory(created_at);
 ```
 
 Конвенции: WAL-режим (`PRAGMA journal_mode=WAL`), `foreign_keys=ON`,
-`check_same_thread=False` + внешний lock (single-flight оркестратора
+`check_same_thread=False` + внешний lock (single-flight CPU-диспетчера
 достаточен); время — TIMESTAMP, хранится как UTC ISO-8601 c timezone
 offset, при загрузке конвертируется в `datetime` (Python-модель оперирует
 только `datetime`, строки не хранит); boolean — INTEGER 0/1.
@@ -366,6 +366,18 @@ class Kanban:
     def get_siblings(self, task_id) -> list[Task]: ...     # тот же parent, по ("order", id)
     def get_subtasks(self, task_id) -> list[Task]: ...     # дети, по ("order", id)
     def find_similar(self, embedding: bytes, top_k=3) -> list[Task]: ...
+
+    # v7 (process §1.2): ожидание родителя на детей — без стека вызовов.
+    def park(self, task_id, *, await_children: bool) -> None: ...
+    #   Родитель (Orchestrator уровня) останавливается, дети уже в очереди.
+    #   Реализация: статус остаётся RUNNING + флаг waiting_on_children;
+    #   resume при старте переводит RUNNING+flag → PENDING (обычная задача).
+    def children_pending(self, task_id) -> bool: ...       # есть ли незавершённые дети
+    def maybe_wake_parent(self, task_id, *, escalation=False) -> None: ...
+    #   Когда последний ребёнок DONE/FAILED: собрать сводку результатов детей
+    #   (Summarizer по триггеру CPU-budget, product §4) → положить её в контекст
+    #   родителя → вернуть родителя в очередь (escalation=True → аварийный
+    #   режим Orchestrator: тупик нижнего уровня).
 ```
 
 `find_similar`: SQLite не умеет cosine similarity нативно — эмбеддинги
@@ -413,7 +425,7 @@ class EnrichedContext:
     completed_siblings: list[dict] = []    # {"brief":..., "result":...}
     total_tokens: int = 0
     confidence: float = 0.0
-    gaps: list[str] = []                   # чего не хватает (сигнал оркестратору)
+    gaps: list[str] = []                   # чего не хватает (сигнал CPU-диспетчеру)
 
     def to_prompt_block(self, max_tokens: int = 500) -> str: ...
 ```

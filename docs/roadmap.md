@@ -201,7 +201,7 @@ mode = "sanitize"   # sanitize | warn | drop_block
 событиях: успешный run, FAILED задачи, завершение поддерева. `reset_local()`
 НЕ трогает stats/breakpoints.
 
-**Механика resume (уровень оркестратора):**
+**Механика resume (уровень CPU-диспетчера):**
 
 1. Kanban — источник истины о задачах (`RUNNING` и `ENRICHMENT` задачи при
    старте после краша переводятся в `PENDING` — они не могли завершиться бесследно,
@@ -265,7 +265,7 @@ seed**, а не через гарантию идентичного вывода 
   путей). Нет опоры → флаг `ungrounded=[...]`, режим `warn|retry`.
   Полный Semantic entailment — вне MVP.
 - **Refusals:** детект маркеров отказа («я не могу выполнить…») по списку
-  паттернов → задача помечается `REFUSED`, оркестратор передаёт в Reflect
+  паттернов → задача помечается `REFUSED`, CPU-диспетчер передаёт в Reflect
   (reframe обычно помогает: отказ малой модели часто следствие плохого
   формулировки brief).
 - **Degraded outputs (качество упало):** скользящее окно по метрикам
@@ -306,7 +306,7 @@ class SharedMemory:          # singleton процесса
 1. **MockLLM** — `class MockLLM(LLMClient)` возвращает ответы по хэшу
    messages из словаря фикстур; умеет эмулировать стриминг (токен за
    токеном) и ошибки (timeout/HTTP 5xx) — unit-тесты плагинов и
-   оркестратора не требуют GPU. Фикстуры кладутся рядом с тестом.
+   CPU-диспетчера не требуют GPU. Фикстуры кладутся рядом с тестом.
 2. **Golden datasets** — `tests/golden/*.jsonl`: пары (prompt-hash →
    ожидаемая структура декомпозиции). Прогон в CI против MockLLM; против
    реального сервера — отдельный e2e-job с `temperature=0, seed=42`
@@ -577,10 +577,10 @@ Benchmark-регрессии — golden-набор в CI.
 - результат child возвращается вызывающему parent-агенту (никакой общей
   рабочей памяти — изоляция соблюдена, единственный шардинг — SharedMemory
   метрик §4.2);
-- конфликты результатов разрешает отдельный **ConflictResolver**-агент
-  (LLM-выбор лучшего/компромисса) — вызывается оркестратором, когда
-  sibling-результаты противоречат (детект: cosine contradictory check
-  + canonical-конфликты §4.6).
+- конфликты результатов разрешает **OrchestratorAgent** (бывш. ConflictResolver,
+  переименован ADR 005; LLM-выбор лучшего/компромисса) — вызывается CPU-диспетчером,
+  когда sibling-результаты противоречат (детект: cosine contradictory check
+  + canonical-конфликты §4.6), а также штатно на каждом неатомном уровне дерева.
 
 ---
 
@@ -733,9 +733,11 @@ port-этап (§1), full observability/dashboards.
       режим; transport инъектируем (для MockLLM).
 - [ ] `history.py`: JSONL-история вызовов + debug.log (формат — docs/data.md §3).
 - [ ] `kanban.py`: SQLite-хранилище дерева задач (schema — docs/data.md).
-- [ ] Оркестратор `execute_task` (декомпозиция ленивая, ADR-004): поверх
-      `Agent.run()` + TaskParserPlugin; цикл brief→decompose→child…; здесь же
-      решается протокол parent-child (§9.1).
+- [ ] Диспетчер `dispatch_loop` (декомпозиция ленивая, ADR-004 + ADR-005
+      с дополнением 2026-10-13): тонкий цикл поверх жизненного цикла агента
+      PENDING→ENRICHMENT(Pre+pick_role)→RUNNING(Agent.run)→оценка(Post);
+      рекурсия дерева — очередью задач + park/wake родителя, не стеком;
+      здесь же решается протокол parent-child (§9.1). Spec: process §1.1–1.3.
 - [ ] `cli.py` + фикс entry point: `--query`, `--max-depth`, рендер дерева,
       режимы resume/replay (зависит от #3/#4 MVP-чеклиста).
 - [ ] `MockLLM` (roadmap #7) + e2e-тест «CLI → mock → дерево задач» — без сети.
