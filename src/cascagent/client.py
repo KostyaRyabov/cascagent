@@ -1,40 +1,53 @@
-"""Транспортный клиент LLM — стриминг через OpenAI-совместимый API (docs/stack.md §4–5).
+"""Транспортные клиенты LLM — стриминг через OpenAI-совместимый API (docs/stack.md §4–5).
 
-Реализует транспортный контракт, зафиксированный 2026-10-13 (roadmap.md §9.4,
+Архитектура (рефакторинг 2026-10-14): различия бэкендов вынесены в иерархию
+классов вместо размазанного по методам ``if backend == ...``:
+
+* ``LLMClient``          — абстрактный интерфейс (ABC): контракт для вызывающей
+  стороны (агент, диспетчер, CLI). Никто в проекте не должен зависеть от
+  конкретного класса — только от этого интерфейса;
+* ``LlamaCppLLMClient``  — llama.cpp server (:8080, ADR-001): think управляется
+  параметром тела запроса ``{"think": bool}``;
+* ``ChatmlLLMClient``    — TabbyAPI и прочие chatml-серверы: think переключается
+  софт-промптом ``/no_think``, приклеиваемым к ПОСЛЕДНЕМУ сообщению
+  пользователя (системный префикс остаётся байт-в-байт неизменным — P8);
+* ``OpenAIChatClient`` / ``LlamaCppClient`` — алиасы эпохи «один класс +
+  flavour» оставлены для обратной совместимости импортов.
+
+Транспортный контракт, зафиксированный 2026-10-13 (roadmap.md §9.4,
 plugins.md §4.2): стык LLM внутри ``Agent.run`` — это **итератор чанков**,
 либо простой итерируемый объект, либо ``callable(messages) -> iterator[str]``.
-``LlamaCppClient.stream()`` — ровно такой вызываемый объект: он выдаёт сырые
-текстовые дельты (SSE ``delta.content``), по одному чанку на событие сервера,
-и завершается строкой-сентинелом ``"[DONE]"``, которую потребляет цикл агента.
-Клиент никогда не возвращает готовую строцу целиком; разделение на
-think/final — тоже НЕ его задача — поток структурирует встроенный
-``ResponseParser`` (plugins.md §3.1).
+``LLMClient.stream()`` — ровно такой вызываемый объект: выдаёт сырые текстовые
+дельты (SSE ``delta.content``) и завершается сентинелом ``"[DONE]"``, который
+потребляет цикл агента. Разделение на think/final — НЕ задача клиента: поток
+структурирует встроенный ``ResponseParser`` (plugins.md §3.1).
+
+Полный контракт (finish_reason, tool_calls) доступен через
+``LLMClient.stream_events()`` — типизированные события см. ниже.
 
 Соблюдаемые инварианты бэкенда (stack.md §4.3):
-1. OpenAI-совместимый эндпоинт (по умолчанию llama.cpp ``:8080``; ADR-001);
+1. OpenAI-совместимый эндпоинт (ADR-001);
 2. стабильный префикс SYSTEM передаёт вызывающая сторона (protocol §2) —
-   клиент отправляет сообщения дословно, ничего не переписывая;
-3. переключатель think на уровне запроса (§5.3): llama.cpp понимает
-   параметр тела ``"think": bool``; запасной вариант TabbyAPI/chatml
-   использует софт-промпт ``/no_think``, приклеиваемый к ПОСЛЕДНЕМУ
-   сообщению пользователя;
-4. single-flight — один HTTP-запрос на вызов, без батчинга и прогрева
-   (AGENTS.md §9);
+   клиент отправляет сообщения дословно, ничего не переписывая
+   (единственное исключение — /no_think у ChatmlLLMClient, п.3);
+3. переключатель think на уровне запроса (§5.3) — реализован в наследниках;
+4. single-flight — один HTTP-запрос на вызов (AGENTS.md §9);
 5. температура по умолчанию 0.2 (config.md §4 [llm]).
 
 Транспорт инъектируемый (roadmap.md §10 Фаза 2 «transport инъектируем»):
 конструктор принимает объект ``session`` с методом ``post(url, json=...,
-stream=..., timeout=...)`` — в реальной работе передаётся ``requests.Session()``,
-в тестах — фейк (MockLLM подаёт данные агенту напрямую, поэтому этот модуль
-не имеет тестов, зависимых от сети).
+stream=..., timeout=...)`` — в реальной работе ``requests.Session()``,
+в тестах — фейк (MockLLM подаёт данные агенту напрямую, поэтому тесты
+этого модуля не зависят от сети).
 
 Граница «CPU-тонкий слой» (roadmap.md §1 п.1): модуль работает только с HTTP;
-никакого SQLite и никаких эвристик парсинга здесь нет.
+никакого SQLite и никаких эвристик парсинга ответа здесь нет.
 """
 
 from __future__ import annotations
 
 import json
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
@@ -43,6 +56,9 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 #: Используется как единственный способ «вежливо» сигнализировать верхнему
 #: потребителю о завершении потока.
 DONE_SENTINEL = "[DONE]"
+
+#: Нормальные (не-ошибочные) причины завершения по OpenAI-спеке.
+NORMAL_FINISH_REASONS = {"stop", "length", "content_filter", "tool_calls"}
 
 
 # ---------------------------------------------------------------------------
@@ -56,10 +72,10 @@ class LLMError(RuntimeError):
 class LLMAborted(LLMError):
     """Генерация была прервана сервером: finish_reason не является нормальным.
 
-    Нормальные причины завершения (``stop``, ``length``, ``content_filter``)
-    обрабатываются штатно; всё остальное (``"abort"``, ``"timeout"``,
-    ``"unknown"`` и т.п.) приводит к этому исключению, если включён режим
-    строгой проверки (см. ``LLMConfig.strict_finish``).
+    Нормальные причины завершения (``stop``, ``length``, ``content_filter``,
+    ``tool_calls``) обрабатываются штатно; всё остальное (``"abort"``,
+    ``"timeout"``, ``"unknown"`` и т.п.) приводит к этому исключению, если
+    включён режим строгой проверки (см. ``LLMConfig.strict_finish``).
     """
 
 
@@ -70,10 +86,46 @@ class LLMToolCallNotSupported(LLMError):
 # ---------------------------------------------------------------------------
 # Типизация стриминговых событий
 # ---------------------------------------------------------------------------
+# Полный набор событий, которые может выдать stream_events():
+#
+#   str                 текстовая дельта (delta.content) — основной поток;
+#   ReasoningDelta      дельта «мыслей» модели (delta.reasoning / reasoning_content):
+#                       llama.cpp >= b5xxx и некоторые vLLM-форки отдают thinking
+#                       ОТДЕЛЬНЫМИ полями, а не в content;
+#   ToolCallDelta       частичный вызов инструмента (кусочки delta.tool_calls);
+#   FinishEvent         РОВНО ОДНО в конце потока: finish_reason + агрегированные
+#                       tool_calls + собранный текст.
+#
+# Чего здесь СОЗНАТЕЛЬНО нет:
+# - RoleDelta (delta.role): в OpenAI-контракте роль ответа всегда "assistant"
+#   и приходит одним служебным фреймом — бизнес-смысла для нас нет, терять
+#   из-за неё content-дельты было бы ошибкой;
+# - UsageEvent (токены prompt/completion): часть серверов шлёт usage в
+#   финальном фрейме — пока игнорируется; при необходимости добавим полем
+#   в FinishEvent (см. открытый вопрос в roadmap);
+# - отдельных событий SSE-фрейминга (comment/keep-alive): это транспортный
+#   шум, он не доходит до потребителя.
+#
+# Аварийные ситуации приходят НЕ событием, а исключением: LLMAborted /
+# LLMError (генератор прерывается — сентинел и FinishEvent после них не
+# выдаются). Исключение — мягкий режим strict_finish=False: обрыв там
+# фиксируется как FinishEvent(finish_reason="abort").
 
-#: Элемент потока: либо текстовая дельта (``str``), либо служебный объект.
-#: Сейчас служебные объекты — только ``ToolCallDelta`` (частичный вызов инструмента).
-StreamItem = Union[str, "ToolCallDelta"]
+StreamEvent = Union[str, "ReasoningDelta", "ToolCallDelta"]
+
+
+@dataclass
+class ReasoningDelta:
+    """Дельта скрытого рассуждения модели (thinking/reasoning).
+
+    Бэкенды отдают её по-разному: llama.cpp — поле ``reasoning`` в delta,
+    некоторые серверы — ``reasoning_content``. Клиент нормализует оба в
+    этот тип; вызывающая сторона решает, показывать ли мысли пользователю
+    (структурирование think/final в терминале — задача ResponseParser,
+    plugins.md §3.1, а не клиента).
+    """
+
+    text: str
 
 
 @dataclass
@@ -98,7 +150,7 @@ class ToolCallDelta:
 class FinishEvent:
     """Финальное событие потока: причина остановки и накопленные tool_calls.
 
-    Не является исключением при нормальных finish_reason. Вызывается
+    Не является исключением при нормальных finish_reason. Выдаётся
     исключительно внутри ``stream_events()``, когда поток дошёл до конца
     или получил ``data: [DONE]`` без явного выбора с finish_reason.
     """
@@ -108,9 +160,18 @@ class FinishEvent:
     content_text: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
+
 @dataclass
 class LLMConfig:
-    """Значения по умолчанию для секции [llm] (docs/config.md §4)."""
+    """Значения по умолчанию для секции [llm] (docs/config.md §4).
+
+    Поле ``backend`` сохранено для обратной совместимости конфига, но
+    больше НЕ управляет поведением: выбор реализации делается классом
+    (фабрика ``create_client`` читает ``backend`` ровно один раз).
+    """
 
     url: str = "http://127.0.0.1:8080/v1/chat/completions"
     model: str = "local"
@@ -122,9 +183,8 @@ class LLMConfig:
     #: сидирование на стороне сервера).
     seed: Optional[int] = None
     stop: List[str] = field(default_factory=list)
-    #: Вариант бэкенда для механизма think (stack.md §5.3):
-    #: "llama_cpp" → параметр тела {"think": bool};
-    #: "chatml"    → софт-промпт /no_think в последнем сообщении пользователя.
+    #: Устаревшее: вариант бэкенда ("llama_cpp" | "chatml"). Используется
+    #: только фабрикой create_client() для выбора класса реализации.
     backend: str = "llama_cpp"
     #: Строгая проверка корректности завершения потока (finish_reason/[DONE]):
     #: если True, то обрыв соединения без finish_reason и [DONE], а также
@@ -139,34 +199,30 @@ class LLMConfig:
     enable_tools: bool = True
 
 
-# Прямой алиас: класс мог называться LlamaCppClient, когда
-# предполагалась привязка к одному серверу. Теперь это универсальный
-# OpenAI-совместимый клиент с несколькими flavor'ами поведения.
+# ---------------------------------------------------------------------------
+# Интерфейс клиента
+# ---------------------------------------------------------------------------
 
+class LLMClient(ABC):
+    """Абстрактный интерфейс клиента LLM (дорожная карта: transport инъектируем).
 
+    Контракт для всего остального кода проекта: агент, диспетчер и CLI должны
+    типизироваться этим классом, а не конкретными реализациями. Общие методы:
 
-class OpenAIChatClient:
-    """Универсальный стриминговый chat-клиент для OpenAI-совместимых API.
+    * ``build_payload``  — собрать тело запроса из сообщений (чистая функция;
+      различия бэкендов — единственная её «ветвящаяся» часть, реализуемая
+      наследниками через хук ``apply_backend_flavour``);
+    * ``stream``         — упрощённый чанк-поток под контракт ``Agent.run``
+      (текст + сентинел [DONE]);
+    * ``stream_events``  — полный контракт: типизированные события
+      (str / ReasoningDelta / ToolCallDelta / FinishEvent);
+    * ``complete``       — convenience: собрать весь поток в FinishEvent;
+    * ``run_tool_loop``  — полный цикл function calling с исполнением
+      инструментов;
+    * ``as_callable``    — адаптер ``callable(messages) -> iterator[str]``.
 
-    Название отражает суть: протокол — OpenAI Chat Completions, а конкретный
-    сервер (llama.cpp, TabbyAPI, vLLM, LM Studio…) выбирается параметрами
-    ``LLMConfig.url`` и ``LLMConfig.backend``.
-
-    Использование в качестве стыка LLM для агента::
-
-        client = OpenAIChatClient(LLMConfig())
-        agent = Agent(name="decomposer",
-                      llm=lambda msgs: client.stream(msgs, use_think=True))
-
-    Или расширенный режим событий (для инструментов и финальных причин)::
-
-        for ev in client.stream_events(msgs):
-            if isinstance(ev, ToolCallDelta): ...
-            elif isinstance(ev, str): ...
-            elif isinstance(ev, FinishEvent): ...
-
-    Совместимость: старый импорт ``from cascagent.client import LlamaCppClient``
-    продолжает работать — ниже определён алиас ``LlamaCppClient = OpenAIChatClient``.
+    Транспорт (HTTP/SSE-разбор) общий для всех бэкендов — OpenAI-совместимость
+    и есть причина, по которой наследники различаются ТОЛЬКО сборкой payload.
     """
 
     def __init__(self, config: Optional[LLMConfig] = None,
@@ -181,7 +237,20 @@ class OpenAIChatClient:
             session = requests.Session()
         self._session = session
 
-    # ------------------------------------------------------------------
+    # ---- обязательный хук наследника ---------------------------------
+    @abstractmethod
+    def apply_backend_flavour(self, payload: Dict[str, Any],
+                              messages: List[Dict[str, Any]], *,
+                              use_think: bool) -> None:
+        """Применить специфику бэкенда к собранному payload (mutates).
+
+        Реализации:
+        - LlamaCppLLMClient: кладёт ``payload["think"] = bool(use_think)``;
+        - ChatmlLLMClient: при use_think=False приклеивает ``/no_think``
+          к последнему user-сообщению в payload["messages"].
+        """
+
+    # ---- сборка запроса ----------------------------------------------
     def build_payload(self, messages: List[Dict[str, Any]], *,
                       use_think: bool = True,
                       temperature: Optional[float] = None,
@@ -190,16 +259,13 @@ class OpenAIChatClient:
                       tool_choice: Optional[Any] = None) -> Dict[str, Any]:
         """Собрать тело запроса (чистая функция — тестируется офлайн).
 
-        Механика think согласно stack.md §5.3:
-        - llama.cpp: параметр запроса ``{"think": true|false}``;
-        - запасной chatml: если think выключен, к последнему сообщению
-          пользователя приклеивается ``/no_think`` (системный промпт
-          остаётся байт-в-байт неизменным — P8).
+        Общая часть одинакова для всех бэкендов; специфика — в хуке
+        ``apply_backend_flavour``.
 
         Function calling (OpenAI-совместимый контракт):
         - ``tools`` — список описаний инструментов; добавляется в тело как есть;
-        - ``tool_choice`` — режим выбора инструмента ("auto", "none", "required"
-          или конкретная функция); прокидывается только вместе с tools.
+        - ``tool_choice`` — режим выбора ("auto", "none", "required" или
+          конкретная функция); прокидывается только вместе с tools.
         Сообщения передаются дословно (инвариант 2): вызывающая сторона сама
         формирует history, включая assistant-сообщения с ``tool_calls`` и
         сообщения с ``role="tool"`` (результаты выполнения инструментов).
@@ -214,7 +280,7 @@ class OpenAIChatClient:
             "stream": True,
         }
         if cfg.seed is not None:
-            payload["seed"] = cfg.seed
+            payload["seed"] = cfg.seed      # воспроизводимость генерации
         if cfg.stop:
             payload["stop"] = list(cfg.stop)
         if tools:
@@ -222,36 +288,26 @@ class OpenAIChatClient:
             if tool_choice is not None:
                 payload["tool_choice"] = tool_choice
 
-        if cfg.backend == "llama_cpp":
-            # основной бэкенд: think управляется параметром тела запроса
-            payload["think"] = bool(use_think)
-        elif cfg.backend == "chatml":
-            # fallback: софт-промпт /no_think в последнем user-сообщении
-            if not use_think:
-                for i in range(len(msgs) - 1, -1, -1):
-                    if msgs[i].get("role") == "user":
-                        msgs[i]["content"] = "/no_think\n" + msgs[i].get("content", "")
-                        break
-        else:
-            # неизвестный вариант бэкенда — явная ошибка, а не тихий default
-            raise ValueError(f"unknown backend flavour: {cfg.backend!r}")
+        # различия бэкендов — единая точка расширения
+        self.apply_backend_flavour(payload, msgs, use_think=use_think)
         return payload
 
-    # ------------------------------------------------------------------
+    # ---- полный контракт событий -------------------------------------
     def stream_events(self, messages: List[Dict[str, Any]], *,
                       use_think: bool = True,
                       temperature: Optional[float] = None,
                       max_tokens: Optional[int] = None,
                       tools: Optional[List[Dict[str, Any]]] = None,
                       tool_choice: Optional[Any] = None,
-                      ) -> Iterator[Union[str, ToolCallDelta, FinishEvent]]:
+                      ) -> Iterator[Union[StreamEvent, FinishEvent]]:
         """Низкоуровневый стриминг событий SSE — полный контракт OpenAI API.
 
         Выдаёт по одному объекту на смысловое событие потока:
-        - ``str``           — текстовая дельта (``delta.content``);
-        - ``ToolCallDelta`` — частичный вызов инструмента (``delta.tool_calls``);
-        - ``FinishEvent``   — ровно ОДИН раз в конце: причина завершения
-          (``finish_reason``) и агрегированные довершенные tool_calls.
+        - ``str``             — текстовая дельта (``delta.content``);
+        - ``ReasoningDelta``  — дельта скрытых рассуждений (thinking);
+        - ``ToolCallDelta``   — частичный вызов инструмента (``delta.tool_calls``);
+        - ``FinishEvent``     — ровно ОДИН раз в конце: причина завершения
+          (``finish_reason``) и агрегированные дополненные tool_calls.
 
         Обработка finish_reason:
         - нормальные причины: "stop", "length", "content_filter", "tool_calls";
@@ -283,9 +339,6 @@ class OpenAIChatClient:
         Генератор всегда закрывает HTTP-соединение в finally (защита от
         утечки при раннем break/исключении сверху).
         """
-        #: Нормальные (не-ошибочные) причины завершения по OpenAI-спеке.
-        NORMAL_FINISH_REASONS = {"stop", "length", "content_filter", "tool_calls"}
-
         payload = self.build_payload(messages, use_think=use_think,
                                      temperature=temperature,
                                      max_tokens=max_tokens,
@@ -318,7 +371,7 @@ class OpenAIChatClient:
                 except json.JSONDecodeError:
                     continue                       # толерантность: битый фрейм пропускаем
 
-                # Some backends put an error message into the stream body.
+                # Некоторые бэкенды кладут ошибку прямо в тело потока.
                 if obj.get("error"):
                     raise LLMError(f"server returned stream error: {obj['error']}")
 
@@ -333,6 +386,12 @@ class OpenAIChatClient:
                 if content:
                     text_parts.append(content)
                     yield content
+
+                # --- дельта рассуждений (thinking) ------------------------
+                # normalize разных имён полей у разных бэкендов
+                reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                if reasoning:
+                    yield ReasoningDelta(reasoning)
 
                 # --- tool_calls (стриминговые куски) ----------------------
                 for tc in (delta.get("tool_calls") or []):
@@ -408,7 +467,7 @@ class OpenAIChatClient:
             if callable(close):
                 close()
 
-    # ------------------------------------------------------------------
+    # ---- упрощённый контракт Agent.run --------------------------------
     def stream(self, messages: List[Dict[str, Any]], *,
                use_think: bool = True,
                temperature: Optional[float] = None,
@@ -417,8 +476,8 @@ class OpenAIChatClient:
 
         Выдаёт ТОЛЬКО текстовые дельты и завершается сентинелом ``[DONE]`` —
         ровно то, что ожидает цикл агента (memory.py: `if chunk == "[DONE]"`).
-        Служебные события (tool_calls, finish_reason) здесь отбрасываются:
-        полный контракт доступен через ``stream_events()``.
+        Служебные события (reasoning, tool_calls, finish_reason) здесь
+        отбрасываются: полный контракт доступен через ``stream_events()``.
 
         Почему сентинел, а не «просто прекратить генератор»:
         - StopAsyncIteration/GeneratorExit — служебные сигналы Python, они
@@ -436,7 +495,7 @@ class OpenAIChatClient:
                 yield ev
         yield DONE_SENTINEL                  # штатный финал упрощённого потока
 
-    # ------------------------------------------------------------------
+    # ---- convenience: весь ответ одним объектом -----------------------
     def complete(self, messages: List[Dict[str, Any]], *,
                  use_think: bool = True,
                  temperature: Optional[float] = None,
@@ -460,7 +519,7 @@ class OpenAIChatClient:
             raise LLMAborted("stream ended without FinishEvent")
         return final
 
-    # ------------------------------------------------------------------
+    # ---- полный цикл function calling ----------------------------------
     def run_tool_loop(self, messages: List[Dict[str, Any]],
                       tool_map: Dict[str, Callable[..., Any]], *,
                       max_rounds: int = 8,
@@ -478,13 +537,14 @@ class OpenAIChatClient:
             text = client.run_tool_loop(
                 [{"role": "user", "content": "Какая погода в Москве?"}],
                 tool_map={"get_weather": get_weather_fn},
+                tools=[...],
             )
         """
         msgs = [dict(m) for m in messages]
         tool_specs = kwargs.pop("tools", None)
         if tool_specs is None:
-            # автоматически строим спецификации из docstring'ов нельзя —
-            # caller обязан дать точные схемы; но пустой список запрещён:
+            # автоматически построить схемы из docstring'ов нельзя —
+            # caller обязан дать точные схемы; пустой список запрещён:
             raise LLMError("run_tool_loop requires explicit 'tools=[...]' specs")
         rounds = 0
         while True:
@@ -519,7 +579,7 @@ class OpenAIChatClient:
                                          else json.dumps(result,
                                                          ensure_ascii=False))})
 
-    # ------------------------------------------------------------------
+    # ---- адаптер под агента ---------------------------------------------
     def as_callable(self, *, use_think: bool = True
                     ) -> Callable[[List[Dict[str, Any]]], Iterator[str]]:
         """Адаптер под контракт ``Agent(llm=...)``: callable(messages) -> чанки."""
@@ -528,6 +588,72 @@ class OpenAIChatClient:
         return _call
 
 
-# Прямой алиас для обратной совместимости: старое имя класса не отражало
-# универсальность (backend может быть chatml/TabbyAPI и т.д.).
-LlamaCppClient = OpenAIChatClient
+# ---------------------------------------------------------------------------
+# Реализации под конкретные бэкенды
+# ---------------------------------------------------------------------------
+
+class LlamaCppLLMClient(LLMClient):
+    """Клиент llama.cpp server (:8080, ADR-001 — дефолтный бэкенд проекта).
+
+    Специфика: think переключается параметром тела запроса ``{"think": bool}``
+    (stack.md §5.3). Рассуждение при think=true приходит отдельным полем
+    ``delta.reasoning`` — stream_events транслирует его как ReasoningDelta.
+    """
+
+    def apply_backend_flavour(self, payload: Dict[str, Any],
+                              messages: List[Dict[str, Any]], *,
+                              use_think: bool) -> None:
+        # основной бэкенд: think управляется параметром тела запроса
+        payload["think"] = bool(use_think)
+
+
+class ChatmlLLMClient(LLMClient):
+    """Клиент TabbyAPI / прочих chatml-серверов (fallback-бэкенд, stack.md §5.3).
+
+    Специфика: сервер не понимает параметр ``think`` — выключение рассуждений
+    достигается софт-промптом ``/no_think``, приклеиваемым к ПОСЛЕДНЕМУ
+    сообщению пользователя. Системный префикс при этом остаётся
+    байт-в-байт неизменным (P8 — стабильность KV-кэша).
+    """
+
+    def apply_backend_flavour(self, payload: Dict[str, Any],
+                              messages: List[Dict[str, Any]], *,
+                              use_think: bool) -> None:
+        # fallback: софт-промпт /no_think в последнем user-сообщении
+        if not use_think:
+            msgs = payload["messages"]
+            for i in range(len(msgs) - 1, -1, -1):
+                if msgs[i].get("role") == "user":
+                    msgs[i]["content"] = "/no_think\n" + msgs[i].get("content", "")
+                    break
+
+
+#: Таблица фабрики: значение конфига [llm].backend → класс клиента.
+BACKEND_REGISTRY: Dict[str, type] = {
+    "llama_cpp": LlamaCppLLMClient,
+    "chatml": ChatmlLLMClient,
+}
+
+
+def create_client(config: Optional[LLMConfig] = None,
+                  session: Optional[Any] = None) -> LLMClient:
+    """Фабрика: выбрать реализацию ``LLMClient`` по ``config.backend``.
+
+    Единственное место, где строковое имя бэкенда превращается в класс.
+    Неизвестное имя — явная ошибка, а не тихий default (как было в эпоху
+    «один класс + if»).
+    """
+    cfg = config or LLMConfig()
+    cls = BACKEND_REGISTRY.get(cfg.backend)
+    if cls is None:
+        raise ValueError(
+            f"unknown backend flavour: {cfg.backend!r}; "
+            f"known: {sorted(BACKEND_REGISTRY)}")
+    return cls(cfg, session=session)
+
+
+# Алиасы для обратной совместимости имён эпохи «один класс + flavour».
+# Новому коду следует использовать LLMClient / LlamaCppLLMClient /
+# ChatmlLLMClient / create_client.
+OpenAIChatClient = LlamaCppLLMClient
+LlamaCppClient = LlamaCppLLMClient

@@ -22,8 +22,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pytest
 
-from cascagent.client import (DONE_SENTINEL, LlamaCppClient, OpenAIChatClient,
-                           LLMConfig)
+from cascagent.client import (DONE_SENTINEL, ChatmlLLMClient, FinishEvent,
+                              LLMAborted, LLMClient, LLMError, LLMConfig,
+                              LLMToolCallNotSupported, LlamaCppLLMClient,
+                              ReasoningDelta, ToolCallDelta, create_client)
+from cascagent.client import LlamaCppClient as LlamaCppClientAlias
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +75,7 @@ MSGS = [{"role": "system", "content": "SYS"},
 
 class TestBuildPayload:
     def test_defaults_and_stream_flag(self):
-        c = LlamaCppClient(LLMConfig())
+        c = LlamaCppLLMClient(LLMConfig())
         p = c.build_payload(MSGS)
         assert p["model"] == "local"
         assert p["temperature"] == pytest.approx(0.2)   # config.md §4
@@ -84,39 +87,39 @@ class TestBuildPayload:
         """Invariant 2 (stack.md §4.3): SYSTEM prefix comes from caller;
         the payload must not be mutated by chatml /no_think rewriting of
         the CALLER's list."""
-        c = LlamaCppClient(LLMConfig())
+        c = LlamaCppLLMClient(LLMConfig())
         p = c.build_payload(MSGS, use_think=False)
         assert p["messages"] == MSGS                    # llama_cpp: no rewrite
         assert MSGS[-1]["content"] == "Задача: собрать сад"
 
     def test_seed_and_stop_passthrough(self):
-        c = LlamaCppClient(LLMConfig(seed=7, stop=["END"]))
+        c = LlamaCppLLMClient(LLMConfig(seed=7, stop=["END"]))
         p = c.build_payload(MSGS)
         assert p["seed"] == 7
         assert p["stop"] == ["END"]
 
     def test_seed_zero_is_kept(self):
         """seed=0 disables server-side seeding but is still explicit."""
-        c = LlamaCppClient(LLMConfig(seed=0))
+        c = LlamaCppLLMClient(LLMConfig(seed=0))
         assert c.build_payload(MSGS)["seed"] == 0
 
     def test_no_seed_key_when_none(self):
-        c = LlamaCppClient(LLMConfig())
+        c = LlamaCppLLMClient(LLMConfig())
         assert "seed" not in c.build_payload(MSGS)
         assert "stop" not in c.build_payload(MSGS)
 
     def test_per_call_overrides(self):
-        c = LlamaCppClient(LLMConfig())
+        c = LlamaCppLLMClient(LLMConfig())
         p = c.build_payload(MSGS, temperature=0.9, max_tokens=64)
         assert p["temperature"] == pytest.approx(0.9)
         assert p["max_tokens"] == 64
 
     def test_llama_cpp_think_toggle_body_param(self):
-        c = LlamaCppClient(LLMConfig(backend="llama_cpp"))
+        c = LlamaCppLLMClient(LLMConfig())
         assert c.build_payload(MSGS, use_think=False)["think"] is False
 
     def test_chatml_no_think_soft_prompt_on_last_user(self):
-        c = LlamaCppClient(LLMConfig(backend="chatml"))
+        c = ChatmlLLMClient(LLMConfig())
         msgs = [{"role": "system", "content": "SYS"},
                 {"role": "user", "content": "U1"},
                 {"role": "assistant", "content": "A1"},
@@ -130,46 +133,70 @@ class TestBuildPayload:
         assert msgs[3]["content"] == "U2"
 
     def test_chatml_think_on_leaves_messages_clean(self):
-        c = LlamaCppClient(LLMConfig(backend="chatml"))
+        c = ChatmlLLMClient(LLMConfig())
         p = c.build_payload(MSGS, use_think=True)
         assert p["messages"] == MSGS
         assert "think" not in p
 
-    def test_unknown_backend_raises(self):
-        c = LlamaCppClient(LLMConfig(backend="vllm"))
-        with pytest.raises(ValueError):
-            c.build_payload(MSGS)
+    def test_unknown_backend_raises_via_factory(self):
+        """flavour-ветвление уехало в классы; неизвестный бэкенд ловит фабрика."""
+        with pytest.raises(ValueError, match="vllm"):
+            create_client(LLMConfig(backend="vllm"))
+
+    def test_llmclient_is_abstract(self):
+        """Интерфейс нельзя инстанцировать — только наследника с хуком."""
+        with pytest.raises(TypeError):
+            LLMClient()
+
+    def test_factory_returns_per_backend_class(self):
+        assert isinstance(create_client(LLMConfig(backend="llama_cpp")),
+                          LlamaCppLLMClient)
+        assert isinstance(create_client(LLMConfig(backend="chatml")),
+                          ChatmlLLMClient)
+
+    def test_chatml_client_think_toggle_via_soft_prompt(self):
+        """Класс-наследник сам решает механику think (без config.backend)."""
+        c = ChatmlLLMClient(LLMConfig())
+        p = c.build_payload(MSGS, use_think=False)
+        assert p["messages"][-1]["content"].startswith("/no_think")
+        assert "think" not in p              # chatml не шлёт body-параметр
+
+    def test_llamacpp_client_never_rewrites_messages(self):
+        c = LlamaCppLLMClient(LLMConfig())
+        p = c.build_payload(MSGS, use_think=False)
+        assert p["messages"] == MSGS
+        assert p["think"] is False
 
 
 class TestStream:
     def test_yields_deltas_then_done_sentinel(self):
         lines = [sse("Привет"), "", "keep-alive", sse(" мир"),
                  "data: [DONE]"]
-        c = LlamaCppClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         out = list(c.stream(MSGS))
         assert out == ["Привет", " мир", DONE_SENTINEL]
 
     def test_clean_eof_without_server_done_still_terminates(self):
         lines = [sse("a"), sse("b")]
-        c = LlamaCppClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         out = list(c.stream(MSGS))
         assert out[-1] == DONE_SENTINEL
         assert out[:-1] == ["a", "b"]
 
     def test_malformed_frame_skipped(self):
         lines = ["data: {not-json", sse("ok"), "data: [DONE]"]
-        c = LlamaCppClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         assert list(c.stream(MSGS)) == ["ok", DONE_SENTINEL]
 
     def test_bytes_lines_decoded(self):
         lines = [sse("юни").encode("utf-8"), "data: [DONE]"]
-        c = LlamaCppClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         assert list(c.stream(MSGS)) == ["юни", DONE_SENTINEL]
 
     def test_empty_delta_not_yielded(self):
         lines = ['data: {"choices":[{"index":0,"delta":{}}]}',
                  sse("x"), "data: [DONE]"]
-        c = LlamaCppClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         assert list(c.stream(MSGS)) == ["x", DONE_SENTINEL]
 
     def test_response_closed_even_mid_iteration(self):
@@ -177,7 +204,7 @@ class TestStream:
         when the consumer breaks early (agent loop stops on plugin vote)."""
         lines = [sse("a"), sse("b"), "data: [DONE]"]
         sess = FakeSession(lines)
-        c = LlamaCppClient(session=sess)
+        c = LlamaCppLLMClient(session=sess)
         it = c.stream(MSGS)
         assert next(it) == "a"
         it.close()                        # simulate early break
@@ -185,14 +212,14 @@ class TestStream:
 
     def test_http_error_propagates(self):
         sess = FakeSession([sse("a")], status_code=500)
-        c = LlamaCppClient(session=sess)
+        c = LlamaCppLLMClient(session=sess)
         with pytest.raises(RuntimeError):
             list(c.stream(MSGS))
         assert sess.response.closed       # closed even on failure path
 
     def test_post_called_with_stream_and_timeout(self):
         sess = FakeSession(["data: [DONE]"])
-        c = LlamaCppClient(LLMConfig(timeout=42.0), session=sess)
+        c = LlamaCppLLMClient(LLMConfig(timeout=42.0), session=sess)
         list(c.stream(MSGS))
         call = sess.calls[0]
         assert call["url"] == c.config.url
@@ -205,7 +232,7 @@ class TestAsCallable:
     def test_adapter_matches_chunk_iterator_contract(self):
         """roadmap §9.4: Agent.run seam is callable(messages) -> iterator."""
         lines = [sse("hello"), "data: [DONE]"]
-        c = LlamaCppClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         fn = c.as_callable(use_think=False)
         gen = fn(MSGS)
         assert not isinstance(gen, str)
@@ -217,7 +244,7 @@ class TestAsCallable:
         """Minimal echo of the memory.py run() consumption pattern:
         iterate chunks, break on [DONE]."""
         lines = [sse("Разбей"), sse(" задачу"), "data: [DONE]", sse("never")]
-        c = LlamaCppClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         collected = []
         for chunk in c.stream(MSGS):
             if chunk == DONE_SENTINEL:
@@ -257,9 +284,8 @@ def sse_tool_delta(index=0, id=None, name=None, args=None) -> str:
 
 class TestStreamEvents:
     def test_text_stream_yields_deltas_then_finishevent(self):
-        from cascagent.client import FinishEvent
         lines = [sse("При"), sse("вет"), sse_finish("stop"), "data: [DONE]"]
-        c = OpenAIChatClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         evs = list(c.stream_events(MSGS))
         assert evs[:-1] == ["При", "вет"]
         fin = evs[-1]
@@ -273,51 +299,47 @@ class TestStreamEvents:
         first = {"choices": [{"index": 0,
                               "delta": {"role": "assistant", "content": "X"}}]}
         lines = [sse_raw(first), sse_finish("stop"), "data: [DONE]"]
-        c = OpenAIChatClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         evs = list(c.stream_events(MSGS))
         assert "X" in evs
 
     def test_length_finish_reason_is_normal(self):
-        from cascagent.client import FinishEvent
         lines = [sse("abc"), sse_finish("length"), "data: [DONE]"]
-        c = OpenAIChatClient(LLMConfig(strict_finish=True),
+        c = LlamaCppLLMClient(LLMConfig(strict_finish=True),
                              session=FakeSession(lines))
         evs = list(c.stream_events(MSGS))
         assert evs[-1].finish_reason == "length"
 
     def test_abnormal_finish_reason_raises_when_strict(self):
-        from cascagent.client import LLMAborted
         lines = [sse("abc"), sse_finish("abort"), "data: [DONE]"]
-        c = OpenAIChatClient(LLMConfig(strict_finish=True),
+        c = LlamaCppLLMClient(LLMConfig(strict_finish=True),
                              session=FakeSession(lines))
         with pytest.raises(LLMAborted):
             list(c.stream_events(MSGS))
 
     def test_truncated_stream_raises_when_strict(self):
         """EOF без finish_reason и без [DONE] — обрыв; strict → LLMAborted."""
-        from cascagent.client import LLMAborted
         lines = [sse("abc")]
-        c = OpenAIChatClient(LLMConfig(strict_finish=True),
+        c = LlamaCppLLMClient(LLMConfig(strict_finish=True),
                              session=FakeSession(lines))
         with pytest.raises(LLMAborted):
             list(c.stream_events(MSGS))
 
     def test_truncated_stream_soft_mode_marks_abort(self):
         lines = [sse("abc")]
-        c = OpenAIChatClient(session=FakeSession(lines))   # strict=False default
+        c = LlamaCppLLMClient(session=FakeSession(lines))   # strict=False default
         evs = list(c.stream_events(MSGS))
         assert evs[-1].finish_reason == "abort"
 
     def test_done_without_finish_reason_normalized_to_stop(self):
         lines = [sse("x"), "data: [DONE]"]
-        c = OpenAIChatClient(LLMConfig(strict_finish=True),
+        c = LlamaCppLLMClient(LLMConfig(strict_finish=True),
                              session=FakeSession(lines))
         assert list(c.stream_events(MSGS))[-1].finish_reason == "stop"
 
     def test_server_error_in_stream_body_raises(self):
-        from cascagent.client import LLMError
         lines = [sse_raw({"error": {"message": "ctx overflow"}})]
-        c = OpenAIChatClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         with pytest.raises(LLMError, match="ctx overflow"):
             list(c.stream_events(MSGS))
 
@@ -325,7 +347,6 @@ class TestStreamEvents:
 class TestToolCallsStreaming:
     def test_aggregates_fragmented_arguments(self):
         """Классический стриминг tool_calls: header-фрейм + куски arguments."""
-        from cascagent.client import FinishEvent, ToolCallDelta
         lines = [
             sse_tool_delta(id="call_1", name="get_weather"),
             sse_tool_delta(args='{"cit'),
@@ -333,7 +354,7 @@ class TestToolCallsStreaming:
             sse_finish("tool_calls"),
             "data: [DONE]",
         ]
-        c = OpenAIChatClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         evs = list(c.stream_events(MSGS))
         deltas = [e for e in evs if isinstance(e, ToolCallDelta)]
         assert len(deltas) == 3
@@ -355,14 +376,13 @@ class TestToolCallsStreaming:
             sse_tool_delta(index=1, id="b", name="f2", args="{}"),
             sse_finish("tool_calls"), "data: [DONE]",
         ]
-        c = OpenAIChatClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         fin = list(c.stream_events(MSGS))[-1]
         assert [t["function"]["name"] for t in fin.tool_calls] == ["f1", "f2"]
 
     def test_tools_disabled_raises(self):
-        from cascagent.client import LLMToolCallNotSupported
         lines = [sse_tool_delta(id="c1", name="evil")]
-        c = OpenAIChatClient(LLMConfig(enable_tools=False),
+        c = LlamaCppLLMClient(LLMConfig(enable_tools=False),
                              session=FakeSession(lines))
         with pytest.raises(LLMToolCallNotSupported):
             list(c.stream_events(MSGS))
@@ -371,7 +391,7 @@ class TestToolCallsStreaming:
         """stream() (контракт Agent.run) отдаёт только текст + [DONE]."""
         lines = [sse("текст"), sse_tool_delta(id="c", name="f", args="{}"),
                  sse_finish("tool_calls"), "data: [DONE]"]
-        c = OpenAIChatClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         assert list(c.stream(MSGS)) == ["текст", DONE_SENTINEL]
 
 
@@ -380,13 +400,13 @@ class TestBuildPayloadTools:
         tools = [{"type": "function",
                   "function": {"name": "get_weather",
                                "parameters": {"type": "object"}}}]
-        c = OpenAIChatClient(session=FakeSession(["data: [DONE]"]))
+        c = LlamaCppLLMClient(session=FakeSession(["data: [DONE]"]))
         p = c.build_payload(MSGS, tools=tools, tool_choice="auto")
         assert p["tools"] == tools
         assert p["tool_choice"] == "auto"
 
     def test_no_tools_keys_by_default(self):
-        c = OpenAIChatClient(LLMConfig())
+        c = LlamaCppLLMClient(LLMConfig())
         p = c.build_payload(MSGS)
         assert "tools" not in p and "tool_choice" not in p
 
@@ -394,7 +414,7 @@ class TestBuildPayloadTools:
 class TestCompleteAndToolLoop:
     def test_complete_collects_finishevent(self):
         lines = [sse("ответ"), sse_finish("stop"), "data: [DONE]"]
-        c = OpenAIChatClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         fin = c.complete(MSGS)
         assert fin.content_text == "ответ"
         assert fin.finish_reason == "stop"
@@ -422,7 +442,7 @@ class TestCompleteAndToolLoop:
                 return FakeResponse(self.responses.pop(0))
 
         sess = MultiSession([round1, round2])
-        c = OpenAIChatClient(session=sess)
+        c = LlamaCppLLMClient(session=sess)
         calls = []
 
         def get_weather(city):
@@ -446,10 +466,9 @@ class TestCompleteAndToolLoop:
         assert json.loads(tool_msg["content"]) == {"temp": 15}
 
     def test_run_tool_loop_unknown_tool_raises(self):
-        from cascagent.client import LLMError
         round1 = [sse_tool_delta(id="c1", name="missing", args="{}"),
                   sse_finish("tool_calls"), "data: [DONE]"]
-        c = OpenAIChatClient(session=FakeSession(round1))
+        c = LlamaCppLLMClient(session=FakeSession(round1))
         with pytest.raises(LLMError, match="unknown tool"):
             c.run_tool_loop(MSGS, {}, tools=[{"type": "function"}])
 
@@ -468,7 +487,7 @@ class TestCompleteAndToolLoop:
                 return FakeResponse(self.responses.pop(0))
 
         sess = MultiSession([round1, round2])
-        c = OpenAIChatClient(session=sess)
+        c = LlamaCppLLMClient(session=sess)
 
         def boom():
             raise ValueError("kaboom")
@@ -480,11 +499,42 @@ class TestCompleteAndToolLoop:
         assert tool_msg["content"].startswith("ERROR:")
 
 
+
+class TestReasoningDeltas:
+    """Поля thinking/рассуждений бэкенды отдают по-разному — клиент нормализует."""
+
+    def test_reasoning_field_becomes_reasoning_delta(self):
+        fr = {"choices": [{"index": 0, "delta": {"reasoning": "думаю"}}]}
+        lines = ["data: " + json.dumps(fr), sse_finish("stop"), "data: [DONE]"]
+        c = LlamaCppLLMClient(session=FakeSession(lines))
+        evs = list(c.stream_events(MSGS))
+        assert any(isinstance(e, ReasoningDelta) and e.text == "думаю" for e in evs)
+
+    def test_reasoning_content_alias_normalized_too(self):
+        fr = {"choices": [{"index": 0,
+                           "delta": {"reasoning_content": "hmm"}}]}
+        lines = ["data: " + json.dumps(fr), sse_finish("stop"), "data: [DONE]"]
+        c = LlamaCppLLMClient(session=FakeSession(lines))
+        evs = list(c.stream_events(MSGS))
+        assert isinstance(evs[0], ReasoningDelta) and evs[0].text == "hmm"
+
+    def test_stream_simplification_drops_reasoning(self):
+        """stream() (контракт Agent.run) отдаёт только текст + [DONE]."""
+        fr = {"choices": [{"index": 0,
+                           "delta": {"reasoning": "секретные мысли"}}]}
+        lines = ["data: " + json.dumps(fr), sse("итог"), "data: [DONE]"]
+        c = LlamaCppLLMClient(session=FakeSession(lines))
+        assert list(c.stream(MSGS)) == ["итог", DONE_SENTINEL]
+
+
 class TestBackwardCompatAlias:
-    def test_llamacppclient_is_openaichatclient(self):
-        assert LlamaCppClient is OpenAIChatClient
+    def test_old_names_alias_the_llamacpp_impl(self):
+        """Эпоха «один класс + flavour»: старые имена = LlamaCppLLMClient."""
+        from cascagent.client import OpenAIChatClient
+        assert LlamaCppClientAlias is LlamaCppLLMClient
+        assert OpenAIChatClient is LlamaCppLLMClient
 
     def test_old_import_shape_still_works(self):
         lines = [sse("a"), "data: [DONE]"]
-        c = LlamaCppClient(session=FakeSession(lines))
+        c = LlamaCppLLMClient(session=FakeSession(lines))
         assert list(c.stream(MSGS)) == ["a", DONE_SENTINEL]
