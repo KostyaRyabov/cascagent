@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pytest
 
-from cascagent.client import DONE_SENTINEL, LlamaCppClient, LLMConfig
+from cascagent.client import (DONE_SENTINEL, LlamaCppClient, OpenAIChatClient,
+                           LLMConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -223,3 +224,267 @@ class TestAsCallable:
                 break
             collected.append(chunk)
         assert "".join(collected) == "Разбей задачу"
+
+
+# ---------------------------------------------------------------------------
+# Расширенный контракт: stream_events / finish_reason / tool_calls (2026-10-14)
+# ---------------------------------------------------------------------------
+
+def sse_raw(obj) -> str:
+    """Произвольный SSE-фрейм с готовым словарём."""
+    return "data: " + json.dumps(obj, ensure_ascii=False)
+
+
+def sse_finish(reason: str) -> str:
+    frame = {"choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}
+    return "data: " + json.dumps(frame)
+
+
+def sse_tool_delta(index=0, id=None, name=None, args=None) -> str:
+    tc = {"index": index}
+    if id is not None:
+        tc["id"] = id
+    if name is not None or args is not None:
+        fn = {}
+        if name is not None:
+            fn["name"] = name
+        if args is not None:
+            fn["arguments"] = args
+        tc["function"] = fn
+    frame = {"choices": [{"index": 0, "delta": {"tool_calls": [tc]}}]}
+    return "data: " + json.dumps(frame)
+
+
+class TestStreamEvents:
+    def test_text_stream_yields_deltas_then_finishevent(self):
+        from cascagent.client import FinishEvent
+        lines = [sse("При"), sse("вет"), sse_finish("stop"), "data: [DONE]"]
+        c = OpenAIChatClient(session=FakeSession(lines))
+        evs = list(c.stream_events(MSGS))
+        assert evs[:-1] == ["При", "вет"]
+        fin = evs[-1]
+        assert isinstance(fin, FinishEvent)
+        assert fin.finish_reason == "stop"
+        assert fin.content_text == "Привет"
+        assert fin.tool_calls == []
+
+    def test_role_frame_content_not_lost(self):
+        """Фрейм с delta.role='assistant' не должен глотать последующий контент."""
+        first = {"choices": [{"index": 0,
+                              "delta": {"role": "assistant", "content": "X"}}]}
+        lines = [sse_raw(first), sse_finish("stop"), "data: [DONE]"]
+        c = OpenAIChatClient(session=FakeSession(lines))
+        evs = list(c.stream_events(MSGS))
+        assert "X" in evs
+
+    def test_length_finish_reason_is_normal(self):
+        from cascagent.client import FinishEvent
+        lines = [sse("abc"), sse_finish("length"), "data: [DONE]"]
+        c = OpenAIChatClient(LLMConfig(strict_finish=True),
+                             session=FakeSession(lines))
+        evs = list(c.stream_events(MSGS))
+        assert evs[-1].finish_reason == "length"
+
+    def test_abnormal_finish_reason_raises_when_strict(self):
+        from cascagent.client import LLMAborted
+        lines = [sse("abc"), sse_finish("abort"), "data: [DONE]"]
+        c = OpenAIChatClient(LLMConfig(strict_finish=True),
+                             session=FakeSession(lines))
+        with pytest.raises(LLMAborted):
+            list(c.stream_events(MSGS))
+
+    def test_truncated_stream_raises_when_strict(self):
+        """EOF без finish_reason и без [DONE] — обрыв; strict → LLMAborted."""
+        from cascagent.client import LLMAborted
+        lines = [sse("abc")]
+        c = OpenAIChatClient(LLMConfig(strict_finish=True),
+                             session=FakeSession(lines))
+        with pytest.raises(LLMAborted):
+            list(c.stream_events(MSGS))
+
+    def test_truncated_stream_soft_mode_marks_abort(self):
+        lines = [sse("abc")]
+        c = OpenAIChatClient(session=FakeSession(lines))   # strict=False default
+        evs = list(c.stream_events(MSGS))
+        assert evs[-1].finish_reason == "abort"
+
+    def test_done_without_finish_reason_normalized_to_stop(self):
+        lines = [sse("x"), "data: [DONE]"]
+        c = OpenAIChatClient(LLMConfig(strict_finish=True),
+                             session=FakeSession(lines))
+        assert list(c.stream_events(MSGS))[-1].finish_reason == "stop"
+
+    def test_server_error_in_stream_body_raises(self):
+        from cascagent.client import LLMError
+        lines = [sse_raw({"error": {"message": "ctx overflow"}})]
+        c = OpenAIChatClient(session=FakeSession(lines))
+        with pytest.raises(LLMError, match="ctx overflow"):
+            list(c.stream_events(MSGS))
+
+
+class TestToolCallsStreaming:
+    def test_aggregates_fragmented_arguments(self):
+        """Классический стриминг tool_calls: header-фрейм + куски arguments."""
+        from cascagent.client import FinishEvent, ToolCallDelta
+        lines = [
+            sse_tool_delta(id="call_1", name="get_weather"),
+            sse_tool_delta(args='{"cit'),
+            sse_tool_delta(args='y":"Москва"}'),
+            sse_finish("tool_calls"),
+            "data: [DONE]",
+        ]
+        c = OpenAIChatClient(session=FakeSession(lines))
+        evs = list(c.stream_events(MSGS))
+        deltas = [e for e in evs if isinstance(e, ToolCallDelta)]
+        assert len(deltas) == 3
+        assert deltas[0].name == "get_weather"
+        assert "".join(d.arguments_delta or "" for d in deltas[1:]) \
+            == '{"city":"Москва"}'
+        fin = evs[-1]
+        assert isinstance(fin, FinishEvent)
+        assert fin.finish_reason == "tool_calls"
+        assert fin.tool_calls == [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "get_weather",
+                         "arguments": '{"city":"Москва"}'},
+        }]
+
+    def test_multiple_tools_by_index(self):
+        lines = [
+            sse_tool_delta(index=0, id="a", name="f1", args="{}"),
+            sse_tool_delta(index=1, id="b", name="f2", args="{}"),
+            sse_finish("tool_calls"), "data: [DONE]",
+        ]
+        c = OpenAIChatClient(session=FakeSession(lines))
+        fin = list(c.stream_events(MSGS))[-1]
+        assert [t["function"]["name"] for t in fin.tool_calls] == ["f1", "f2"]
+
+    def test_tools_disabled_raises(self):
+        from cascagent.client import LLMToolCallNotSupported
+        lines = [sse_tool_delta(id="c1", name="evil")]
+        c = OpenAIChatClient(LLMConfig(enable_tools=False),
+                             session=FakeSession(lines))
+        with pytest.raises(LLMToolCallNotSupported):
+            list(c.stream_events(MSGS))
+
+    def test_stream_simplification_drops_tool_events(self):
+        """stream() (контракт Agent.run) отдаёт только текст + [DONE]."""
+        lines = [sse("текст"), sse_tool_delta(id="c", name="f", args="{}"),
+                 sse_finish("tool_calls"), "data: [DONE]"]
+        c = OpenAIChatClient(session=FakeSession(lines))
+        assert list(c.stream(MSGS)) == ["текст", DONE_SENTINEL]
+
+
+class TestBuildPayloadTools:
+    def test_tools_and_choice_passthrough(self):
+        tools = [{"type": "function",
+                  "function": {"name": "get_weather",
+                               "parameters": {"type": "object"}}}]
+        c = OpenAIChatClient(session=FakeSession(["data: [DONE]"]))
+        p = c.build_payload(MSGS, tools=tools, tool_choice="auto")
+        assert p["tools"] == tools
+        assert p["tool_choice"] == "auto"
+
+    def test_no_tools_keys_by_default(self):
+        c = OpenAIChatClient(LLMConfig())
+        p = c.build_payload(MSGS)
+        assert "tools" not in p and "tool_choice" not in p
+
+
+class TestCompleteAndToolLoop:
+    def test_complete_collects_finishevent(self):
+        lines = [sse("ответ"), sse_finish("stop"), "data: [DONE]"]
+        c = OpenAIChatClient(session=FakeSession(lines))
+        fin = c.complete(MSGS)
+        assert fin.content_text == "ответ"
+        assert fin.finish_reason == "stop"
+
+    def test_run_tool_loop_full_cycle(self):
+        """Двухраундовый цикл: модель просит инструмент → результат → ответ.
+
+        Проверяет ровно тот протокол, что описан в OpenAI-спеке:
+        assistant-сообщение с tool_calls, затем role='tool' с tool_call_id.
+        """
+        round1 = [
+            sse_tool_delta(id="call_42", name="get_weather",
+                            args='{"city": "Москва"}'),
+            sse_finish("tool_calls"), "data: [DONE]",
+        ]
+        round2 = [sse("В Москве +15"), sse_finish("stop"), "data: [DONE]"]
+
+        class MultiSession:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.payloads = []
+
+            def post(self, url, json=None, stream=None, timeout=None):
+                self.payloads.append(json)
+                return FakeResponse(self.responses.pop(0))
+
+        sess = MultiSession([round1, round2])
+        c = OpenAIChatClient(session=sess)
+        calls = []
+
+        def get_weather(city):
+            calls.append(city)
+            return {"temp": 15}
+
+        tools = [{"type": "function", "function": {"name": "get_weather",
+                                                   "parameters": {}}}]
+        text = c.run_tool_loop(MSGS[:], {"get_weather": get_weather},
+                               tools=tools)
+        assert text == "В Москве +15"
+        assert calls == ["Москва"]
+        # второй запрос содержит history: original + assistant(tool_calls) + tool
+        second_msgs = sess.payloads[1]["messages"]
+        asst = second_msgs[-2]
+        assert asst["role"] == "assistant"
+        assert asst["tool_calls"][0]["function"]["name"] == "get_weather"
+        tool_msg = second_msgs[-1]
+        assert tool_msg["role"] == "tool"
+        assert tool_msg["tool_call_id"] == "call_42"
+        assert json.loads(tool_msg["content"]) == {"temp": 15}
+
+    def test_run_tool_loop_unknown_tool_raises(self):
+        from cascagent.client import LLMError
+        round1 = [sse_tool_delta(id="c1", name="missing", args="{}"),
+                  sse_finish("tool_calls"), "data: [DONE]"]
+        c = OpenAIChatClient(session=FakeSession(round1))
+        with pytest.raises(LLMError, match="unknown tool"):
+            c.run_tool_loop(MSGS, {}, tools=[{"type": "function"}])
+
+    def test_run_tool_loop_tool_exception_reported_to_model(self):
+        round1 = [sse_tool_delta(id="c1", name="boom", args="{}"),
+                  sse_finish("tool_calls"), "data: [DONE]"]
+        round2 = [sse("ok"), sse_finish("stop"), "data: [DONE]"]
+
+        class MultiSession:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.payloads = []
+
+            def post(self, url, json=None, stream=None, timeout=None):
+                self.payloads.append(json)
+                return FakeResponse(self.responses.pop(0))
+
+        sess = MultiSession([round1, round2])
+        c = OpenAIChatClient(session=sess)
+
+        def boom():
+            raise ValueError("kaboom")
+
+        text = c.run_tool_loop(MSGS[:], {"boom": boom},
+                               tools=[{"type": "function"}])
+        assert text == "ok"
+        tool_msg = sess.payloads[1]["messages"][-1]
+        assert tool_msg["content"].startswith("ERROR:")
+
+
+class TestBackwardCompatAlias:
+    def test_llamacppclient_is_openaichatclient(self):
+        assert LlamaCppClient is OpenAIChatClient
+
+    def test_old_import_shape_still_works(self):
+        lines = [sse("a"), "data: [DONE]"]
+        c = LlamaCppClient(session=FakeSession(lines))
+        assert list(c.stream(MSGS)) == ["a", DONE_SENTINEL]
