@@ -742,11 +742,12 @@ port-этап (§1), full observability/dashboards.
       `/v1/chat/completions` llama.cpp server), параметры seed/max_tokens/stop,
       think-режим (`{"think": bool}` / `/no_think`); transport инъектируем
       (`session=`), контракт chunk-iterator §9.4. — сделано (2026-10-14).
-      Тесты payload/SSE на fake-session — ⬜ (следующий шаг).
+      Тесты payload/SSE на fake-session — сделано (2026-10-14, 21 тест;
+      попутно исправлен branch chatml-флавора в build_payload).
 - ~~`history.py`~~ — СНЯТ (см. правку 2026-10-14 выше; data.md §3).
 - [x] `kanban.py`: SQLite-хранилище дерева задач (schema — docs/data.md §4.2;
       semantic_memory/remember_done/recall/forget_old; recover_interrupted).
-      — код сделан (2026-10-14); тестов нет — ⬜ (приоритет: покрытие).
+      — код + тесты сделаны (2026-10-14, 42 offline-теста на tmp_path).
 - [ ] Диспетчер `dispatch_loop` (декомпозиция ленивая, ADR-004 + ADR-005
       с дополнением 2026-10-13): тонкий цикл поверх жизненного цикла агента
       PENDING→ENRICHMENT(Pre+pick_role)→RUNNING(Agent.run)→оценка(Post);
