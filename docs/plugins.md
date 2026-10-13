@@ -3,7 +3,7 @@
 > **Статус:** 🟡 частично реализовано (v0.1). Реализованы и покрыты тестами:
 > базовые классы секций (§6.3, факт: `plugins/base.py` — Pre/Runtime/Post,
 > Init убран), плоская KV-память `Memory` + иерархия Workspace/Project/Agent
-> и оркестратор `Agent.run()` (§6.4 в фактическом виде, `memory.py`),
+> и цикл `Agent.run()` (§6.4 в фактическом виде, `memory.py`),
 > встроенный сервис `ResponseParser` (`stream_parser.py`, спека
 > `docs/stream_parser_model.md`) и единственный конкретный плагин
 > `TaskParserPlugin` (`plugins/task_parser.py`). НЕ реализованы (план):
@@ -85,7 +85,7 @@
 ### 2.5 Принцип «agent-as-tool» (ADR 005, ролевая модель v6)
 
 Вызов подагента оформляется как инструмент в секции Pre/Post — например,
-`DecomposeTool` (PrePlugin оркестратора уровня) вызывает DecomposerAgent и
+`DecomposeTool` (PrePlugin Orchestrator-агента уровня) вызывает DecomposerAgent и
 кладёт результат (дерево детей в project-ключ `tasks`, `is_atom`) в память.
 При этом:
 
@@ -754,7 +754,7 @@ class BreakpointManager:
 (`Memory`, `Workspace`, `Project`, `Agent`) и
 `src/cascagent/plugins/base.py` (`Plugin`, `PrePlugin`, `RuntimePlugin`,
 `PostPlugin`). Раздел 6.1 показывает код как есть (v0.1); 6.2 — объектную
-иерархию уровней; 6.3 — классы плагинов; 6.4 — оркестратор `Agent.run()`;
+иерархию уровней; 6.3 — классы плагинов; 6.4 — цикл `Agent.run()`;
 6.5–6.7 — **план** (персистентность, фабрика, breakpoints; к v0.1 не
 реализованы, оставлены как ориентир проектирования).
 
@@ -922,7 +922,7 @@ class PostPlugin(Plugin):              # секция POST (был OutputPlugin)
 
 ### 6.4 Agent (внутренний цикл run(), реализовано)
 
-> Термин: здесь «оркестратор» — историческое имя цикла `Agent.run()`
+> Термин: здесь «оркестратор» (истор.) — имя цикла `Agent.run()`
 > (клей Pre→генерация→Runtime→Post). Ролевый **OrchestratorAgent** уровня
 > декомпозиции — отдельная сущность (§8.5, ADR 005); во избежание путаницы
 > раздел назван «внутренний цикл».

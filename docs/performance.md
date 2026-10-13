@@ -88,7 +88,7 @@ decoding вне скоупа v0.x, AGENTS.md §9 «не делать»); есл�
 
 ## 5. Метрики (`PerformanceMetrics`)
 
-Собираются оркестратором по окончании сессии из `history.jsonl` + таймингов
+Собираются CPU-диспетчером по окончании сессии из `history.jsonl` + таймингов
 канбанa; вывод — `cascagent report` (product §5.4). Сырьё пишется на каждом
 вызове (cpu-offload A13, data.md §3 DecompositionCall).
 

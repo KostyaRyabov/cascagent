@@ -45,7 +45,7 @@ Details: docs/protocol.md §2–3.
 | Модуль | Назначение | Статус |
 |--------|-----------|--------|
 | `models.py` | Task(brief, description, status), TaskStatus, snowflake-ID, embed() | ✅ v2 принят (миграция завершена) |
-| `memory.py` | Memory (flat-KV + glob-подписки), Workspace/Project/Agent (оркестратор run()) | ✅ v0.1 реализовано |
+| `memory.py` | Memory (flat-KV + glob-подписки), Workspace/Project/Agent (CPU-диспетчер run()) | ✅ v0.1 реализовано |
 | `stream_parser.py` | ResponseParser (бывш. StreamParser): feed/commit/finalize/close_on_stop, Segment/Word (v5), ParseState | ✅ v0.1 реализовано (docs/stream_parser_model.md) |
 | `plugins/base.py` | Plugin/PrePlugin/RuntimePlugin/PostPlugin (on_input/on_upload→bool/on_output) | ✅ v0.1 реализовано |
 | `plugins/task_parser.py` | SYSTEM_PROMPT + парсинг декомпозиции v2, дедуп (0.75), атомарность (поглотил parser.py+detector.py, удалены 2026-10-12) | ✅ v0.1 реализовано |
@@ -58,7 +58,7 @@ Details: docs/protocol.md §2–3.
 | `cli.py` | argparse интерфейс, рендер дерева и статистики | ⬜ Этап 3 |
 | `enricher.py` | ContextEnricher: RAG + semantic recall + siblings + сжатие | ⬜ Этап 4+ |
 | `executor.py` | ExecutorAgent: выполнение ТОЛЬКО атомарных задач; MCP tools, Researcher как tool (product §4 v6) | ⬜ Этап 4+ |
-| `orchestrator.py` | OrchestratorAgent (бывш. ConflictResolver, ADR 005): неатомные задачи как оркестратор своего уровня + аварийный режим тупиков | ⬜ план |
+| `orchestrator.py` | OrchestratorAgent (бывш. ConflictResolver, ADR 005): неатомные задачи как CPU-диспетчер своего уровня + аварийный режим тупиков | ⬜ план |
 | `reflector.py` | ReflectAgent: анализ провалов, обратная связь | ⬜ Этап 4+ |
 | `researcher.py` | ResearchAgent: изолированный сбор информации (единственный, кто ищет) | ⬜ Этап 4+ |
 | `summarizer.py` | SummarizerAgent: краткая сводка артефактов по запросу агента (опциональный) | ⬜ план |

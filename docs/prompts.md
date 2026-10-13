@@ -162,7 +162,7 @@ def parse_decomposition(response: str) -> list[dict]:
 - одна подзадача с brief ≈ родителя → degenerate-repeat правило → атом
   (protocol §3.7; cpu-offload A5);
 - ответ «совсем не то» (не парсится структура/покрытие) → ReflectAgent
-  анализирует провал (product §4), оркестратор решает retry/переформулировку.
+  анализирует провал (product §4), CPU-диспетчер решает retry/переформулировку.
 
 ### 4.1. Разделение THINK / FINAL (`split_think_and_response`)
 
